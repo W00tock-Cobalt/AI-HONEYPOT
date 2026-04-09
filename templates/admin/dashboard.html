@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Console</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-secondary: #1a1a2e;
+            --bg-tertiary: #252542;
+            --accent: #e94560;
+            --accent-hover: #ff6b8a;
+            --text-primary: #e4e4e4;
+            --text-secondary: #888;
+            --border: rgba(100, 100, 150, 0.2);
+            --success: #4ade80;
+            --warning: #fbbf24;
+            --danger: #f87171;
+            --critical: #dc2626;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo h1 {
+            font-size: 20px;
+            color: var(--accent);
+        }
+
+        .logo span {
+            color: var(--text-secondary);
+            font-size: 14px;
+        }
+
+        .header-actions {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+
+        .btn-secondary {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(100, 100, 150, 0.2);
+        }
+
+        .container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 18px;
+        }
+
+        .stat-card.critical {
+            border-color: var(--critical);
+            background: rgba(220, 38, 38, 0.1);
+        }
+
+        .stat-card h3 {
+            color: var(--text-secondary);
+            font-size: 12px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .stat-card.critical .stat-value {
+            color: var(--critical);
+        }
+
+        .content-grid {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 20px;
+        }
+
+        @media (max-width: 1200px) {
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .panel-header {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .panel-header h2 {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .panel-body {
+            padding: 20px;
+        }
+
+        #map {
+            height: 350px;
+            border-radius: 8px;
+            background: var(--bg-tertiary);
+        }
+
+        .request-feed {
+            max-height: 700px;
+            overflow-y: auto;
+        }
+
+        .request-item {
+            padding: 15px;
+            border-bottom: 1px solid var(--border);
+            transition: background 0.2s;
+            cursor: pointer;
+        }
+
+        .request-item:hover {
+            background: rgba(100, 100, 150, 0.1);
+        }
+
+        .request-item:last-child {
+            border-bottom: none;
+        }
+
+        .request-item.expanded {
+            background: rgba(100, 100, 150, 0.15);
+        }
+
+        .request-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 8px;
+        }
+
+        .request-id {
+            font-size: 11px;
+            color: var(--text-secondary);
+            font-family: monospace;
+        }
+
+        .request-method {
+            font-weight: 600;
+            font-size: 12px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(100, 100, 150, 0.2);
+        }
+
+        .request-method.POST {
+            background: rgba(233, 69, 96, 0.2);
+            color: var(--accent);
+        }
+
+        .request-method.GET {
+            background: rgba(74, 222, 128, 0.2);
+            color: var(--success);
+        }
+
+        .request-time {
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .request-path {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
+            color: var(--text-primary);
+            word-break: break-all;
+        }
+
+        .request-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 8px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .request-ip {
+            font-family: monospace;
+        }
+
+        .badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge.scanner { background: rgba(251, 191, 36, 0.2); color: var(--warning); }
+        .badge.credential_stuffer { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+        .badge.prompt_harvester { background: rgba(192, 132, 252, 0.2); color: #c084fc; }
+        .badge.researcher { background: rgba(96, 165, 250, 0.2); color: #60a5fa; }
+        .badge.human { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+        .badge.unknown { background: rgba(100, 100, 150, 0.2); color: var(--text-secondary); }
+
+        .threat-badge {
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .threat-badge.low { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+        .threat-badge.medium { background: rgba(251, 191, 36, 0.2); color: var(--warning); }
+        .threat-badge.high { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+        .threat-badge.critical { background: rgba(220, 38, 38, 0.3); color: #ff4444; }
+
+        /* AI Analysis Panel */
+        .ai-analysis {
+            margin-top: 12px;
+            padding: 12px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            border-left: 3px solid var(--accent);
+            display: none;
+        }
+
+        .ai-analysis.visible {
+            display: block;
+        }
+
+        .ai-analysis-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .ai-analysis-header svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        .ai-summary {
+            font-size: 13px;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+
+        .ai-details {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .ai-recommendations {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--border);
+        }
+
+        .ai-recommendations h4 {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+
+        .ai-recommendations ul {
+            list-style: none;
+            font-size: 12px;
+        }
+
+        .ai-recommendations li {
+            padding: 3px 0;
+            color: var(--text-primary);
+        }
+
+        .ai-recommendations li::before {
+            content: "→ ";
+            color: var(--accent);
+        }
+
+        .refresh-indicator {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .refresh-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .sidebar-panels {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .country-list, .classification-list {
+            list-style: none;
+        }
+
+        .country-item, .classification-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .country-item:last-child, .classification-item:last-child {
+            border-bottom: none;
+        }
+
+        .country-name {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .country-flag {
+            font-size: 18px;
+        }
+
+        .country-count {
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-tertiary); }
+        ::-webkit-scrollbar-thumb { background: rgba(100, 100, 150, 0.5); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(100, 100, 150, 0.7); }
+
+        .groq-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 6px;
+            background: linear-gradient(135deg, #f55036, #ff6b4a);
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="logo">
+            <h1>Console</h1>
+            <span>API Monitor</span>
+            <span class="groq-badge">⚡ Groq AI</span>
+        </div>
+        <div class="header-actions">
+            <div class="refresh-indicator">
+                <span class="refresh-dot"></span>
+                <span>Live</span>
+            </div>
+            <a href="{{ admin_path }}/tokens" class="btn btn-secondary">🎯 Canary Tokens</a>
+            <a href="{{ admin_path }}/settings" class="btn btn-secondary">⚙️ Settings</a>
+            <a href="{{ admin_path }}/export/json" class="btn btn-secondary">Export JSON</a>
+            <a href="{{ admin_path }}/export/csv" class="btn btn-secondary">Export CSV</a>
+            <a href="{{ admin_path }}/logout" class="btn btn-primary">Logout</a>
+        </div>
+    </header>
+
+    <div class="container">
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Requests</h3>
+                <div class="stat-value" id="total-requests">{{ stats.total_requests }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Unique IPs</h3>
+                <div class="stat-value" id="unique-ips">{{ stats.unique_ips }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>API Keys Captured</h3>
+                <div class="stat-value" id="unique-keys">{{ stats.unique_api_keys }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Credential Stuffers</h3>
+                <div class="stat-value" id="credential-stuffers">{{ stats.classification_breakdown.get('credential_stuffer', 0) }}</div>
+            </div>
+            <div class="stat-card critical">
+                <h3>High/Critical Threats</h3>
+                <div class="stat-value" id="critical-threats">{{ stats.get('critical_threats', 0) }}</div>
+            </div>
+        </div>
+
+        <div class="content-grid">
+            <div>
+                <div class="panel" style="margin-bottom: 20px;">
+                    <div class="panel-header">
+                        <h2>Attack Sources</h2>
+                    </div>
+                    <div class="panel-body">
+                        <div id="map"></div>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Live Request Feed</h2>
+                        <span class="refresh-indicator">
+                            <span class="refresh-dot"></span>
+                            Auto-refresh: 5s | Click request for AI analysis
+                        </span>
+                    </div>
+                    <div class="request-feed" id="request-feed">
+                        {% for req in recent_requests %}
+                        <div class="request-item" data-id="{{ req.id }}" onclick="toggleAnalysis(this, {{ req | tojson | safe }})">
+                            <div class="request-header">
+                                <div>
+                                    <span class="request-id">#{{ req.id }}</span>
+                                    <span class="request-method {{ req.method }}">{{ req.method }}</span>
+                                </div>
+                                <span class="request-time">{{ req.timestamp }}</span>
+                            </div>
+                            <div class="request-path">{{ req.path }}</div>
+                            <div class="request-meta">
+                                <span class="request-ip">{{ req.source_ip }}</span>
+                                {% if req.country_name %}<span>{{ req.country_name }}</span>{% endif %}
+                                {% if req.classification %}<span class="badge {{ req.classification }}">{{ req.classification }}</span>{% endif %}
+                                {% if req.threat_level %}<span class="threat-badge {{ req.threat_level }}">{{ req.threat_level }}</span>{% endif %}
+                            </div>
+                            <div class="ai-analysis" id="analysis-{{ req.id }}">
+                                {% if req.ai_summary %}
+                                <div class="ai-analysis-header">
+                                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                                    AI Analysis
+                                </div>
+                                <div class="ai-summary">{{ req.ai_summary }}</div>
+                                {% if req.ai_details %}<div class="ai-details">{{ req.ai_details }}</div>{% endif %}
+                                {% if req.ai_recommendations %}
+                                <div class="ai-recommendations">
+                                    <h4>Recommendations</h4>
+                                    <ul>
+                                    {% for rec in req.ai_recommendations %}
+                                        <li>{{ rec }}</li>
+                                    {% endfor %}
+                                    </ul>
+                                </div>
+                                {% endif %}
+                                {% else %}
+                                <div class="ai-analysis-header">
+                                    <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                                    AI Analysis
+                                </div>
+                                <div class="ai-summary" style="color: var(--text-secondary);">Analysis pending or not available...</div>
+                                {% endif %}
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar-panels">
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Threat Levels</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="classification-list" id="threat-list">
+                            {% for level, count in stats.get('threat_levels', {}).items() %}
+                            <li class="classification-item">
+                                <span class="threat-badge {{ level }}">{{ level }}</span>
+                                <span>{{ count }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Classifications</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="classification-list" id="classification-list">
+                            {% for class_name, count in stats.classification_breakdown.items() %}
+                            <li class="classification-item">
+                                <span class="badge {{ class_name }}">{{ class_name }}</span>
+                                <span>{{ count }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Top Countries</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="country-list" id="country-list">
+                            {% for country in stats.top_countries %}
+                            <li class="country-item">
+                                <span class="country-name">
+                                    <span class="country-flag">{{ country.code | country_flag }}</span>
+                                    <span>{{ country.code }}</span>
+                                </span>
+                                <span class="country-count">{{ country.count }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Top Endpoints</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="country-list">
+                            {% for path in stats.top_paths %}
+                            <li class="country-item">
+                                <span style="font-family: monospace; font-size: 12px;">{{ path.path }}</span>
+                                <span class="country-count">{{ path.count }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="panel">
+                    <div class="panel-header">
+                        <h2>Top Networks</h2>
+                    </div>
+                    <div class="panel-body">
+                        <ul class="country-list">
+                            {% for org in stats.top_asn_orgs %}
+                            <li class="country-item">
+                                <span style="font-size: 12px;">{{ org.org[:25] }}{% if org.org|length > 25 %}...{% endif %}</span>
+                                <span class="country-count">{{ org.count }}</span>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([20, 0], 2);
+
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(map);
+
+        const attackIcon = L.divIcon({
+            className: 'attack-marker',
+            html: '<div style="background: #e94560; width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(233, 69, 96, 0.5); box-shadow: 0 0 10px rgba(233, 69, 96, 0.8);"></div>',
+            iconSize: [12, 12],
+            iconAnchor: [6, 6]
+        });
+
+        const ADMIN_PATH = '{{ admin_path }}';
+
+        async function loadMapData() {
+            try {
+                const response = await fetch(ADMIN_PATH + '/api/map');
+                const data = await response.json();
+                data.forEach(point => {
+                    if (point.lat && point.lng) {
+                        L.marker([point.lat, point.lng], { icon: attackIcon })
+                            .addTo(map)
+                            .bindPopup(`<strong>${point.ip}</strong><br>${point.city || 'Unknown'}, ${point.country || 'Unknown'}<br>Requests: ${point.count}`);
+                    }
+                });
+            } catch (error) {
+                console.error('Failed to load map data:', error);
+            }
+        }
+
+        function toggleAnalysis(element, reqData) {
+            const analysisDiv = element.querySelector('.ai-analysis');
+            const isVisible = analysisDiv.classList.contains('visible');
+
+            // Hide all others
+            document.querySelectorAll('.ai-analysis.visible').forEach(el => {
+                el.classList.remove('visible');
+                el.closest('.request-item').classList.remove('expanded');
+            });
+
+            if (!isVisible) {
+                analysisDiv.classList.add('visible');
+                element.classList.add('expanded');
+            }
+        }
+
+        async function refreshData() {
+            try {
+                const statsResponse = await fetch(ADMIN_PATH + '/api/stats');
+                const stats = await statsResponse.json();
+
+                document.getElementById('total-requests').textContent = stats.total_requests;
+                document.getElementById('unique-ips').textContent = stats.unique_ips;
+                document.getElementById('unique-keys').textContent = stats.unique_api_keys;
+                document.getElementById('credential-stuffers').textContent = stats.classification_breakdown.credential_stuffer || 0;
+                document.getElementById('critical-threats').textContent = stats.critical_threats || 0;
+
+                const requestsResponse = await fetch(ADMIN_PATH + '/api/requests?limit=100');
+                const requests = await requestsResponse.json();
+
+                const feed = document.getElementById('request-feed');
+                feed.innerHTML = requests.map(req => `
+                    <div class="request-item" data-id="${req.id}" onclick="toggleAnalysis(this, ${JSON.stringify(req).replace(/"/g, '&quot;')})">
+                        <div class="request-header">
+                            <div>
+                                <span class="request-id">#${req.id}</span>
+                                <span class="request-method ${req.method}">${req.method}</span>
+                            </div>
+                            <span class="request-time">${req.timestamp}</span>
+                        </div>
+                        <div class="request-path">${req.path}</div>
+                        <div class="request-meta">
+                            <span class="request-ip">${req.source_ip}</span>
+                            ${req.country_name ? `<span>${req.country_name}</span>` : ''}
+                            ${req.classification ? `<span class="badge ${req.classification}">${req.classification}</span>` : ''}
+                            ${req.threat_level ? `<span class="threat-badge ${req.threat_level}">${req.threat_level}</span>` : ''}
+                        </div>
+                        <div class="ai-analysis" id="analysis-${req.id}">
+                            <div class="ai-analysis-header">
+                                <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+                                AI Analysis
+                            </div>
+                            ${req.ai_summary ? `
+                                <div class="ai-summary">${req.ai_summary}</div>
+                                ${req.ai_details ? `<div class="ai-details">${req.ai_details}</div>` : ''}
+                                ${req.ai_recommendations && req.ai_recommendations.length ? `
+                                    <div class="ai-recommendations">
+                                        <h4>Recommendations</h4>
+                                        <ul>${req.ai_recommendations.map(r => `<li>${r}</li>`).join('')}</ul>
+                                    </div>
+                                ` : ''}
+                            ` : '<div class="ai-summary" style="color: var(--text-secondary);">Analysis pending...</div>'}
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Failed to refresh data:', error);
+            }
+        }
+
+        loadMapData();
+        setInterval(refreshData, 5000);
+    </script>
+</body>
+</html>

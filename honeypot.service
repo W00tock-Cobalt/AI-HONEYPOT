@@ -1,0 +1,35 @@
+[Unit]
+Description=OpenAI API Honeypot
+Documentation=https://github.com/your-repo/honeypot
+After=network.target
+
+[Service]
+Type=simple
+User=honeypot
+Group=honeypot
+WorkingDirectory=/opt/honeypot
+Environment="PATH=/opt/honeypot/venv/bin"
+EnvironmentFile=/opt/honeypot/.env
+ExecStart=/opt/honeypot/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8000
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/honeypot
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=honeypot
+
+[Install]
+WantedBy=multi-user.target

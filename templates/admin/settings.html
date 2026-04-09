@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Settings</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            --bg-primary: #0f0f1a;
+            --bg-secondary: #1a1a2e;
+            --bg-tertiary: #252542;
+            --accent: #e94560;
+            --accent-hover: #ff6b8a;
+            --text-primary: #e4e4e4;
+            --text-secondary: #888;
+            --border: rgba(100, 100, 150, 0.2);
+            --success: #4ade80;
+            --warning: #fbbf24;
+            --danger: #f87171;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+        }
+
+        .header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header h1 {
+            font-size: 20px;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .header-actions { display: flex; gap: 15px; }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: 6px;
+            border: none;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-primary:hover { background: var(--accent-hover); }
+        .btn-secondary { background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border); }
+        .btn-secondary:hover { background: rgba(100, 100, 150, 0.2); }
+        .btn-success { background: var(--success); color: #000; }
+        .btn-sm { padding: 6px 12px; font-size: 12px; }
+
+        .container { max-width: 900px; margin: 0 auto; padding: 30px; }
+
+        .section {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            margin-bottom: 24px;
+            overflow: hidden;
+        }
+
+        .section-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .section-header h2 { font-size: 16px; font-weight: 600; }
+        .section-header .icon { font-size: 20px; }
+        .section-body { padding: 20px; }
+        .form-group { margin-bottom: 20px; }
+        .form-group:last-child { margin-bottom: 0; }
+        .form-group label { display: block; margin-bottom: 8px; font-size: 14px; color: var(--text-secondary); }
+        .form-group label strong { color: var(--text-primary); }
+
+        .form-control {
+            width: 100%;
+            padding: 12px 16px;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+
+        .form-control:focus { outline: none; border-color: var(--accent); }
+        .form-control::placeholder { color: #555; }
+        .form-control.mono { font-family: 'Monaco', 'Menlo', monospace; }
+        .form-hint { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+        .form-hint a { color: var(--accent); text-decoration: none; }
+        .form-hint a:hover { text-decoration: underline; }
+
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+        @media (max-width: 600px) { .form-row, .form-row-3 { grid-template-columns: 1fr; } }
+
+        .switch-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .switch-group:last-child { border-bottom: none; }
+        .switch-label { display: flex; flex-direction: column; gap: 4px; }
+        .switch-label strong { font-size: 14px; }
+        .switch-label span { font-size: 12px; color: var(--text-secondary); }
+
+        .switch { position: relative; width: 50px; height: 28px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider {
+            position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+            background-color: var(--bg-tertiary); border: 1px solid var(--border);
+            transition: 0.3s; border-radius: 28px;
+        }
+        .slider:before {
+            position: absolute; content: ""; height: 20px; width: 20px;
+            left: 4px; bottom: 3px; background-color: var(--text-secondary);
+            transition: 0.3s; border-radius: 50%;
+        }
+        input:checked + .slider { background-color: var(--accent); border-color: var(--accent); }
+        input:checked + .slider:before { transform: translateX(20px); background-color: white; }
+
+        .status-indicator {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 600;
+        }
+        .status-indicator.success { background: rgba(74, 222, 128, 0.2); color: var(--success); }
+        .status-indicator.warning { background: rgba(251, 191, 36, 0.2); color: var(--warning); }
+        .status-indicator.error { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+
+        .toast {
+            position: fixed; bottom: 30px; right: 30px; padding: 16px 24px;
+            background: var(--success); color: white; border-radius: 8px;
+            font-weight: 600; opacity: 0; transform: translateY(20px);
+            transition: all 0.3s; z-index: 1000;
+        }
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast.error { background: var(--danger); }
+
+        .input-group { display: flex; gap: 10px; }
+        .input-group .form-control { flex: 1; }
+
+        .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+        .tag {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 6px 12px; background: var(--bg-tertiary);
+            border: 1px solid var(--border); border-radius: 6px;
+            font-size: 13px; font-family: monospace;
+        }
+        .tag .remove { cursor: pointer; color: var(--danger); font-weight: bold; }
+
+        .collapsible { cursor: pointer; }
+        .collapsible-content { display: none; padding-top: 15px; }
+        .collapsible-content.show { display: block; }
+
+        .test-result {
+            margin-top: 10px; padding: 10px; border-radius: 6px;
+            font-size: 13px; display: none;
+        }
+        .test-result.success { display: block; background: rgba(74, 222, 128, 0.1); color: var(--success); }
+        .test-result.error { display: block; background: rgba(248, 113, 113, 0.1); color: var(--danger); }
+
+        .divider { height: 1px; background: var(--border); margin: 20px 0; }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>Settings</h1>
+        <div class="header-actions">
+            <a href="{{ admin_path }}" class="btn btn-secondary">← Dashboard</a>
+            <button class="btn btn-primary" onclick="saveAll()">💾 Save All</button>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- AI Analysis -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">🤖</span>
+                <h2>AI Analysis (Groq)</h2>
+                <span class="status-indicator {{ 'success' if config.groq_api_key else 'warning' }}" id="groq-status">
+                    <span class="status-dot"></span>
+                    {{ 'Connected' if config.groq_api_key else 'Not Configured' }}
+                </span>
+            </div>
+            <div class="section-body">
+                <div class="form-group">
+                    <label><strong>Groq API Key</strong></label>
+                    <div class="input-group">
+                        <input type="password" class="form-control mono" id="groq_api_key"
+                               placeholder="gsk_xxxxxxxxxxxxxxxxxxxxxxxx"
+                               value="{{ config.groq_api_key }}">
+                        <button class="btn btn-secondary btn-sm" onclick="testGroq()">Test</button>
+                    </div>
+                    <p class="form-hint">Free at <a href="https://console.groq.com/keys" target="_blank">console.groq.com</a></p>
+                    <div class="test-result" id="groq-test-result"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label><strong>Model</strong></label>
+                        <select class="form-control" id="groq_model">
+                            <option value="llama-3.1-8b-instant" {{ 'selected' if config.groq_model == 'llama-3.1-8b-instant' }}>Llama 3.1 8B (Fast)</option>
+                            <option value="llama-3.1-70b-versatile" {{ 'selected' if config.groq_model == 'llama-3.1-70b-versatile' }}>Llama 3.1 70B (Better)</option>
+                            <option value="mixtral-8x7b-32768" {{ 'selected' if config.groq_model == 'mixtral-8x7b-32768' }}>Mixtral 8x7B</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Enable AI Analysis</strong></label>
+                        <label class="switch" style="margin-top: 8px;">
+                            <input type="checkbox" id="groq_enabled" {{ 'checked' if config.groq_enabled }}>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Webhooks & Alerts -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">🔔</span>
+                <h2>Alerts & Webhooks</h2>
+            </div>
+            <div class="section-body">
+                <div class="form-group">
+                    <label><strong>Slack Webhook URL</strong></label>
+                    <div class="input-group">
+                        <input type="password" class="form-control mono" id="slack_webhook_url"
+                               placeholder="https://hooks.slack.com/services/xxx/xxx/xxx"
+                               value="{{ config.slack_webhook_url }}">
+                        <button class="btn btn-secondary btn-sm" onclick="testWebhook('slack')">Test</button>
+                    </div>
+                    <div class="test-result" id="slack-test-result"></div>
+                </div>
+                <div class="form-group">
+                    <label><strong>Discord Webhook URL</strong></label>
+                    <div class="input-group">
+                        <input type="password" class="form-control mono" id="discord_webhook_url"
+                               placeholder="https://discord.com/api/webhooks/xxx/xxx"
+                               value="{{ config.discord_webhook_url }}">
+                        <button class="btn btn-secondary btn-sm" onclick="testWebhook('discord')">Test</button>
+                    </div>
+                    <div class="test-result" id="discord-test-result"></div>
+                </div>
+                <div class="form-group">
+                    <label><strong>Generic Webhook</strong> (SIEM/Splunk/ELK)</label>
+                    <div class="input-group">
+                        <input type="password" class="form-control mono" id="webhook_url"
+                               placeholder="https://your-siem.com/api/ingest"
+                               value="{{ config.webhook_url }}">
+                        <button class="btn btn-secondary btn-sm" onclick="testWebhook('generic')">Test</button>
+                    </div>
+                    <div class="test-result" id="generic-test-result"></div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label><strong>Alert Threshold</strong></label>
+                        <select class="form-control" id="alert_threshold">
+                            <option value="low" {{ 'selected' if config.alert_threshold == 'low' }}>Low (All events)</option>
+                            <option value="medium" {{ 'selected' if config.alert_threshold == 'medium' }}>Medium (Default)</option>
+                            <option value="high" {{ 'selected' if config.alert_threshold == 'high' }}>High threats only</option>
+                            <option value="critical" {{ 'selected' if config.alert_threshold == 'critical' }}>Critical only</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Rate Limit (seconds)</strong></label>
+                        <input type="number" class="form-control" id="alert_rate_limit"
+                               value="{{ config.alert_rate_limit }}" min="0" max="3600">
+                    </div>
+                </div>
+
+                <div class="divider"></div>
+
+                <!-- Email SMTP -->
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Email Alerts (SMTP)</strong>
+                        <span>Send alerts via email</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="smtp_enabled" {{ 'checked' if config.smtp_enabled }} onchange="toggleSmtp()">
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div id="smtp-settings" style="{{ '' if config.smtp_enabled else 'display:none' }}">
+                    <div class="form-row" style="margin-top: 15px;">
+                        <div class="form-group">
+                            <label><strong>SMTP Host</strong></label>
+                            <input type="text" class="form-control" id="smtp_host" placeholder="smtp.gmail.com" value="{{ config.smtp_host }}">
+                        </div>
+                        <div class="form-group">
+                            <label><strong>Port</strong></label>
+                            <input type="number" class="form-control" id="smtp_port" value="{{ config.smtp_port or 587 }}">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label><strong>Username</strong></label>
+                            <input type="text" class="form-control" id="smtp_username" value="{{ config.smtp_username }}">
+                        </div>
+                        <div class="form-group">
+                            <label><strong>Password</strong></label>
+                            <input type="password" class="form-control" id="smtp_password" value="{{ config.smtp_password }}">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label><strong>From Address</strong></label>
+                            <input type="email" class="form-control" id="smtp_from" placeholder="alerts@example.com" value="{{ config.smtp_from }}">
+                        </div>
+                        <div class="form-group">
+                            <label><strong>To Addresses</strong> (comma-separated)</label>
+                            <input type="text" class="form-control" id="smtp_to" placeholder="admin@example.com, soc@example.com" value="{{ config.smtp_to }}">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- GeoIP -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">🌍</span>
+                <h2>GeoIP / MaxMind</h2>
+                <span class="status-indicator {{ 'success' if geoip_loaded else 'warning' }}">
+                    <span class="status-dot"></span>
+                    {{ 'Database Loaded' if geoip_loaded else 'Not Loaded' }}
+                </span>
+            </div>
+            <div class="section-body">
+                <div class="form-group">
+                    <label><strong>MaxMind License Key</strong></label>
+                    <div class="input-group">
+                        <input type="password" class="form-control mono" id="maxmind_license_key"
+                               placeholder="Your MaxMind license key"
+                               value="{{ config.maxmind_license_key }}">
+                        <button class="btn btn-success btn-sm" onclick="downloadGeoIP()">📥 Download DB</button>
+                    </div>
+                    <p class="form-hint">Free at <a href="https://www.maxmind.com/en/geolite2/signup" target="_blank">maxmind.com</a></p>
+                    <div class="test-result" id="geoip-result"></div>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Enable GeoIP Lookup</strong>
+                        <span>Resolve IP addresses to locations</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="geoip_enabled" {{ 'checked' if config.geoip_enabled }}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Canary Tokens -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">🎯</span>
+                <h2>Canary Tokens</h2>
+            </div>
+            <div class="section-body">
+                <p class="form-hint" style="margin-bottom: 15px;">
+                    Add API keys to track specifically. If any of these keys are used, you'll get a high-priority alert.
+                    Use these as "honey tokens" seeded in your infrastructure.
+                </p>
+                <div class="tag-list" id="canary-list">
+                    {% for token in config.canary_tokens %}
+                    <span class="tag">{{ token[:20] }}...<span class="remove" onclick="removeCanary('{{ token }}')">×</span></span>
+                    {% endfor %}
+                </div>
+                <div class="input-group" style="margin-top: 15px;">
+                    <input type="text" class="form-control mono" id="new-canary" placeholder="sk-proj-your-canary-token...">
+                    <button class="btn btn-secondary" onclick="addCanary()">Add Token</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Multi-Port -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">🔌</span>
+                <h2>Multi-Port Listening</h2>
+            </div>
+            <div class="section-body">
+                <p class="form-hint" style="margin-bottom: 15px;">Primary port: 8000. Add more ports to capture traffic on common API ports.</p>
+                <div class="tag-list" id="port-list">
+                    {% for port in config.additional_ports %}
+                    <span class="tag">:{{ port }}<span class="remove" onclick="removePort({{ port }})">×</span></span>
+                    {% endfor %}
+                </div>
+                <div class="input-group" style="margin-top: 15px;">
+                    <input type="number" class="form-control" id="new-port" placeholder="443" min="1" max="65535" style="width: 120px;">
+                    <button class="btn btn-secondary" onclick="addPort()">Add Port</button>
+                </div>
+                <p class="form-hint" style="margin-top: 10px;">⚠️ Requires restart. Ensure firewall allows these ports.</p>
+            </div>
+        </div>
+
+        <!-- Logging & Retention -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">📝</span>
+                <h2>Logging & Data Retention</h2>
+            </div>
+            <div class="section-body">
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Log Request Headers</strong>
+                        <span>Store all HTTP headers</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="log_headers" {{ 'checked' if config.log_headers }}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Log Request Body</strong>
+                        <span>Store raw request content</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="log_body" {{ 'checked' if config.log_body }}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Log Response Body</strong>
+                        <span>Store API response bodies</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="log_response" {{ 'checked' if config.log_response }}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+                <div class="switch-group">
+                    <div class="switch-label">
+                        <strong>Verbose Console</strong>
+                        <span>Detailed terminal output</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="verbose_console" {{ 'checked' if config.verbose_console }}>
+                        <span class="slider"></span>
+                    </label>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label><strong>Data Retention (days)</strong></label>
+                        <input type="number" class="form-control" id="retention_days" value="{{ config.retention_days }}" min="0">
+                        <p class="form-hint">Auto-delete logs older than X days (0 = keep forever)</p>
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Max DB Size (MB)</strong></label>
+                        <input type="number" class="form-control" id="max_db_size_mb" value="{{ config.max_db_size_mb }}" min="0">
+                        <p class="form-hint">Prune oldest logs when exceeded (0 = unlimited)</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Response Customization -->
+        <div class="section">
+            <div class="section-header">
+                <span class="icon">⚙️</span>
+                <h2>Response Customization</h2>
+            </div>
+            <div class="section-body">
+                <div class="form-group">
+                    <label><strong>Fake Organization Name</strong></label>
+                    <input type="text" class="form-control" id="fake_org_name" value="{{ config.fake_org_name }}" placeholder="org-internal">
+                    <p class="form-hint">Appears in OpenAI-style response headers</p>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label><strong>Min Response Delay (ms)</strong></label>
+                        <input type="number" class="form-control" id="response_delay_min_ms" value="{{ config.response_delay_min_ms }}" min="0">
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Max Response Delay (ms)</strong></label>
+                        <input type="number" class="form-control" id="response_delay_max_ms" value="{{ config.response_delay_max_ms }}" min="0">
+                    </div>
+                </div>
+                <p class="form-hint">Random delay between min-max to prevent timing fingerprinting</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast">Settings saved!</div>
+
+    <script>
+        let additionalPorts = {{ config.additional_ports | tojson }};
+        let canaryTokens = {{ config.canary_tokens | tojson }};
+
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = 'toast show' + (isError ? ' error' : '');
+            setTimeout(() => toast.className = 'toast', 3000);
+        }
+
+        function toggleSmtp() {
+            document.getElementById('smtp-settings').style.display =
+                document.getElementById('smtp_enabled').checked ? 'block' : 'none';
+        }
+
+        function addPort() {
+            const input = document.getElementById('new-port');
+            const port = parseInt(input.value);
+            if (port && port > 0 && port < 65536 && !additionalPorts.includes(port)) {
+                additionalPorts.push(port);
+                renderPorts();
+                input.value = '';
+            }
+        }
+
+        function removePort(port) {
+            additionalPorts = additionalPorts.filter(p => p !== port);
+            renderPorts();
+        }
+
+        function renderPorts() {
+            document.getElementById('port-list').innerHTML = additionalPorts.map(port =>
+                `<span class="tag">:${port}<span class="remove" onclick="removePort(${port})">×</span></span>`
+            ).join('');
+        }
+
+        function addCanary() {
+            const input = document.getElementById('new-canary');
+            const token = input.value.trim();
+            if (token && !canaryTokens.includes(token)) {
+                canaryTokens.push(token);
+                renderCanaries();
+                input.value = '';
+            }
+        }
+
+        function removeCanary(token) {
+            canaryTokens = canaryTokens.filter(t => t !== token);
+            renderCanaries();
+        }
+
+        function renderCanaries() {
+            document.getElementById('canary-list').innerHTML = canaryTokens.map(token =>
+                `<span class="tag">${token.substring(0, 20)}...<span class="remove" onclick="removeCanary('${token}')">×</span></span>`
+            ).join('');
+        }
+
+        async function testGroq() {
+            const key = document.getElementById('groq_api_key').value;
+            const result = document.getElementById('groq-test-result');
+            if (!key) {
+                result.className = 'test-result error';
+                result.textContent = 'Please enter an API key';
+                return;
+            }
+            result.className = 'test-result';
+            result.style.display = 'block';
+            result.textContent = 'Testing...';
+
+            try {
+                const response = await fetch('/admin/api/test-groq', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: key })
+                });
+                const data = await response.json();
+                result.className = 'test-result ' + (data.success ? 'success' : 'error');
+                result.textContent = data.message;
+            } catch (e) {
+                result.className = 'test-result error';
+                result.textContent = 'Test failed: ' + e.message;
+            }
+        }
+
+        async function testWebhook(type) {
+            const urlField = document.getElementById(type === 'generic' ? 'webhook_url' : type + '_webhook_url');
+            const result = document.getElementById(type + '-test-result');
+            const url = urlField.value;
+
+            if (!url) {
+                result.className = 'test-result error';
+                result.textContent = 'Please enter a webhook URL';
+                return;
+            }
+
+            result.className = 'test-result';
+            result.style.display = 'block';
+            result.textContent = 'Sending test...';
+
+            try {
+                const response = await fetch('/admin/api/test-webhook', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ type, url })
+                });
+                const data = await response.json();
+                result.className = 'test-result ' + (data.success ? 'success' : 'error');
+                result.textContent = data.message;
+            } catch (e) {
+                result.className = 'test-result error';
+                result.textContent = 'Test failed: ' + e.message;
+            }
+        }
+
+        async function downloadGeoIP() {
+            const key = document.getElementById('maxmind_license_key').value;
+            const result = document.getElementById('geoip-result');
+
+            if (!key) {
+                result.className = 'test-result error';
+                result.textContent = 'Please enter a MaxMind license key';
+                return;
+            }
+
+            result.className = 'test-result';
+            result.style.display = 'block';
+            result.textContent = 'Downloading GeoLite2 database...';
+
+            try {
+                const response = await fetch('/admin/api/download-geoip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ license_key: key })
+                });
+                const data = await response.json();
+                result.className = 'test-result ' + (data.success ? 'success' : 'error');
+                result.textContent = data.message;
+            } catch (e) {
+                result.className = 'test-result error';
+                result.textContent = 'Download failed: ' + e.message;
+            }
+        }
+
+        async function saveAll() {
+            const config = {
+                groq_api_key: document.getElementById('groq_api_key').value,
+                groq_model: document.getElementById('groq_model').value,
+                groq_enabled: document.getElementById('groq_enabled').checked,
+                slack_webhook_url: document.getElementById('slack_webhook_url').value,
+                discord_webhook_url: document.getElementById('discord_webhook_url').value,
+                webhook_url: document.getElementById('webhook_url').value,
+                alert_threshold: document.getElementById('alert_threshold').value,
+                alert_rate_limit: parseInt(document.getElementById('alert_rate_limit').value) || 60,
+                smtp_enabled: document.getElementById('smtp_enabled').checked,
+                smtp_host: document.getElementById('smtp_host').value,
+                smtp_port: parseInt(document.getElementById('smtp_port').value) || 587,
+                smtp_username: document.getElementById('smtp_username').value,
+                smtp_password: document.getElementById('smtp_password').value,
+                smtp_from: document.getElementById('smtp_from').value,
+                smtp_to: document.getElementById('smtp_to').value,
+                maxmind_license_key: document.getElementById('maxmind_license_key').value,
+                geoip_enabled: document.getElementById('geoip_enabled').checked,
+                additional_ports: additionalPorts,
+                canary_tokens: canaryTokens,
+                log_headers: document.getElementById('log_headers').checked,
+                log_body: document.getElementById('log_body').checked,
+                log_response: document.getElementById('log_response').checked,
+                verbose_console: document.getElementById('verbose_console').checked,
+                retention_days: parseInt(document.getElementById('retention_days').value) || 90,
+                max_db_size_mb: parseInt(document.getElementById('max_db_size_mb').value) || 0,
+                fake_org_name: document.getElementById('fake_org_name').value,
+                response_delay_min_ms: parseInt(document.getElementById('response_delay_min_ms').value) || 80,
+                response_delay_max_ms: parseInt(document.getElementById('response_delay_max_ms').value) || 300,
+            };
+
+            try {
+                const response = await fetch('/admin/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+
+                if (response.ok) {
+                    showToast('✅ Settings saved!');
+                } else {
+                    showToast('Failed to save settings', true);
+                }
+            } catch (error) {
+                showToast('Error: ' + error.message, true);
+            }
+        }
+    </script>
+</body>
+</html>

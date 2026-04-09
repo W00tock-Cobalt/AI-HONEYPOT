@@ -1,0 +1,30 @@
+# Core framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.18
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+aiosqlite==0.20.0
+
+# Templates and admin
+jinja2==3.1.4
+python-dotenv==1.0.1
+
+# Security
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# Geolocation
+geoip2==4.8.1
+maxminddb==2.6.2
+
+# Console output
+rich==13.9.4
+
+# HTTP client for setup
+httpx==0.28.1
+
+# Utilities
+pydantic==2.10.3
+pydantic-settings==2.6.1

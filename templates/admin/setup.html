@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Initial Setup</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #e4e4e4;
+        }
+
+        .setup-container {
+            background: rgba(26, 26, 46, 0.95);
+            border: 1px solid rgba(100, 100, 150, 0.3);
+            border-radius: 12px;
+            padding: 48px 40px;
+            width: 100%;
+            max-width: 480px;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 36px;
+        }
+
+        .header .step-badge {
+            display: inline-block;
+            background: rgba(99, 179, 237, 0.15);
+            border: 1px solid rgba(99, 179, 237, 0.4);
+            color: #63b3ed;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            padding: 4px 12px;
+            border-radius: 20px;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+
+        .header h1 {
+            font-size: 22px;
+            font-weight: 700;
+            color: #e4e4e4;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: #888;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 7px;
+            color: #aaa;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 11px 14px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(100, 100, 150, 0.3);
+            border-radius: 6px;
+            color: #fff;
+            font-size: 15px;
+            transition: border-color 0.2s;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #63b3ed;
+        }
+
+        .hint {
+            margin-top: 5px;
+            font-size: 11px;
+            color: #666;
+        }
+
+        button[type="submit"] {
+            width: 100%;
+            padding: 13px;
+            background: linear-gradient(135deg, #3182ce 0%, #2c5282 100%);
+            border: none;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 8px;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+
+        button[type="submit"]:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+
+        .error {
+            background: rgba(248, 113, 113, 0.12);
+            border: 1px solid rgba(248, 113, 113, 0.4);
+            color: #fc8181;
+            padding: 12px 14px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 13px;
+        }
+
+        .rules {
+            margin-top: 24px;
+            padding: 14px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 6px;
+            font-size: 12px;
+            color: #666;
+            line-height: 1.8;
+        }
+
+        .rules strong {
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+    <div class="setup-container">
+        <div class="header">
+            <div class="step-badge">First-Run Setup</div>
+            <h1>Create Admin Account</h1>
+            <p>Choose credentials for your admin console.<br>These replace the defaults and cannot be recovered if lost.</p>
+        </div>
+
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+
+        <form method="POST" action="{{ admin_path }}/setup">
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required
+                       autocomplete="off" minlength="3" placeholder="e.g. secops_admin">
+                <p class="hint">Minimum 3 characters. Do not use "admin" or "root".</p>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required
+                       autocomplete="new-password" minlength="10">
+                <p class="hint">Minimum 10 characters.</p>
+            </div>
+
+            <div class="form-group">
+                <label for="confirm_password">Confirm Password</label>
+                <input type="password" id="confirm_password" name="confirm_password"
+                       required autocomplete="new-password">
+            </div>
+
+            <button type="submit">Create Account &amp; Continue</button>
+        </form>
+
+        <div class="rules">
+            <strong>Requirements:</strong><br>
+            &bull; Username ≥ 3 chars, not "admin" / "root"<br>
+            &bull; Password ≥ 10 chars, not a common phrase<br>
+            &bull; Credentials are stored as a bcrypt hash in config.json
+        </div>
+    </div>
+</body>
+</html>
