@@ -132,6 +132,32 @@ class SqlDetector:
                     f"Body length changed {base_len} -> {inj_len} ({ratio:.0%})"
                 )
 
+        # Authentication bypass via SQLi: baseline is denied (401/403 or a
+        # generic "invalid credentials" 200) but the injected payload — which
+        # looks like a SQLi auth-bypass attempt (quote + OR/UNION/comment) —
+        # succeeds (200 with what looks like a session/token). This is the
+        # classic ' OR 1=1-- login bypass and produces NO SQL error text at all,
+        # so none of the other checks above catch it.
+        payload_lower = (injected.payload or "").lower()
+        looks_like_bypass_payload = (
+            ("'" in payload_lower or '"' in payload_lower)
+            and any(kw in payload_lower for kw in (" or ", "or 1=1", "union", "--", "#"))
+        )
+        baseline_denied = baseline.status_code in (401, 403) or any(
+            kw in baseline.response_body.lower()
+            for kw in ("invalid credentials", "invalid login", "authentication failed", "incorrect password")
+        )
+        injected_succeeded = (200 <= injected.status_code < 300) and any(
+            kw in injected.response_body.lower()
+            for kw in ("token", "authentication", "bearer", '"id"', "session", "jwt")
+        )
+        if looks_like_bypass_payload and baseline_denied and injected_succeeded:
+            score = max(score, 0.9)
+            evidence_parts.append(
+                f"Auth bypass: baseline denied (HTTP {baseline.status_code}), "
+                f"SQLi payload succeeded (HTTP {injected.status_code} with session/token)"
+            )
+
         # Timing anomaly (time-based blind hint).
         # Only use the calibrated threshold on ACTUAL sleep payloads (tagged with
         # _expected_sleep_ms). For other payloads use a high fixed threshold so
@@ -210,6 +236,8 @@ class SqlDetector:
     ) -> InjectionType:
         """Infer injection type from evidence."""
         lower = evidence.lower()
+        if "auth bypass" in lower:
+            return InjectionType.BOOLEAN_BLIND  # logically a boolean-true injection
         if "sql error" in lower or self.find_sql_errors(injected.response_body):
             return InjectionType.ERROR_BASED
         if "delay" in lower or "sleep" in lower or "waitfor" in lower:

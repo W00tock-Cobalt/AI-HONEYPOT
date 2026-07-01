@@ -252,6 +252,27 @@ class Scanner:
         # Quick pre-check: send a single quote before running the full payload suite.
         # If the response is identical to baseline, this param ignores the value.
         # Skip it immediately — avoids 100s of wasted requests on dead params.
+        # Auth-bypass probe: fields that look like login credentials (email,
+        # username, password) need a FULL 'OR 1=1' style payload to reveal
+        # SQLi — a bare quote just fails the login normally (same status as
+        # baseline), which would otherwise cause the precheck below to wrongly
+        # declare the param "dead" before ever trying the payload that matters.
+        _AUTH_FIELD_NAMES = {
+            "email", "username", "user", "login", "password", "pass", "pwd",
+        }
+        if self._precheck and point.name.lower() in _AUTH_FIELD_NAMES:
+            bypass_probe = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload="' OR '1'='1'--",
+            )
+            report.total_requests += 1
+            score, evidence = self.detector.quick_score(baseline, bypass_probe)
+            if score >= 0.85:
+                return self._build_finding(
+                    point, bypass_probe, baseline, evidence, score,
+                    inj_type=InjectionType.BOOLEAN_BLIND,
+                )
+
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
             star_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
