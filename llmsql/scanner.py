@@ -56,6 +56,9 @@ class Scanner:
         self.continue_on_found = continue_on_found
         self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
         self._sleep_ms = 3000  # calibrated by CLI --sleep
+        # Precheck is always on unless explicitly disabled.
+        # In fast mode it's extra important — avoids 22 payloads on dead params.
+        self._precheck = True
 
     def scan(
         self,
@@ -206,6 +209,26 @@ class Scanner:
         report: ScanReport,
     ) -> Optional[Finding]:
         """Test a single injection point with LLM-guided payloads."""
+        # Quick pre-check: send a single quote before running the full payload suite.
+        # If the response is identical to baseline, this param ignores the value.
+        # Skip it immediately — avoids 100s of wasted requests on dead params.
+        if self._precheck and not self.detector.baseline_already_erroring(baseline):
+            probe = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload="'",
+            )
+            report.total_requests += 1
+            pre_score, pre_ev = self.detector.quick_score(baseline, probe)
+            if pre_score == 0.0 and probe.status_code == baseline.status_code:
+                self.on_progress(
+                    f"    [skip] no response diff on {point.name!r} — not injectable"
+                )
+                return None
+            if pre_score >= 0.75:
+                return self._build_finding(
+                    point, probe, baseline, pre_ev, pre_score
+                )
+
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
         else:

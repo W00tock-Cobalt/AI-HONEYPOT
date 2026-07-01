@@ -118,6 +118,9 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--fast", action="store_true",
                    help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only "
                         "(much faster with local models like llama3.2)")
+    p.add_argument("--no-precheck", action="store_true",
+                   help="Disable the quick pre-check that skips params with no response diff "
+                        "(default: precheck ON — drops dead params after 1 request)")
     p.add_argument("--payloads", default="sqlmap",
                    choices=["sqlmap", "embedded", "error", "boolean", "union", "time", "stacked"],
                    help="Payload source: 'sqlmap' reads from sqlmap XML library, "
@@ -808,6 +811,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     scanner._sleep_ms = args.sleep * 1000
+    scanner._precheck = not args.no_precheck
     if tamper_chain:
         console.print(f"[dim]Tamper chain: {', '.join(tamper_chain)}[/dim]")
     if test_path:
