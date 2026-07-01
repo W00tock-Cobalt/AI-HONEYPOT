@@ -811,6 +811,24 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(targets)} URL(s) scanned, "
         f"[bold]{total_findings}[/bold] finding(s)"
     )
+    if total_findings:
+        from rich.table import Table
+        tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
+        tbl.add_column("URL", no_wrap=False, max_width=70)
+        tbl.add_column("Param", style="bold yellow")
+        tbl.add_column("Type", style="cyan")
+        tbl.add_column("DB", style="green")
+        tbl.add_column("Conf")
+        for r in all_reports:
+            for f in r.findings:
+                tbl.add_row(
+                    r.target_url,
+                    f.param,
+                    f.injection_type.value,
+                    f.db_type or "?",
+                    f"{f.confidence:.0%}",
+                )
+        console.print(tbl)
 
     if args.output:
         if len(all_reports) == 1:
@@ -864,17 +882,15 @@ def run_sqlmap_on_findings(
     # --guess-params can produce many findings for the same endpoint (one per
     # guessed param). We only need to run sqlmap once per URL — it will probe
     # all parameters itself. If there's a confirmed param, we add -p to focus.
-    best_finding: dict[str, object] = {}  # base_url -> (extra, confidence)
+    from urllib.parse import parse_qs, urlencode
+    best_finding: dict[str, tuple] = {}  # base_url -> (extra, confidence, db_type)
     for report in reports:
-        # Canonical base: strip mined params so /count?query=test&page=1 → /count?query=test
-        from urllib.parse import parse_qs, urlencode
         raw_parsed = urlparse(report.target_url)
         raw_qs = parse_qs(raw_parsed.query, keep_blank_values=True)
         for f in report.findings:
             base = report.target_url
             extra = ""
             if f.location in (ParamLocation.QUERY, ParamLocation.BODY):
-                # Rebuild URL with only the real confirmed param
                 spec_params = {k: v for k, v in raw_qs.items() if k == f.param}
                 if not spec_params:
                     spec_params = {f.param: ["1"]}
@@ -900,9 +916,9 @@ def run_sqlmap_on_findings(
 
             prev = best_finding.get(base)
             if prev is None or f.confidence > prev[1]:
-                best_finding[base] = (extra, f.confidence)
+                best_finding[base] = (extra, f.confidence, f.db_type)
 
-    jobs = [(url, data[0]) for url, data in best_finding.items()]
+    jobs = [(url, data[0], data[2]) for url, data in best_finding.items()]
 
     if not jobs:
         console.print(
@@ -927,13 +943,18 @@ def run_sqlmap_on_findings(
         f"\n[bold cyan]Stage 2 — sqlmap targets ({len(jobs)}):[/bold cyan] "
         f"[dim]profile: {profile}[/dim]"
     )
-    for i, (url, extra) in enumerate(jobs, 1):
-        console.print(f"  {i}) {url}  [dim]{extra}[/dim]")
+    for i, (url, extra, db) in enumerate(jobs, 1):
+        db_tag = f"  [dim][{db}][/dim]" if db else ""
+        console.print(f"  {i}) {url}  [dim]{extra}[/dim]{db_tag}")
     console.print()
 
     have_sqlmap = shutil.which("sqlmap") is not None
-    for i, (url, extra) in enumerate(jobs, 1):
-        cmd = f"sqlmap -u '{url}' {base_args} {sqlmap_args} {extra}{header_args}".strip()
+    for i, (url, extra, db) in enumerate(jobs, 1):
+        dbms_flag = f"--dbms={db}" if db else ""
+        cmd = f"sqlmap -u '{url}' {base_args} {dbms_flag} {sqlmap_args} {extra}{header_args}".strip()
+        # collapse multiple spaces
+        import re as _re
+        cmd = _re.sub(r" {2,}", " ", cmd)
         console.print(f"\n[bold]━━━ sqlmap ({i}/{len(jobs)}):[/bold] {url}")
         console.print(f"[dim]{cmd}[/dim]")
         if not have_sqlmap:
