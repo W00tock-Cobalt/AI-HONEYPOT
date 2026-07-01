@@ -85,17 +85,31 @@ class HttpProbe:
             ))
 
         # Parameter mining: add common param names the URL doesn't expose.
-        # For CGI-style ?action=X URLs, prioritise action-specific params first.
         if guess_params:
-            action_val = (list(existing)[0] if "action" in existing else "")
-            if "action" in existing:
-                import re as _re
-                qs_raw = parsed.query
-                am = _re.search(r"[?&]action=([^&]+)", "?" + qs_raw)
-                action_val = am.group(1).lower() if am else ""
+            import re as _re
+            # For CGI ?action=X URLs, prioritise the action-specific params first
+            am = _re.search(r"[?&]action=([^&]+)", "?" + parsed.query)
+            action_val = am.group(1).lower() if am else ""
             priority = _ACTION_PARAM_MAP.get(action_val, [])
+
+            # For bare REST API paths (/api/X, /rest/X) with no existing params,
+            # only try a small focused set to avoid 90+ requests per endpoint.
+            # The precheck will quickly skip dead ones anyway.
+            path_lower = parsed.path.lower()
+            is_rest_api = (
+                not existing  # no existing query params
+                and not action_val
+                and any(seg in path_lower for seg in ("/api/", "/rest/", "/v1/", "/v2/", "/graphql"))
+            )
+            if is_rest_api and not priority:
+                # Short REST-focused list: search, filter, id, q are most common SQLi vectors
+                candidate_params = ["q", "search", "query", "id", "filter", "name",
+                                    "email", "username", "orderBy", "sort"]
+            else:
+                candidate_params = list(guess_params)
+
             seen_params = set(existing)
-            for name in priority + list(guess_params):
+            for name in priority + candidate_params:
                 if name not in seen_params:
                     seen_params.add(name)
                     points.append(InjectionPoint(

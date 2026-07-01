@@ -553,6 +553,25 @@ def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | N
     return True, ollama_base_url(host), None
 
 
+_STATIC_EXT = frozenset({
+    ".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf", ".zip", ".gz",
+    ".tar", ".mp4", ".mp3", ".webm", ".wav",
+})
+_STATIC_SEGS = ("/assets/", "/static/", "/images/", "/img/", "/fonts/",
+                "/dist/", "/build/", "/vendor/", "/node_modules/")
+
+
+def _is_static(url: str) -> bool:
+    """Return True for static assets that cannot contain SQL injection."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower()
+    ext = path[path.rfind("."):] if "." in path else ""
+    if ext in _STATIC_EXT:
+        return True
+    return any(s in url.lower() for s in _STATIC_SEGS)
+
+
 def _auto_discover(args, targets: list[str], console) -> None:
     """
     Smart target discovery for --auto mode.
@@ -598,9 +617,14 @@ def _auto_discover(args, targets: list[str], console) -> None:
             ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
             capture_output=True, text=True, timeout=120,
         )
-        crawled = sorted({l.strip() for l in result.stdout.splitlines() if l.strip()})
+        raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+        crawled = sorted({u for u in raw if not _is_static(u)})
+        filtered = len(raw) - len(crawled)
         if crawled:
-            console.print(f"[green]✓[/green] katana found {len(crawled)} URL(s)")
+            console.print(
+                f"[green]✓[/green] katana: {len(crawled)} URL(s) "
+                f"[dim]({filtered} static assets dropped)[/dim]"
+            )
             args._auto_targets = crawled
         else:
             console.print("[yellow]katana found no URLs — scanning root only[/yellow]")
