@@ -629,13 +629,9 @@ def main(argv: list[str] | None = None) -> int:
     headers = parse_headers(args.headers)
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
-    # In full payload mode (not fast), allow enough attempts to use all payloads
-    if args.max_attempts:
-        max_attempts = args.max_attempts
-    elif args.fast:
-        max_attempts = 10
-    else:
-        max_attempts = level_to_attempts(args.level)
+    # max_attempts must be >= len(seed_payloads) so all payloads get tested.
+    # We resolve this after loading payloads below.
+    _raw_max_attempts = args.max_attempts
 
     # Auto-grab a session cookie (optionally via login) and reuse everywhere
     if args.grab_cookie or (args.login_url and args.login_data):
@@ -735,13 +731,22 @@ def main(argv: list[str] | None = None) -> int:
     else:
         seed_payloads = get_payloads(techniques=[args.payloads], sleep=args.sleep)
         payload_src = f"{args.payloads} technique ({len(seed_payloads)} payloads)"
-    # When --fast: use only the first 10 payloads (quick triage) per param
+
+    # --fast: only error-based payloads (fastest detection, no time-blind)
     if args.fast:
-        display_payloads = seed_payloads[:10]
-        payload_src += " [fast: first 10]"
+        from llmsql.sqlmap_payloads import PAYLOADS_ERROR_BASED
+        display_payloads = PAYLOADS_ERROR_BASED
+        payload_src = f"error-based only [{len(display_payloads)} payloads, fast mode]"
     else:
         display_payloads = seed_payloads
-    console.print(f"[dim]Payloads: {payload_src}[/dim]")
+
+    # max_attempts must cover the whole payload list so nothing is skipped
+    if _raw_max_attempts:
+        max_attempts = _raw_max_attempts
+    else:
+        max_attempts = len(display_payloads)
+
+    console.print(f"[dim]Payloads: {payload_src} | max {max_attempts}/param[/dim]")
 
     tamper_chain = []
     if args.tamper:

@@ -203,10 +203,52 @@ def _find_sqlmap_data_dir(hint: Optional[str] = None) -> Optional[Path]:
         Path(os.path.expanduser("~/.local/share/sqlmap")),
         Path(os.path.expanduser("~/sqlmap")),
         Path(os.path.expanduser("~/tools/sqlmap")),
+        Path(os.path.expanduser("~/tools/sqlmap-dev")),
+        Path("/opt/sqlmap"),
     ]:
         candidate = base / "data" / "xml" / "payloads"
         if candidate.is_dir():
             return candidate
+
+    # Try pip-installed sqlmap package
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("sqlmap")
+        if spec and spec.origin:
+            candidate = Path(spec.origin).parent / "data" / "xml" / "payloads"
+            if candidate.is_dir():
+                return candidate
+    except Exception:
+        pass
+
+    # Try `pip show sqlmap` to find location
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["pip", "show", "sqlmap"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode()
+        for line in out.splitlines():
+            if line.startswith("Location:"):
+                loc = line.split(":", 1)[1].strip()
+                candidate = Path(loc) / "sqlmap" / "data" / "xml" / "payloads"
+                if candidate.is_dir():
+                    return candidate
+    except Exception:
+        pass
+
+    # Last resort: find via `locate` (fast on Linux)
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["locate", "-r", "sqlmap/data/xml/payloads"],
+            stderr=subprocess.DEVNULL, timeout=5
+        ).decode()
+        for line in out.strip().splitlines():
+            p = Path(line.strip())
+            if p.is_dir():
+                return p
+    except Exception:
+        pass
 
     return None
 
