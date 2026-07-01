@@ -210,20 +210,27 @@ class Scanner:
         # If the response is identical to baseline, this param ignores the value.
         # Skip it immediately — avoids 100s of wasted requests on dead params.
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
-            probe = self.probe.send(
+            # Step 1: '*' — not a SQL metachar but reveals if param has any effect
+            star_probe = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload="*",
+            )
+            report.total_requests += 1
+            star_score, _ = self.detector.quick_score(baseline, star_probe)
+            if star_score == 0.0 and star_probe.status_code == baseline.status_code:
+                return None  # dead param, skip silently
+            # Step 2: param is live — probe with a quote for immediate SQL errors
+            quote_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="'",
             )
             report.total_requests += 1
-            pre_score, pre_ev = self.detector.quick_score(baseline, probe)
-            if pre_score == 0.0 and probe.status_code == baseline.status_code:
-                # Silent skip in normal mode; only log in verbose (on_progress
-                # already gates on verbose_progress in the CLI)
-                return None
+            pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
             if pre_score >= 0.75:
                 return self._build_finding(
-                    point, probe, baseline, pre_ev, pre_score
+                    point, quote_probe, baseline, pre_ev, pre_score
                 )
+            # Param is live but no immediate SQLi — run the full payload suite
 
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
