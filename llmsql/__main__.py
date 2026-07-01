@@ -927,7 +927,28 @@ def main(argv: list[str] | None = None) -> int:
                 except EOFError:
                     answer = "y"
                 if answer not in ("", "y", "yes"):
-                    console.print("[dim]Skipped sqlmap. Run manually using the commands above.[/dim]")
+                    console.print("[dim]Skipped sqlmap — printing commands to run manually:[/dim]")
+                    # Build and print the commands without executing
+                    from llmsql.models import ParamLocation
+                    from urllib.parse import urlparse as _up2, parse_qs, urlencode, urlunparse
+                    base_args = SQLMAP_PROFILES.get(args.sqlmap_profile, SQLMAP_PROFILES["normal"])
+                    header_args = "".join(
+                        f" -H '{k}: {v}'" for k, v in headers.items()
+                        if k.lower() != "user-agent"
+                    )
+                    if args.cookie:
+                        header_args += f" --cookie '{args.cookie}'"
+                    for r in all_reports:
+                        for f in r.findings:
+                            url = r.target_url
+                            extra = f"-p {f.param}" if f.location in (
+                                ParamLocation.QUERY, ParamLocation.BODY
+                            ) else ""
+                            dbms = f"--dbms={f.db_type}" if f.db_type else ""
+                            cmd = f"sqlmap -u '{url}' {base_args} {dbms} {args.sqlmap_args} {extra}{header_args}".strip()
+                            import re as _re2
+                            cmd = _re2.sub(r" {2,}", " ", cmd)
+                            console.print(f"  [dim]{cmd}[/dim]")
                     return 1 if total_findings else 0
             console.print(
                 f"[bold cyan]━━━ Stage 2 starting[/bold cyan] — "
