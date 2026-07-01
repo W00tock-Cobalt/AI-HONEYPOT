@@ -13,16 +13,30 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-# Endpoints where a Swagger/OpenAPI JSON spec is commonly served
+# Endpoints where a Swagger/OpenAPI JSON spec is commonly served.
+# Covers NestJS, Spring, Django REST, FastAPI, ASP.NET, and generic conventions.
 COMMON_SPEC_PATHS = [
     "/swagger-json",
     "/swagger.json",
     "/swagger/v1/swagger.json",
     "/openapi.json",
     "/v3/api-docs",
+    "/v2/api-docs",
     "/api-docs",
+    "/api-docs.json",
     "/api/swagger.json",
     "/api/openapi.json",
+    "/api/v1/openapi.json",
+    "/api/docs/swagger.json",
+    "/docs/swagger.json",
+    "/openapi.yaml",
+    "/swagger.yaml",
+    "/api/schema",
+    "/api/schema.json",
+    "/rest/openapi.json",
+    "/rest/swagger.json",
+    "/spec/swagger.json",
+    "/.well-known/openapi.json",
 ]
 
 
@@ -199,6 +213,21 @@ def _schema_to_example(schema: dict[str, Any], depth: int = 0) -> Any:
     return "1"
 
 
+class SpecProbeResult:
+    """Diagnostics for one attempted Swagger/OpenAPI path."""
+    __slots__ = ("path", "status", "reason")
+
+    def __init__(self, path: str, status: int, reason: str):
+        self.path = path
+        self.status = status
+        self.reason = reason
+
+
+# Populated by the most recent load_openapi() call so callers can inspect
+# exactly what was tried and why it did or didn't work — no silent failures.
+last_probe_log: list[SpecProbeResult] = []
+
+
 def load_openapi(
     source: str,
     timeout: float = 15.0,
@@ -209,8 +238,14 @@ def load_openapi(
     Load an OpenAPI/Swagger spec from a URL or local file and expand it.
 
     'source' may be a full spec URL, a local path, or a base site URL
-    (in which case common spec paths are probed).
+    (in which case common spec paths are probed). After calling this,
+    inspect `llmsql.openapi.last_probe_log` for a full diagnostic trail
+    of every path tried and its outcome.
     """
+    # Mutate the existing list in place (not rebind) so callers who imported
+    # `last_probe_log` by name still see updates after this call returns.
+    last_probe_log.clear()
+
     spec: Optional[dict[str, Any]] = None
     spec_url: Optional[str] = None
 
@@ -223,12 +258,12 @@ def load_openapi(
     client = httpx.Client(timeout=timeout, verify=verify_ssl, follow_redirects=True)
     spec_urls_gql: list[str] = []
     try:
-        # If the source already looks like a spec endpoint, fetch directly
+        # If the source already looks like a spec endpoint, fetch it directly
         candidates = [source]
         parsed = urlparse(source)
         looks_like_spec = any(
             source.rstrip("/").endswith(p) for p in
-            ("swagger-json", "swagger.json", "openapi.json", "api-docs")
+            ("swagger-json", "swagger.json", "openapi.json", "api-docs", ".yaml")
         )
         if not looks_like_spec:
             root = f"{parsed.scheme}://{parsed.netloc}"
@@ -237,14 +272,41 @@ def load_openapi(
         for cand in candidates:
             try:
                 resp = client.get(cand, headers=headers or {})
-                if resp.status_code == 200 and resp.text.strip().startswith("{"):
-                    data = resp.json()
-                    if "paths" in data:
-                        spec = data
-                        spec_url = cand
-                        break
-            except (httpx.HTTPError, json.JSONDecodeError, ValueError):
+            except httpx.HTTPError as e:
+                last_probe_log.append(SpecProbeResult(cand, 0, f"request failed: {e}"))
                 continue
+
+            if resp.status_code != 200:
+                last_probe_log.append(
+                    SpecProbeResult(cand, resp.status_code, "non-200 response")
+                )
+                continue
+
+            text = resp.text.strip()
+            if not text.startswith("{"):
+                last_probe_log.append(
+                    SpecProbeResult(cand, resp.status_code, "200 but not a JSON object")
+                )
+                continue
+
+            try:
+                data = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                last_probe_log.append(
+                    SpecProbeResult(cand, resp.status_code, "200 but invalid JSON")
+                )
+                continue
+
+            if "paths" not in data:
+                last_probe_log.append(
+                    SpecProbeResult(cand, resp.status_code, "valid JSON but no 'paths' key")
+                )
+                continue
+
+            spec = data
+            spec_url = cand
+            last_probe_log.append(SpecProbeResult(cand, resp.status_code, "valid OpenAPI spec found"))
+            break
         # GraphQL probe — client still open here
         if spec_url:
             parsed_spec = urlparse(spec_url)

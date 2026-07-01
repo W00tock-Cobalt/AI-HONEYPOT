@@ -579,66 +579,108 @@ def _is_static(url: str) -> bool:
 
 def _auto_discover(args, targets: list[str], console) -> None:
     """
-    Smart target discovery for --auto mode.
+    Smart target discovery for --auto mode. Fully transparent: every step
+    prints exactly what it tried and what it found — no silent fallbacks.
 
-    1. Probe for Swagger/OpenAPI spec on the site root.
-    2. If found: set args.openapi so the spec importer runs.
-    3. If not found: run katana to crawl the site, store results in args._auto_targets.
+    1. Probe common Swagger/OpenAPI spec paths on the site root.
+       Prints every path tried and its HTTP status/outcome (verbose: all,
+       non-verbose: summary + non-200 count).
+    2. If a spec is found: set args.openapi so the spec importer runs.
+    3. If not: crawl the site to discover URLs. This step is ONLY labeled
+       "katana" if katana actually runs — the discovered URLs are always
+       printed (not just a count) so you can see exactly what will be scanned.
     """
     site = targets[0]
-    console.print(f"[*] Auto-discovery: {site}")
+    console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
 
-    # Try OpenAPI first
+    # ---- Step 1: probe for an OpenAPI/Swagger spec ----------------------
+    from llmsql.openapi import COMMON_SPEC_PATHS, load_openapi, last_probe_log
+    console.print(f"[*] Probing {len(COMMON_SPEC_PATHS)} common Swagger/OpenAPI paths...")
     try:
-        from llmsql.openapi import load_openapi
         spec_hits = load_openapi(
             site,
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
         )
-        if spec_hits:
-            console.print(
-                f"[green]✓[/green] OpenAPI spec found — "
-                f"{len(spec_hits)} endpoint(s) imported"
-            )
-            args.openapi = site  # trigger the spec importer
-            return
-    except Exception:
-        pass
+    except Exception as e:
+        spec_hits = []
+        console.print(f"[yellow]  OpenAPI probe raised an error: {e}[/yellow]")
 
-    # No spec — fall back to katana crawl
+    if args.verbose:
+        for r in last_probe_log:
+            tag = "[green]200[/green]" if r.status == 200 else f"[dim]{r.status or 'ERR'}[/dim]"
+            console.print(f"    {tag}  {r.path}  [dim]— {r.reason}[/dim]")
+
+    if spec_hits:
+        found_path = next((r.path for r in last_probe_log if r.reason == "valid OpenAPI spec found"), "?")
+        console.print(
+            f"[green]✓ Found OpenAPI/Swagger spec at {found_path}[/green] — "
+            f"{len(spec_hits)} endpoint(s) will be imported"
+        )
+        args.openapi = site
+        return
+
+    non200 = sum(1 for r in last_probe_log if r.status != 200)
+    blocked = sum(1 for r in last_probe_log if r.status == 403)
+    console.print(
+        f"[yellow]✗ No OpenAPI/Swagger spec found[/yellow] "
+        f"({len(last_probe_log)} paths tried, {non200} non-200 responses"
+        + (f", {blocked} returned 403 — target may be blocking automated probes" if blocked else "")
+        + ")"
+    )
+    if not args.verbose:
+        console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
+
+    # ---- Step 2: crawl to discover URLs ----------------------------------
     import shutil
-    import subprocess as _sp
     if not shutil.which("katana"):
         console.print(
-            "[yellow]No OpenAPI spec and katana not found — "
-            "scanning root with --guess-params[/yellow]"
+            "[yellow]katana is not installed — cannot crawl for URLs.[/yellow]\n"
+            "[dim]Install it (https://github.com/projectdiscovery/katana) for --auto "
+            "to discover URLs automatically, or pass -l/--stdin with URLs yourself.\n"
+            "Falling back to scanning the site root with mined parameter names.[/dim]"
         )
         args.guess_params = True
         return
 
-    console.print("[dim]No OpenAPI spec — crawling with katana...[/dim]")
+    console.print("[*] No spec found — crawling with katana to discover URLs...")
+    import subprocess as _sp
     try:
         result = _sp.run(
             ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
             capture_output=True, text=True, timeout=120,
         )
-        raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        crawled = sorted({u for u in raw if not _is_static(u)})
-        filtered = len(raw) - len(crawled)
-        if crawled:
-            console.print(
-                f"[green]✓[/green] katana: {len(crawled)} URL(s) "
-                f"[dim]({filtered} static assets dropped)[/dim]"
-            )
-            args._auto_targets = crawled
-        else:
-            console.print("[yellow]katana found no URLs — scanning root only[/yellow]")
-            args._auto_targets = targets
     except Exception as e:
-        console.print(f"[yellow]katana error: {e} — scanning root only[/yellow]")
+        console.print(f"[yellow]katana failed to run: {e} — scanning root only[/yellow]")
         args._auto_targets = targets
+        args.guess_params = True
+        return
 
-    args.guess_params = True  # always mine params in crawl mode
+    raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    crawled = sorted({u for u in raw if not _is_static(u)})
+    filtered = len(raw) - len(crawled)
+
+    if not crawled:
+        console.print(
+            f"[yellow]katana ran but found no usable URLs[/yellow] "
+            f"[dim]({len(raw)} raw hits, all static/filtered)[/dim] — scanning root only"
+        )
+        args._auto_targets = targets
+        args.guess_params = True
+        return
+
+    console.print(
+        f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
+        f"[dim]({filtered} static assets filtered out)[/dim]"
+    )
+    # Always show what was actually found — this is what gets scanned next.
+    show_n = crawled if args.verbose else crawled[:15]
+    for u in show_n:
+        console.print(f"    [cyan]->[/cyan] {u}")
+    if len(show_n) < len(crawled):
+        console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
+
+    args._auto_targets = crawled
+    args.guess_params = True  # crawled URLs rarely expose real params — mine them
 
 
 def main(argv: list[str] | None = None) -> int:
