@@ -76,6 +76,7 @@ class SqlDetector:
     def guess_db_from_errors(self, text: str) -> Optional[str]:
         """Guess database type from error messages."""
         lower = text.lower()
+        # Explicit vendor names
         if "mysql" in lower or "mariadb" in lower:
             return "mysql"
         if "postgresql" in lower or "pg_" in lower or "psql" in lower:
@@ -85,6 +86,36 @@ class SqlDetector:
         if "sql server" in lower or "odbc" in lower or "mssql" in lower:
             return "mssql"
         if "ora-" in lower or "oracle" in lower:
+            return "oracle"
+
+        # Signature phrases when the vendor name isn't in the message
+        # PostgreSQL / TypeORM / Sequelize wrappers
+        if (
+            "syntax error at or near" in lower
+            or "unterminated quoted" in lower
+            or "does not exist" in lower  # relation/column ... does not exist
+            or "invalid input syntax for" in lower
+            or "queryfailederror" in lower
+            or "operator does not exist" in lower
+        ):
+            return "postgresql"
+        # SQLite phrasing
+        if (
+            "unrecognized token" in lower
+            or "no such table" in lower
+            or "no such column" in lower
+            or "incomplete input" in lower
+            or 'syntax error' in lower and 'near "' in lower
+        ):
+            return "sqlite"
+        # MySQL phrasing
+        if "you have an error in your sql syntax" in lower:
+            return "mysql"
+        # MSSQL phrasing
+        if "unclosed quotation mark" in lower or "incorrect syntax near" in lower:
+            return "mssql"
+        # Oracle phrasing
+        if "quoted string not properly terminated" in lower:
             return "oracle"
         return None
 
