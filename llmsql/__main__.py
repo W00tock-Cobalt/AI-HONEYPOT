@@ -72,7 +72,13 @@ Note: a bare host with no ?params has nothing to inject. Crawl first
     p.add_argument("--stdin", action="store_true",
                    help="Read target URLs from stdin (e.g. katana ... | llmsql --stdin)")
     p.add_argument("--only-with-params", action="store_true",
-                   help="Skip URLs that have no injectable parameters (recommended for crawl input)")
+                   help="Skip URLs with no query params AND no path segments to test")
+    p.add_argument("--path", dest="test_path", action="store_true",
+                   help="Test URL path segments too (e.g. /api/products/1). Auto-on for crawl input")
+    p.add_argument("--path-all", action="store_true",
+                   help="Test every path segment, not just IDs/last segment")
+    p.add_argument("--no-path", dest="no_path", action="store_true",
+                   help="Disable path-segment testing even in crawl mode")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
@@ -149,10 +155,15 @@ def collect_targets(args) -> list[str]:
     return unique
 
 
-def has_injectable_params(url: str) -> bool:
-    """Quick check: does the URL carry query parameters?"""
+def has_injectable_params(url: str, test_path: bool = False) -> bool:
+    """Does the URL carry query params (or path segments when path testing)?"""
     from urllib.parse import urlparse
-    return bool(urlparse(url).query)
+    parsed = urlparse(url)
+    if parsed.query or "*" in url:
+        return True
+    if test_path:
+        return any(s for s in parsed.path.split("/") if s)
+    return False
 
 
 def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | None]:
@@ -214,10 +225,17 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Crawl mode = many targets from stdin/list. Path testing on by default there
+    # (REST apps are mostly path-based), unless explicitly disabled.
+    crawl_mode = bool(args.stdin or args.url_list) or len(targets) > 1
+    test_path = args.test_path or (crawl_mode and not args.no_path)
+    if args.no_path:
+        test_path = False
+
     # For crawl input, it's common to only care about parameterized URLs
     if args.only_with_params:
         before = len(targets)
-        targets = [t for t in targets if has_injectable_params(t)]
+        targets = [t for t in targets if has_injectable_params(t, test_path)]
         skipped = before - len(targets)
         if skipped:
             console.print(f"[dim]Skipped {skipped} URL(s) without query parameters[/dim]")
@@ -260,10 +278,14 @@ def main(argv: list[str] | None = None) -> int:
         probe=probe,
         max_attempts_per_param=max_attempts,
         use_llm=use_llm,
+        test_path=test_path,
+        path_all_segments=args.path_all,
         on_progress=progress if args.verbose else lambda m: (
             console.print(m) if m.startswith(("[!]", "[+]", "[*] Scan", "[*] Found")) else None
         ),
     )
+    if test_path:
+        console.print("[dim]Path-segment injection: enabled[/dim]")
 
     all_reports = []
     total_findings = 0

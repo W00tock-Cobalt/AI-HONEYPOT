@@ -44,11 +44,20 @@ class HttpProbe:
         data: Optional[str] = None,
         content_type: Optional[str] = None,
         extra_headers: Optional[dict[str, str]] = None,
+        test_path: bool = False,
+        path_all_segments: bool = False,
     ) -> list[InjectionPoint]:
-        """Discover injectable parameters from URL, body, headers."""
+        """Discover injectable parameters from URL path, query, body, headers."""
         points: list[InjectionPoint] = []
 
         parsed = urlparse(url)
+
+        # sqlmap-style '*' marker: only the marked spot is tested
+        if "*" in parsed.path or "*" in (parsed.query or ""):
+            points.extend(self._marked_points(parsed))
+            if points:
+                return points
+
         query = parse_qs(parsed.query, keep_blank_values=True)
         for name, values in query.items():
             points.append(InjectionPoint(
@@ -56,6 +65,9 @@ class HttpProbe:
                 location=ParamLocation.QUERY,
                 original_value=values[0] if values else "",
             ))
+
+        if test_path:
+            points.extend(self._path_points(parsed, path_all_segments))
 
         if data and method.upper() in ("POST", "PUT", "PATCH"):
             ct = (content_type or "").lower()
@@ -90,6 +102,54 @@ class HttpProbe:
                 original_value=value,
             ))
 
+        return points
+
+    def _path_points(self, parsed, all_segments: bool) -> list[InjectionPoint]:
+        """Treat URL path segments as injection points.
+
+        By default only test 'interesting' segments (numeric IDs, or the last
+        segment) to avoid request explosion. all_segments tests every segment.
+        """
+        points: list[InjectionPoint] = []
+        raw = parsed.path.split("/")  # keeps leading '' so indexes map to _inject
+        non_empty = [i for i, s in enumerate(raw) if s != ""]
+        if not non_empty:
+            return points
+        last_idx = non_empty[-1]
+
+        for i in non_empty:
+            seg = raw[i]
+            is_numeric = seg.isdigit()
+            looks_like_id = is_numeric or (len(seg) >= 8 and any(c.isdigit() for c in seg))
+            if all_segments or is_numeric or looks_like_id or i == last_idx:
+                points.append(InjectionPoint(
+                    name=f"path[{i}]:{seg[:20]}",
+                    location=ParamLocation.PATH,
+                    original_value=seg,
+                    path_index=i,
+                ))
+        return points
+
+    def _marked_points(self, parsed) -> list[InjectionPoint]:
+        """Handle sqlmap-style '*' injection markers in the URL."""
+        points: list[InjectionPoint] = []
+        segments = parsed.path.split("/")
+        for i, seg in enumerate(segments):
+            if "*" in seg:
+                points.append(InjectionPoint(
+                    name=f"path[{i}]",
+                    location=ParamLocation.PATH,
+                    original_value=seg.replace("*", ""),
+                    path_index=i,
+                ))
+        if "*" in (parsed.query or ""):
+            query = parse_qs(parsed.query.replace("*", ""), keep_blank_values=True)
+            for name, values in query.items():
+                points.append(InjectionPoint(
+                    name=name,
+                    location=ParamLocation.QUERY,
+                    original_value=values[0] if values else "",
+                ))
         return points
 
     def _json_paths(self, obj: Any, prefix: str = "") -> list[InjectionPoint]:
@@ -201,6 +261,15 @@ class HttpProbe:
             query[point.name] = [payload]
             new_query = urlencode(query, doseq=True)
             target_url = urlunparse(parsed._replace(query=new_query))
+
+        elif point.location == ParamLocation.PATH and point.path_index is not None:
+            from urllib.parse import quote
+            parsed = urlparse(url)
+            segments = parsed.path.split("/")
+            if 0 <= point.path_index < len(segments):
+                segments[point.path_index] = quote(payload, safe="")
+                new_path = "/".join(segments)
+                target_url = urlunparse(parsed._replace(path=new_path))
 
         elif point.location == ParamLocation.BODY and data:
             form = parse_qs(data, keep_blank_values=True)

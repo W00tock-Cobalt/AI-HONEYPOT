@@ -28,6 +28,8 @@ class Scanner:
         max_attempts_per_param: int = 8,
         use_llm: bool = True,
         on_progress: Optional[Callable[[str], None]] = None,
+        test_path: bool = False,
+        path_all_segments: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -35,6 +37,8 @@ class Scanner:
         self.max_attempts = max_attempts_per_param
         self.use_llm = use_llm
         self.on_progress = on_progress or (lambda _: None)
+        self.test_path = test_path
+        self.path_all_segments = path_all_segments
 
     def scan(
         self,
@@ -57,7 +61,9 @@ class Scanner:
 
         # Discover injection points
         points = self.probe.extract_injection_points(
-            url, method, data, content_type, extra_headers
+            url, method, data, content_type, extra_headers,
+            test_path=self.test_path,
+            path_all_segments=self.path_all_segments,
         )
         if params:
             allowed = set(params)

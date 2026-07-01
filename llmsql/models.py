@@ -28,6 +28,7 @@ class ParamLocation(str, Enum):
     HEADER = "header"
     COOKIE = "cookie"
     JSON = "json"
+    PATH = "path"
 
 
 @dataclass
@@ -38,6 +39,7 @@ class InjectionPoint:
     location: ParamLocation
     original_value: str
     json_path: Optional[str] = None  # e.g. "user.name" for nested JSON
+    path_index: Optional[int] = None  # index of URL path segment for PATH injection
 
 
 @dataclass
