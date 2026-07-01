@@ -10,6 +10,22 @@ import httpx
 
 from llmsql.models import HttpExchange, InjectionPoint, ParamLocation
 
+# CGI/web-app action → likely injectable params (for ?action=X style apps like BadStore).
+# When katana finds /page.cgi?action=search but no searchquery param in the URL,
+# these will be probed first before the generic param wordlist.
+_ACTION_PARAM_MAP: dict[str, list[str]] = {
+    "search":        ["searchquery", "q", "query", "keyword", "search", "term"],
+    "cartadd":       ["cartitem", "item", "itemid", "product", "pid", "qty"],
+    "login":         ["email", "username", "user", "password", "pass"],
+    "loginregister": ["email", "username", "user", "password"],
+    "register":      ["email", "username", "user", "password", "firstname"],
+    "viewprevious":  ["email", "user", "orderid", "order_id"],
+    "supplierlogin": ["email", "username", "user", "password"],
+    "guestbook":     ["message", "name", "email", "comment"],
+    "whatsnew":      ["cat", "category", "id", "pid"],
+    "myaccount":     ["email", "user", "id"],
+}
+
 
 class HttpProbe:
     """Send HTTP requests with payload injection at specific points."""
@@ -69,9 +85,19 @@ class HttpProbe:
             ))
 
         # Parameter mining: add common param names the URL doesn't expose.
+        # For CGI-style ?action=X URLs, prioritise action-specific params first.
         if guess_params:
-            for name in guess_params:
-                if name not in existing:
+            action_val = (list(existing)[0] if "action" in existing else "")
+            if "action" in existing:
+                import re as _re
+                qs_raw = parsed.query
+                am = _re.search(r"[?&]action=([^&]+)", "?" + qs_raw)
+                action_val = am.group(1).lower() if am else ""
+            priority = _ACTION_PARAM_MAP.get(action_val, [])
+            seen_params = set(existing)
+            for name in priority + list(guess_params):
+                if name not in seen_params:
+                    seen_params.add(name)
                     points.append(InjectionPoint(
                         name=name,
                         location=ParamLocation.QUERY,
