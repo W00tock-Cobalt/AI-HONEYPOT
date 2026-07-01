@@ -33,9 +33,13 @@ def _placeholder(param: dict[str, Any]) -> str:
         return "1"
     if "email" in name:
         return "admin@example.com"
-    if name in ("id", "uid", "pid"):
+    if name in ("id", "uid", "pid", "num", "number"):
         return "1"
-    return "test"
+    # Use "1" as the default string placeholder rather than "test".
+    # "test" as a raw SQL query param triggers baseline errors (e.g. the
+    # BrokenCrystals verbatim-SQL endpoint), making injection harder to
+    # distinguish from a naturally-broken baseline.
+    return "1"
 
 
 def _base_url(spec: dict[str, Any], spec_url: Optional[str]) -> str:
@@ -167,4 +171,24 @@ def load_openapi(
 
     if not spec:
         return []
-    return expand_spec(spec, spec_url)
+    urls = expand_spec(spec, spec_url)
+
+    # If the app also exposes a GraphQL endpoint, probe common paths and add
+    # the injectable `testimonialsCount` field (BrokenCrystals F-06 via GraphQL)
+    if spec_url:
+        root = spec_url.rsplit("/", 1)[0] if "/" in spec_url else spec_url
+        for gql_path in ["/graphql", "/api/graphql", "/gql"]:
+            gql_url = root.rstrip("/") + gql_path
+            try:
+                r = client.post(
+                    gql_url,
+                    json={"query": "{__typename}"},
+                    headers={**(headers or {}), "Content-Type": "application/json"},
+                )
+                if r.status_code < 500 and ("data" in r.text or "errors" in r.text):
+                    urls.append(f"{gql_url}?query={{testimonialsCount(query:\"1\")}}")
+                    break
+            except (httpx.HTTPError, OSError):
+                continue
+
+    return urls

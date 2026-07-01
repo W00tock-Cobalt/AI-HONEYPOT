@@ -21,6 +21,10 @@ class SqlDetector:
                 matches.append(m.group(0))
         return matches
 
+    def baseline_already_erroring(self, baseline: HttpExchange) -> bool:
+        """True when the baseline response itself contains SQL error text."""
+        return bool(self.find_sql_errors(baseline.response_body))
+
     def quick_score(
         self,
         baseline: HttpExchange,
@@ -33,11 +37,33 @@ class SqlDetector:
         evidence_parts = []
         score = 0.0
 
-        # SQL errors in injected response
+        baseline_errors = self.find_sql_errors(baseline.response_body)
+        baseline_broken = bool(baseline_errors)
+
+        # SQL errors in injected response.
+        # If the baseline is already erroring (e.g. OpenAPI placeholder `test`
+        # used as a raw SQL param), only flag when the injected error is
+        # *different* from the baseline error — same error = param was already
+        # broken before injection, not a new SQLi trigger.
         errors = self.find_sql_errors(injected.response_body)
         if errors:
-            score = max(score, 0.85)
-            evidence_parts.append(f"SQL error: {errors[0][:120]}")
+            if not baseline_broken:
+                # Clean baseline → any SQL error is a finding
+                score = max(score, 0.85)
+                evidence_parts.append(f"SQL error: {errors[0][:120]}")
+            else:
+                # Baseline already has SQL errors; only flag if the injected
+                # error text is materially different (new error appeared)
+                new_errors = [e for e in errors if e not in baseline_errors]
+                if new_errors:
+                    score = max(score, 0.85)
+                    evidence_parts.append(f"SQL error (new): {new_errors[0][:120]}")
+                # Even with same error text, a status change is suspicious
+                elif baseline.status_code != injected.status_code:
+                    score = max(score, 0.5)
+                    evidence_parts.append(
+                        f"SQL error + status change {baseline.status_code}->{injected.status_code}"
+                    )
 
         # Status code change — only meaningful alongside a SQL error in the body.
         # A bare HTTP 500 just means "server crashed on invalid input", which is
