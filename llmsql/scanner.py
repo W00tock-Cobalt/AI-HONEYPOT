@@ -274,14 +274,59 @@ class Scanner:
             quote_errors = self.detector.find_sql_errors(quote_probe.response_body)
             status_changed = quote_probe.status_code != baseline.status_code
 
-            if quote_errors or status_changed:
+            if quote_errors:
+                # Explicit SQL error text — confirmed, no ambiguity.
                 pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
-                evidence = pre_ev or (
-                    f"SQL error: {quote_errors[0][:80]}" if quote_errors else
-                    f"Status {baseline.status_code} -> {quote_probe.status_code}"
+                evidence = pre_ev or f"SQL error: {quote_errors[0][:80]}"
+                return self._build_finding(
+                    point, quote_probe, baseline, evidence, max(pre_score, 0.85)
                 )
-                confidence = max(pre_score, 0.85 if quote_errors else 0.75)
-                return self._build_finding(point, quote_probe, baseline, evidence, confidence)
+
+            if status_changed:
+                # Status changed but no recognisable SQL error text. This is
+                # ambiguous — could be real SQLi with a swallowed error, or just
+                # "any unexpected input breaks this endpoint" (generic validation).
+                #
+                # sqlmap-style differential test: send a harmless control value
+                # that is equally "weird" (long alphanumeric) but NOT a SQL
+                # metacharacter. If it triggers the SAME status change, the
+                # break isn't SQL-specific — don't confirm. If the control
+                # succeeds normally, the quote-specific failure is a real signal.
+                control_probe = self.probe.send(
+                    url, method, data, content_type, extra_headers,
+                    inject_point=point, payload="zzz9x8y7w6v5",
+                )
+                report.total_requests += 1
+                control_broke = control_probe.status_code == quote_probe.status_code
+
+                if control_broke:
+                    # Generic "any weird value breaks this" — not SQL-specific.
+                    # Don't confirm here; let the full payload suite look for
+                    # a technique-specific signal (timing, boolean, UNION, etc).
+                    pass
+                else:
+                    # Control succeeds, quote breaks it → SQL-specific signal.
+                    # Try a comment-based "fix": if closing/commenting the quote
+                    # restores normal behaviour, that's strong confirmation the
+                    # value lands inside a SQL statement.
+                    fix_probe = self.probe.send(
+                        url, method, data, content_type, extra_headers,
+                        inject_point=point, payload="'--",
+                    )
+                    report.total_requests += 1
+                    fix_confirms = fix_probe.status_code == baseline.status_code
+
+                    evidence = (
+                        f"Status {baseline.status_code} -> {quote_probe.status_code} "
+                        f"on quote only (control value succeeded normally)"
+                    )
+                    if fix_confirms:
+                        evidence += "; comment-closing the quote restored normal response"
+                    confidence = 0.85 if fix_confirms else 0.7
+                    return self._build_finding(
+                        point, quote_probe, baseline, evidence, confidence,
+                        inj_type=InjectionType.ERROR_BASED,
+                    )
 
             # No SQL errors and no status change — check if quote is more
             # interesting than '*'. If both give the same body-diff score,
