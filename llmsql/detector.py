@@ -134,16 +134,20 @@ class SqlDetector:
                 )
 
         # Timing anomaly (time-based blind hint).
-        # Threshold is 60% of the expected sleep time so we catch it even with
-        # some network variance. Stored on the exchange when time payloads are used.
-        expected_sleep_ms = getattr(injected, '_expected_sleep_ms', 2000)
+        # Only use the calibrated threshold on ACTUAL sleep payloads (tagged with
+        # _expected_sleep_ms). For other payloads use a high fixed threshold so
+        # slow servers don't generate false positives on every request.
         delay = injected.response_time_ms - baseline.response_time_ms
-        if delay > expected_sleep_ms * 0.6:
-            score = max(score, 0.75)
-            evidence_parts.append(f"Delay +{delay:.0f}ms (expected ~{expected_sleep_ms}ms)")
-        elif delay > 2500:
+        expected_sleep_ms = getattr(injected, '_expected_sleep_ms', None)
+        if expected_sleep_ms is not None and delay > expected_sleep_ms * 0.6:
+            score = max(score, 0.8)
+            evidence_parts.append(
+                f"Time-blind delay +{delay:.0f}ms (expected ~{expected_sleep_ms}ms)"
+            )
+        elif delay > 4500:
+            # High threshold for non-sleep payloads — avoids slow-server false positives
             score = max(score, 0.6)
-            evidence_parts.append(f"Delay +{delay:.0f}ms")
+            evidence_parts.append(f"Unexpected delay +{delay:.0f}ms")
 
         # Payload reflected with error context
         if injected.payload and injected.payload in injected.response_body:
@@ -157,7 +161,7 @@ class SqlDetector:
         """Guess database type from error messages."""
         lower = text.lower()
         # Explicit vendor names
-        if "mysql" in lower or "mariadb" in lower:
+        if "mysql" in lower or "mariadb" in lower or "dbd::mysql" in lower:
             return "mysql"
         if "postgresql" in lower or "pg_" in lower or "psql" in lower:
             return "postgresql"

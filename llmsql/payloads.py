@@ -25,11 +25,25 @@ SEED_PAYLOADS = [
 # Common parameter names to guess when a URL exposes none (param mining).
 # Ordered by how often they carry injectable values in real APIs.
 COMMON_PARAMS = [
+    # Generic
     "query", "q", "id", "search", "s", "name", "user", "username", "email",
     "cat", "category", "filter", "sort", "order", "orderby", "field", "column",
     "table", "sql", "keyword", "term", "value", "val", "key", "page", "limit",
     "offset", "product", "item", "pid", "uid", "type", "action", "view",
     "lang", "ref", "url", "path", "file", "dir", "date", "from", "to", "code",
+    # E-commerce / cart
+    "cartitem", "cart_item", "cart", "itemid", "item_id", "productid",
+    "product_id", "sku", "qty", "quantity", "price", "amount",
+    "order_id", "orderid", "invoice",
+    # Auth / user management
+    "password", "pass", "pwd", "token", "session", "hash",
+    "login", "register", "account", "profile",
+    # Common web app params
+    "msg", "message", "comment", "subject", "body", "content", "text",
+    "title", "tag", "tags", "status", "mode", "format", "output",
+    "callback", "redirect", "next", "return", "goto",
+    # PHP / CGI classics
+    "searchquery", "query_string", "keyword", "words", "phrase",
 ]
 
 
@@ -96,11 +110,17 @@ SQL_ERROR_PATTERNS = [
     r'near ".*": syntax error',
     r"incomplete input",
 
-    # Generic MySQL / MariaDB
+    # MySQL / MariaDB — note: MariaDB errors say "MariaDB" not "MySQL"
     r"You have an error in your SQL syntax",
+    r"check the manual that corresponds to your (MySQL|MariaDB) server",
     r"supplied argument is not a valid MySQL",
     r"com\.mysql\.jdbc",
     r"MariaDB server version",
+    r"mysql_fetch_array\(\)",
+    r"mysql_num_rows\(\)",
+    r"DBD::mysql",         # Perl DBI/DBD MySQL driver (BadStore uses this)
+    r"execute failed:",    # Perl DBI execute failed
+    r"syntax to use near", # MariaDB/MySQL generic syntax error
 
     # Generic catch-alls seen in JSON error bodies
     r"SQLException",
