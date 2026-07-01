@@ -145,9 +145,6 @@ class Scanner:
         import concurrent.futures as _cf
 
         def _test_one(point):
-            self.on_progress(
-                f"\n[+] Testing: {point.name} ({point.location.value})"
-            )
             return self._test_parameter(
                 url, method, data, content_type, extra_headers,
                 point, baseline, report,
@@ -220,9 +217,8 @@ class Scanner:
             report.total_requests += 1
             pre_score, pre_ev = self.detector.quick_score(baseline, probe)
             if pre_score == 0.0 and probe.status_code == baseline.status_code:
-                self.on_progress(
-                    f"    [skip] no response diff on {point.name!r} — not injectable"
-                )
+                # Silent skip in normal mode; only log in verbose (on_progress
+                # already gates on verbose_progress in the CLI)
                 return None
             if pre_score >= 0.75:
                 return self._build_finding(
