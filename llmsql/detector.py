@@ -47,10 +47,14 @@ class SqlDetector:
                     f"Status {baseline.status_code} -> {injected.status_code}"
                 )
 
-        # Significant body length change (boolean blind hint)
+        # Significant body length change (boolean blind hint).
+        # Only meaningful when the injected response is a success-class status —
+        # a 404→404 or 400→400 length diff is just normal error variation, not SQLi.
         base_len = len(baseline.response_body)
         inj_len = len(injected.response_body)
-        if base_len > 0:
+        injected_ok = 200 <= injected.status_code < 300
+        baseline_ok = 200 <= baseline.status_code < 300
+        if base_len > 0 and injected_ok and baseline_ok:
             ratio = abs(inj_len - base_len) / base_len
             if ratio > 0.3:
                 score = max(score, 0.4)

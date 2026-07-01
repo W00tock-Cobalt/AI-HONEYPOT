@@ -267,8 +267,8 @@ class Scanner:
                     f"    [!] confirmed (score {score:.0%}) — continuing for more types"
                 )
 
-            # LLM-guided continuation
-            if self.use_llm and score >= 0.3:
+            # LLM-guided continuation — skipped in fast mode (heuristics only)
+            if self.use_llm and not self.fast and score >= 0.3:
                 try:
                     decision = self.agent.analyze_exchange(
                         baseline, injected, point, score, evidence,
@@ -306,7 +306,7 @@ class Scanner:
 
         # Final check on best candidate
         if best_exchange and best_score >= 0.6:
-            if self.use_llm:
+            if self.use_llm and not self.fast:
                 try:
                     confirm = self.agent.confirm_finding(baseline, best_exchange, point)
                     if confirm.get("vulnerable") and confirm.get("confidence", 0) >= 0.6:
