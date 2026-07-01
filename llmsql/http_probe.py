@@ -46,6 +46,7 @@ class HttpProbe:
         extra_headers: Optional[dict[str, str]] = None,
         test_path: bool = False,
         path_all_segments: bool = False,
+        guess_params: Optional[list[str]] = None,
     ) -> list[InjectionPoint]:
         """Discover injectable parameters from URL path, query, body, headers."""
         points: list[InjectionPoint] = []
@@ -59,12 +60,23 @@ class HttpProbe:
                 return points
 
         query = parse_qs(parsed.query, keep_blank_values=True)
+        existing = set(query.keys())
         for name, values in query.items():
             points.append(InjectionPoint(
                 name=name,
                 location=ParamLocation.QUERY,
                 original_value=values[0] if values else "",
             ))
+
+        # Parameter mining: add common param names the URL doesn't expose.
+        if guess_params:
+            for name in guess_params:
+                if name not in existing:
+                    points.append(InjectionPoint(
+                        name=name,
+                        location=ParamLocation.QUERY,
+                        original_value="1",
+                    ))
 
         if test_path:
             points.extend(self._path_points(parsed, path_all_segments))

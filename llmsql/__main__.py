@@ -57,11 +57,13 @@ Examples:
   %(prog)s -u "http://target/search" --data "q=test" --method POST
   %(prog)s -l urls.txt --only-with-params        # scan a URL list
   katana -u https://target -f qurl -silent | %(prog)s --stdin --only-with-params
-  %(prog)s -u "http://target/page?id=1" --model qwen2.5-coder:7b
+  %(prog)s --openapi https://target/            # import Swagger/OpenAPI spec
+  %(prog)s -u "http://target/api/count" --guess-params   # mine param names
   %(prog)s -u "http://target/page?id=1" --no-llm          # heuristic-only
 
-Note: a bare host with no ?params has nothing to inject. Crawl first
-(katana/gau/hakrawler) to collect parameterized URLs, then pipe them in.
+Note: a bare host with no ?params has nothing to inject. Either import the
+API spec (--openapi), mine param names (--guess-params), or crawl first
+(katana/gau) to collect parameterized URLs and pipe them in.
         """,
     )
 
@@ -79,6 +81,13 @@ Note: a bare host with no ?params has nothing to inject. Crawl first
                    help="Test every path segment, not just IDs/last segment")
     p.add_argument("--no-path", dest="no_path", action="store_true",
                    help="Disable path-segment testing even in crawl mode")
+    p.add_argument("--guess-params", action="store_true",
+                   help="Mine common param names (query,q,id,search,...) on each URL")
+    p.add_argument("--param-wordlist",
+                   help="File of parameter names to guess (implies --guess-params)")
+    p.add_argument("--openapi",
+                   help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
+                        "to discover endpoints WITH their real parameter names")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
@@ -266,6 +275,30 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     targets = collect_targets(args)
+
+    # OpenAPI/Swagger import — discover endpoints with their real param names
+    if args.openapi:
+        from llmsql.openapi import load_openapi
+        console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
+        try:
+            spec_urls = load_openapi(
+                args.openapi,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                },
+            )
+            if spec_urls:
+                console.print(f"[green]✓[/green] {len(spec_urls)} endpoints from spec")
+                targets.extend(spec_urls)
+            else:
+                console.print("[yellow]No endpoints parsed from spec[/yellow]")
+        except Exception as e:
+            console.print(f"[yellow]OpenAPI import failed: {e}[/yellow]")
+        # De-dup after merge
+        seen_t = set()
+        targets = [t for t in targets if not (t in seen_t or seen_t.add(t))]
+
     if not targets:
         console.print(
             "[red]No targets.[/red] Provide one of:\n"
@@ -301,6 +334,20 @@ def main(argv: list[str] | None = None) -> int:
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
     max_attempts = args.max_attempts or level_to_attempts(args.level)
+
+    # Parameter mining wordlist
+    guess_params = None
+    if args.guess_params or args.param_wordlist:
+        from llmsql.payloads import COMMON_PARAMS
+        if args.param_wordlist:
+            try:
+                with open(args.param_wordlist) as f:
+                    guess_params = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            except OSError as e:
+                console.print(f"[yellow]Cannot read --param-wordlist: {e}[/yellow]")
+                guess_params = list(COMMON_PARAMS)
+        else:
+            guess_params = list(COMMON_PARAMS)
 
     default_ua = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -365,12 +412,15 @@ def main(argv: list[str] | None = None) -> int:
         path_all_segments=args.path_all,
         include_dead=args.include_dead,
         fast=args.fast,
+        guess_params=guess_params,
         on_progress=progress if args.verbose else lambda m: (
             console.print(m) if m.startswith(("[!]", "[+]", "[*] Scan", "[*] Found")) else None
         ),
     )
     if test_path:
         console.print("[dim]Path-segment injection: enabled[/dim]")
+    if guess_params:
+        console.print(f"[dim]Parameter mining: {len(guess_params)} names per URL[/dim]")
 
     all_reports = []
     total_findings = 0

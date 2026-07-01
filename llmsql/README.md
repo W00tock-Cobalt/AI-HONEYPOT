@@ -64,6 +64,9 @@ python -m llmsql -u "http://target?id=1" \
 --path                 Test URL path segments (auto-on for crawl input)
 --path-all             Test every path segment, not just IDs/last
 --no-path              Disable path-segment testing
+--guess-params         Mine common param names on each URL (query,q,id,...)
+--param-wordlist FILE  Custom parameter-name wordlist
+--openapi SRC          Import Swagger/OpenAPI spec (URL/file/site root)
 -t, --threads N        Scan N targets concurrently
 --fast                 Skip per-param LLM suggestion (heuristics + confirm only)
 --probe / --no-probe   Liveness pre-filter (httpx-style, auto-on for crawls)
@@ -122,6 +125,31 @@ llmsql/
   detector.py      Heuristic SQL error/timing detection
   payloads.py      Seed payloads + LLM system prompts
 ```
+
+## Finding hidden parameters (the hard part)
+
+Most injectable bugs live in a parameter the crawler never sees. Example:
+`GET /api/testimonials/count?query=<SQL>` — a crawl of the site only finds
+`/api/testimonials/count`, with no `?query`. LLMSQL has three ways to recover
+the real parameter names:
+
+```bash
+# 1. Import the API spec (best) — pulls every endpoint WITH its params.
+#    Works against an exposed Swagger/OpenAPI doc or a site root.
+python -m llmsql --openapi https://target/ -v
+python -m llmsql --openapi https://target/swagger-json -v
+
+# 2. Parameter mining — try a built-in wordlist of common names
+#    (query, q, id, search, cat, filter, sort, ...).
+python -m llmsql -u "https://target/api/testimonials/count" --guess-params -v
+
+# 3. Custom wordlist
+python -m llmsql -u "https://target/api/x" --param-wordlist params.txt -v
+```
+
+With `--openapi`, an exposed spec (very common — see Swagger UIs) turns into a
+full, precise target list including `?query=`, path IDs, etc. This is how a
+tester who read the Swagger doc finds `/api/testimonials/count?query=...`.
 
 ## Crawl + scan (katana / gau)
 

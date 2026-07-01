@@ -32,6 +32,7 @@ class Scanner:
         path_all_segments: bool = False,
         include_dead: bool = False,
         fast: bool = False,
+        guess_params: Optional[list[str]] = None,
     ):
         self.agent = agent
         self.probe = probe
@@ -43,6 +44,7 @@ class Scanner:
         self.path_all_segments = path_all_segments
         self.include_dead = include_dead
         self.fast = fast
+        self.guess_params = guess_params
 
     def scan(
         self,
@@ -68,6 +70,7 @@ class Scanner:
             url, method, data, content_type, extra_headers,
             test_path=self.test_path,
             path_all_segments=self.path_all_segments,
+            guess_params=self.guess_params,
         )
         if params:
             allowed = set(params)
