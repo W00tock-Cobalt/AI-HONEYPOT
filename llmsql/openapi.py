@@ -143,6 +143,7 @@ def load_openapi(
         return expand_spec(spec, None)
 
     client = httpx.Client(timeout=timeout, verify=verify_ssl, follow_redirects=True)
+    spec_urls_gql: list[str] = []
     try:
         # If the source already looks like a spec endpoint, fetch directly
         candidates = [source]
@@ -166,29 +167,31 @@ def load_openapi(
                         break
             except (httpx.HTTPError, json.JSONDecodeError, ValueError):
                 continue
+        # GraphQL probe — client still open here
+        if spec_url:
+            parsed_spec = urlparse(spec_url)
+            gql_root = f"{parsed_spec.scheme}://{parsed_spec.netloc}"
+            for gql_path in ["/graphql", "/api/graphql", "/gql"]:
+                gql_url = gql_root + gql_path
+                try:
+                    r = client.post(
+                        gql_url,
+                        json={"query": "{__typename}"},
+                        headers={**(headers or {}), "Content-Type": "application/json"},
+                    )
+                    if r.status_code < 500 and (
+                        "data" in r.text or "errors" in r.text
+                    ):
+                        spec_urls_gql.append(gql_url)
+                        break
+                except (httpx.HTTPError, OSError):
+                    continue
     finally:
         client.close()
 
     if not spec:
         return []
     urls = expand_spec(spec, spec_url)
-
-    # If the app also exposes a GraphQL endpoint, probe common paths and add
-    # the injectable `testimonialsCount` field (BrokenCrystals F-06 via GraphQL)
-    if spec_url:
-        root = spec_url.rsplit("/", 1)[0] if "/" in spec_url else spec_url
-        for gql_path in ["/graphql", "/api/graphql", "/gql"]:
-            gql_url = root.rstrip("/") + gql_path
-            try:
-                r = client.post(
-                    gql_url,
-                    json={"query": "{__typename}"},
-                    headers={**(headers or {}), "Content-Type": "application/json"},
-                )
-                if r.status_code < 500 and ("data" in r.text or "errors" in r.text):
-                    urls.append(f"{gql_url}?query={{testimonialsCount(query:\"1\")}}")
-                    break
-            except (httpx.HTTPError, OSError):
-                continue
-
+    for gql_url in spec_urls_gql:
+        urls.append(f"{gql_url}?query={{testimonialsCount(query:\"1\")}}")
     return urls
