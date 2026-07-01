@@ -312,8 +312,9 @@ class Scanner:
                 best_exchange = injected
                 best_evidence = evidence
 
-            # High-confidence heuristic hit
-            if score >= 0.85:
+            # Confirmed finding — lower threshold when we have multiple consistent hits
+            confirm_threshold = 0.85 if attempts <= 2 else 0.75
+            if score >= confirm_threshold:
                 finding = self._build_finding(point, injected, baseline, best_evidence, score)
                 if not self.continue_on_found:
                     return finding

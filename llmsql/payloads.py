@@ -118,9 +118,15 @@ SQL_ERROR_PATTERNS = [
     r"MariaDB server version",
     r"mysql_fetch_array\(\)",
     r"mysql_num_rows\(\)",
-    r"DBD::mysql",         # Perl DBI/DBD MySQL driver (BadStore uses this)
-    r"execute failed:",    # Perl DBI execute failed
-    r"syntax to use near", # MariaDB/MySQL generic syntax error
+    r"DBD::mysql",           # Perl DBI/DBD MySQL driver (BadStore uses this)
+    r"execute failed:",      # Perl DBI execute failed
+    r"syntax to use near",   # MariaDB/MySQL generic syntax error
+    r"XPATH syntax error",   # MySQL EXTRACTVALUE error-based exfil
+    r"Illegal mix of collations",  # MySQL
+    r"Column count doesn't match", # MySQL UNION column mismatch
+    r"ERROR 1064",           # MySQL generic syntax error code
+    r"ERROR 1105",           # MySQL unknown error
+    r"Warning.*DBD",         # Perl DBD warning
 
     # Generic catch-alls seen in JSON error bodies
     r"SQLException",
