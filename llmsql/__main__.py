@@ -813,14 +813,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     if total_findings:
         from rich.table import Table
+        from urllib.parse import urlparse as _up
         tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
         tbl.add_column("URL", no_wrap=False, max_width=70)
         tbl.add_column("Param", style="bold yellow")
         tbl.add_column("Type", style="cyan")
         tbl.add_column("DB", style="green")
         tbl.add_column("Conf")
+        # Deduplicate: same base path + param = same sink
+        seen_sinks: set[tuple[str, str]] = set()
+        deduped = 0
         for r in all_reports:
             for f in r.findings:
+                sink = (_up(r.target_url).path, f.param)
+                if sink in seen_sinks:
+                    deduped += 1
+                    continue
+                seen_sinks.add(sink)
                 tbl.add_row(
                     r.target_url,
                     f.param,
@@ -829,6 +838,10 @@ def main(argv: list[str] | None = None) -> int:
                     f"{f.confidence:.0%}",
                 )
         console.print(tbl)
+        if deduped:
+            console.print(
+                f"[dim]({deduped} duplicate finding(s) collapsed — same endpoint+param)[/dim]"
+            )
 
     if args.output:
         if len(all_reports) == 1:
