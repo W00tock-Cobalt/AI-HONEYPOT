@@ -74,6 +74,7 @@ class SpecTarget:
     method: str = "GET"
     body: Optional[str] = None
     content_type: Optional[str] = None
+    inject_headers: Optional[dict[str, str]] = None  # headers to test for injection
 
 
 def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[SpecTarget]:
@@ -100,6 +101,7 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[Sp
 
             path = raw_path
             query_pairs = []
+            inject_headers: dict[str, str] = {}
             for param in params:
                 if not isinstance(param, dict):
                     continue
@@ -112,6 +114,12 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[Sp
                     path = path.replace(f"{{{pname}}}", val)
                 elif loc == "query":
                     query_pairs.append(f"{pname}={val}")
+                elif loc == "header" and pname.lower() not in (
+                    "authorization", "content-type", "accept",
+                    "content-length", "host", "user-agent",
+                ):
+                    # Custom headers are common SQLi vectors (e.g. x-product-name)
+                    inject_headers[pname] = val
 
             # Replace any leftover {placeholders}
             while "{" in path and "}" in path:
@@ -131,7 +139,7 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[Sp
             if method_lower in ("post", "put", "patch"):
                 body, content_type = _build_request_body(op)
 
-            key = f"{method_lower}:{url}:{body or ''}"
+            key = f"{method_lower}:{url}:{body or ''}:{sorted(inject_headers.items())}"
             if key not in seen:
                 seen.add(key)
                 targets.append(SpecTarget(
@@ -139,6 +147,7 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[Sp
                     method=method_lower.upper(),
                     body=body,
                     content_type=content_type,
+                    inject_headers=inject_headers if inject_headers else None,
                 ))
 
     return targets

@@ -98,9 +98,13 @@ class HttpProbe:
                         original_value=values[0] if values else "",
                     ))
 
+        _skip_headers = {
+            "host", "content-length", "content-type", "user-agent",
+            "authorization", "accept", "accept-encoding", "connection",
+        }
         if extra_headers:
             for name, value in extra_headers.items():
-                if name.lower() not in ("host", "content-length", "content-type"):
+                if name.lower() not in _skip_headers:
                     points.append(InjectionPoint(
                         name=name,
                         location=ParamLocation.HEADER,

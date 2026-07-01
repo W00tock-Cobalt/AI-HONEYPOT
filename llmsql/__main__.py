@@ -565,8 +565,8 @@ def main(argv: list[str] | None = None) -> int:
     targets = collect_targets(args)
 
     # OpenAPI/Swagger import — discover endpoints with their real param names
-    # spec_extras maps url -> (method, body, content_type) for POST targets
-    spec_extras: dict[str, tuple[str, Optional[str], Optional[str]]] = {}
+    # spec_extras maps url -> (method, body, content_type, inject_headers)
+    spec_extras: dict[str, tuple[str, Optional[str], Optional[str], Optional[dict]]] = {}
     if args.openapi:
         from llmsql.openapi import load_openapi
         console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
@@ -585,8 +585,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for st in spec_targets:
                     targets.append(st.url)
-                    if st.method != "GET" or st.body:
-                        spec_extras[st.url] = (st.method, st.body, st.content_type)
+                    if st.method != "GET" or st.body or st.inject_headers:
+                        spec_extras[st.url] = (
+                            st.method, st.body, st.content_type, st.inject_headers
+                        )
             else:
                 console.print("[yellow]No endpoints parsed from spec[/yellow]")
         except Exception as e:
@@ -816,14 +818,21 @@ def main(argv: list[str] | None = None) -> int:
     total_findings = 0
     try:
         def run_one(target: str):
-            # Use method/body from OpenAPI spec if available, else CLI args
-            spec_method, spec_body, spec_ct = spec_extras.get(target, (None, None, None))
+            # Use method/body/headers from OpenAPI spec if available, else CLI args
+            spec_data = spec_extras.get(target, (None, None, None, None))
+            spec_method, spec_body, spec_ct, spec_headers = spec_data
+            # Merge: CLI headers take precedence; spec inject_headers are added
+            merged_headers = dict(headers)
+            if spec_headers:
+                for k, v in spec_headers.items():
+                    if k not in merged_headers:
+                        merged_headers[k] = v
             return scanner.scan(
                 url=target,
                 method=spec_method or args.method,
                 data=spec_body or args.data,
                 content_type=spec_ct or content_type,
-                extra_headers=headers,
+                extra_headers=merged_headers if merged_headers else headers,
                 params=args.params,
             )
 
