@@ -176,6 +176,8 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("-o", "--output", help="Save JSON report to file")
     p.add_argument("--batch", action="store_true", help="Non-interactive mode")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    p.add_argument("--show-response", action="store_true",
+                   help="Print a snippet of each injected response (debug detection)")
     p.add_argument("--version", action="version", version=f"llmsql {__version__}")
 
     return p
@@ -722,8 +724,10 @@ def main(argv: list[str] | None = None) -> int:
         model=args.model if use_llm else DEFAULT_OLLAMA_MODEL,
     )
 
+    verbose_progress = args.verbose or args.show_response
+
     def progress(msg: str):
-        if args.verbose or msg.startswith(("[!]", "[+]", "[*]\n", "[*] Scan")):
+        if verbose_progress or msg.startswith(("[!]", "[+]", "[*]\n", "[*] Scan")):
             console.print(msg)
 
     scanner = Scanner(
@@ -738,7 +742,8 @@ def main(argv: list[str] | None = None) -> int:
         guess_params=guess_params,
         tamper=tamper_chain,
         auto_tamper=not args.no_auto_tamper,
-        on_progress=progress if args.verbose else lambda m: (
+        show_response=args.show_response,
+        on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
     )

@@ -35,6 +35,7 @@ class Scanner:
         guess_params: Optional[list[str]] = None,
         tamper: Optional[list[str]] = None,
         auto_tamper: bool = True,
+        show_response: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -49,6 +50,7 @@ class Scanner:
         self.guess_params = guess_params
         self.tamper = tamper or []
         self.auto_tamper = auto_tamper
+        self.show_response = show_response
 
     def scan(
         self,
@@ -220,6 +222,9 @@ class Scanner:
                 f"    [{attempts}] payload={payload[:40]!r} score={score:.2f} "
                 f"HTTP {injected.status_code}"
             )
+            if self.show_response:
+                snippet = injected.response_body[:300].replace("\n", " ")
+                self.on_progress(f"        body: {snippet}")
 
             # WAF/block detection: baseline was OK but payload is refused.
             if is_blocked:

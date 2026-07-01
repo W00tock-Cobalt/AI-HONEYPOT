@@ -59,6 +59,40 @@ SQL_ERROR_PATTERNS = [
     r"mysqli",
     r"PDOException",
     r"SQLITE_ERROR",
+
+    # Generic PostgreSQL / TypeORM / Sequelize / node driver errors
+    # (BrokenCrystals & most modern Node/NestJS apps surface these)
+    r"QueryFailedError",              # TypeORM
+    r"SequelizeDatabaseError",        # Sequelize
+    r"syntax error at or near",       # PostgreSQL
+    r"unterminated quoted string",    # PostgreSQL
+    r"invalid input syntax for",      # PostgreSQL
+    r"column .* does not exist",      # PostgreSQL
+    r"relation .* does not exist",    # PostgreSQL
+    r"operator does not exist",       # PostgreSQL
+    r"psycopg2\.",                    # Python pg driver
+    r"asyncpg\.",                     # async pg driver
+    r"error: .*at character \d+",     # pg error with position
+
+    # Generic SQLite (node better-sqlite3 / python)
+    r"no such table",
+    r"no such column",
+    r"unrecognized token",
+    r'near ".*": syntax error',
+    r"incomplete input",
+
+    # Generic MySQL / MariaDB
+    r"You have an error in your SQL syntax",
+    r"supplied argument is not a valid MySQL",
+    r"com\.mysql\.jdbc",
+    r"MariaDB server version",
+
+    # Generic catch-alls seen in JSON error bodies
+    r"SQLException",
+    r"DatabaseError",
+    r"OperationalError",
+    r"ProgrammingError",
+    r"IntegrityError",
 ]
 
 AGENT_SYSTEM_PROMPT = """You are an expert penetration tester specializing in SQL injection.
