@@ -30,6 +30,8 @@ class Scanner:
         on_progress: Optional[Callable[[str], None]] = None,
         test_path: bool = False,
         path_all_segments: bool = False,
+        include_dead: bool = False,
+        fast: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -39,6 +41,8 @@ class Scanner:
         self.on_progress = on_progress or (lambda _: None)
         self.test_path = test_path
         self.path_all_segments = path_all_segments
+        self.include_dead = include_dead
+        self.fast = fast
 
     def scan(
         self,
@@ -83,6 +87,18 @@ class Scanner:
         report.total_requests += 1
         self.on_progress(f"[*] Baseline: HTTP {baseline.status_code} ({baseline.response_time_ms:.0f}ms)")
 
+        # Skip dead endpoints — no point fuzzing a route that doesn't exist
+        if not self.include_dead and baseline.status_code in (0, 404, 405, 501):
+            report.errors.append(
+                f"Skipped: baseline HTTP {baseline.status_code} "
+                f"(endpoint dead/unroutable; use --include-404 to force)"
+            )
+            report.duration_seconds = time.perf_counter() - start
+            self.on_progress(
+                f"[*] Skipping (baseline HTTP {baseline.status_code})"
+            )
+            return report
+
         for point in points:
             self.on_progress(f"\n[+] Testing parameter: {point.name} ({point.location.value})")
             finding = self._test_parameter(
@@ -117,7 +133,10 @@ class Scanner:
         """Test a single injection point with LLM-guided payloads."""
         payloads = list(SEED_PAYLOADS[:5])
 
-        if self.use_llm:
+        # In fast mode, skip the per-parameter LLM suggestion call (slow on
+        # local models). Rely on seed payloads + heuristics, use the LLM only
+        # to confirm strong hits.
+        if self.use_llm and not self.fast:
             try:
                 llm_payloads = self.agent.suggest_initial_payloads(
                     url, method, point, content_type, baseline

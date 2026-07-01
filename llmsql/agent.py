@@ -95,12 +95,37 @@ class LlmAgent:
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        """Extract JSON from LLM output."""
+        """Extract JSON from LLM output, tolerant of small model quirks."""
         text = text.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\n?", "", text)
             text = re.sub(r"\n?```$", "", text)
-        return json.loads(text)
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+        # Extract the outermost {...} block (small models add prose around it)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # Repair common issues: trailing commas, single quotes, unquoted null-ish
+                repaired = re.sub(r",\s*([}\]])", r"\1", candidate)
+                repaired = repaired.replace("'", '"')
+                repaired = re.sub(r"\bTrue\b", "true", repaired)
+                repaired = re.sub(r"\bFalse\b", "false", repaired)
+                repaired = re.sub(r"\bNone\b", "null", repaired)
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
+
+        raise json.JSONDecodeError("No valid JSON in LLM response", text, 0)
 
     def suggest_initial_payloads(
         self,

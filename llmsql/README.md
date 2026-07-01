@@ -61,6 +61,13 @@ python -m llmsql -u "http://target?id=1" \
 --cookie               Cookie string
 -p, --param            Test specific parameter only
 --level                1=quick, 2=normal, 3=deep
+--path                 Test URL path segments (auto-on for crawl input)
+--path-all             Test every path segment, not just IDs/last
+--no-path              Disable path-segment testing
+-t, --threads N        Scan N targets concurrently
+--fast                 Skip per-param LLM suggestion (heuristics + confirm only)
+--probe / --no-probe   Liveness pre-filter (httpx-style, auto-on for crawls)
+--include-404          Test endpoints even if baseline is 404/405
 --model                Ollama model (default: llama3.2)
 --ollama-host          Ollama URL (default: localhost:11434)
 --no-start-ollama      Don't auto-start Ollama background service
@@ -115,6 +122,27 @@ llmsql/
   detector.py      Heuristic SQL error/timing detection
   payloads.py      Seed payloads + LLM system prompts
 ```
+
+## Crawl + scan (katana / gau)
+
+REST apps are mostly path-based, so crawl broadly and let LLMSQL test path
+segments. Dead URLs are auto-filtered with a built-in liveness probe.
+
+```bash
+# Broad JS crawl, dedupe, scan with 10 threads in fast mode
+katana -u https://target/ -jc -silent | sort -u \
+  | python -m llmsql --stdin -t 10 --fast -o report.json
+
+# Only URLs that look injectable
+katana -u https://target/ -jc -silent | grep -E '\?|/api/' \
+  | python -m llmsql --stdin -t 10 -v
+```
+
+Speed tips:
+- `--fast` — skip the slow per-parameter LLM suggestion, keep LLM confirmation
+- `-t/--threads` — scan many targets in parallel
+- liveness probe + baseline-404 skip drop dead endpoints automatically
+- `--no-llm` — pure heuristic mode, fastest, no model calls
 
 ## Ethical use
 

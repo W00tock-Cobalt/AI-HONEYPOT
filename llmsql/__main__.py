@@ -96,6 +96,20 @@ Note: a bare host with no ?params has nothing to inject. Crawl first
     p.add_argument("--max-attempts", type=int, default=None,
                    help="Max payloads per parameter (default: level-based)")
 
+    # Performance
+    p.add_argument("--threads", "-t", type=int, default=1,
+                   help="Concurrent targets to scan (default: 1)")
+    p.add_argument("--fast", action="store_true",
+                   help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only")
+    p.add_argument("--probe", dest="probe_alive", action="store_true",
+                   help="Pre-filter dead URLs with a liveness check (auto-on for crawl input)")
+    p.add_argument("--no-probe", action="store_true",
+                   help="Disable liveness pre-filter")
+    p.add_argument("--probe-threads", type=int, default=20,
+                   help="Concurrency for liveness probe (default: 20)")
+    p.add_argument("--include-404", dest="include_dead", action="store_true",
+                   help="Test endpoints even if baseline is 404/405 (dead routes)")
+
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
                    help="Ollama host (default: http://127.0.0.1:11434)")
@@ -153,6 +167,46 @@ def collect_targets(args) -> list[str]:
             seen.add(t)
             unique.append(t)
     return unique
+
+
+def probe_alive(
+    urls: list[str],
+    threads: int = 20,
+    timeout: float = 8.0,
+    headers: dict[str, str] | None = None,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """
+    httpx-style liveness check. Returns (alive_urls, status_map).
+    A URL is 'alive' if it responds at all with a non-dead status.
+    """
+    import concurrent.futures
+
+    import httpx
+
+    dead_statuses = {0, 404, 405, 410, 501}
+    status_map: dict[str, int] = {}
+
+    client_kwargs = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    def check(url: str) -> tuple[str, int]:
+        try:
+            with httpx.Client(**client_kwargs) as c:
+                # Prefer GET (HEAD is often unsupported / misleading on APIs)
+                resp = c.get(url, headers=headers or {})
+                return url, resp.status_code
+        except (httpx.HTTPError, OSError):
+            return url, 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        for url, status in ex.map(check, urls):
+            status_map[url] = status
+
+    alive = [u for u in urls if status_map.get(u, 0) not in dead_statuses]
+    return alive, status_map
 
 
 def has_injectable_params(url: str, test_path: bool = False) -> bool:
@@ -243,13 +297,42 @@ def main(argv: list[str] | None = None) -> int:
             console.print("[yellow]No URLs with parameters to test.[/yellow]")
             return 2
 
-    if len(targets) > 1:
-        console.print(f"[*] {len(targets)} targets queued\n")
-
     headers = parse_headers(args.headers)
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
     max_attempts = args.max_attempts or level_to_attempts(args.level)
+
+    default_ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
+    # UA used for liveness probing; NOT an injection point unless user set -H
+    probe_headers = dict(headers)
+    probe_headers.setdefault("User-Agent", default_ua)
+
+    # Liveness pre-filter (httpx-style): drop dead URLs before the slow scan.
+    # On by default for crawl input; disable with --no-probe.
+    do_probe = (args.probe_alive or crawl_mode) and not args.no_probe and len(targets) > 1
+    if do_probe:
+        console.print(f"[*] Probing {len(targets)} URLs for liveness...")
+        alive, status_map = probe_alive(
+            targets,
+            threads=args.probe_threads,
+            headers=probe_headers,
+            proxy=args.proxy,
+        )
+        dead = len(targets) - len(alive)
+        console.print(
+            f"[*] Live: [green]{len(alive)}[/green]  "
+            f"Dead/filtered: [dim]{dead}[/dim]"
+        )
+        targets = alive
+        if not targets:
+            console.print("[yellow]No live targets to scan.[/yellow]")
+            return 2
+
+    if len(targets) > 1:
+        console.print(f"[*] {len(targets)} targets queued\n")
 
     use_llm, base_url, llm_error = setup_llm_backend(args, console)
     if llm_error:
@@ -259,7 +342,7 @@ def main(argv: list[str] | None = None) -> int:
 
     probe = HttpProbe(
         proxy=args.proxy,
-        default_headers={"User-Agent": "llmsql/0.1"},
+        default_headers={"User-Agent": default_ua},
         cookies=cookies,
     )
 
@@ -280,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
         use_llm=use_llm,
         test_path=test_path,
         path_all_segments=args.path_all,
+        include_dead=args.include_dead,
+        fast=args.fast,
         on_progress=progress if args.verbose else lambda m: (
             console.print(m) if m.startswith(("[!]", "[+]", "[*] Scan", "[*] Found")) else None
         ),
@@ -290,10 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     all_reports = []
     total_findings = 0
     try:
-        for idx, target in enumerate(targets, 1):
-            if len(targets) > 1:
-                console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
-            report = scanner.scan(
+        def run_one(target: str):
+            return scanner.scan(
                 url=target,
                 method=args.method,
                 data=args.data,
@@ -301,9 +384,32 @@ def main(argv: list[str] | None = None) -> int:
                 extra_headers=headers,
                 params=args.params,
             )
-            all_reports.append(report)
-            total_findings += len(report.findings)
-            print_report(report, console)
+
+        if args.threads > 1 and len(targets) > 1:
+            import concurrent.futures
+            console.print(
+                f"[dim]Scanning {len(targets)} targets with {args.threads} threads...[/dim]\n"
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
+                futures = {ex.submit(run_one, t): t for t in targets}
+                done = 0
+                for fut in concurrent.futures.as_completed(futures):
+                    done += 1
+                    report = fut.result()
+                    all_reports.append(report)
+                    total_findings += len(report.findings)
+                    console.print(
+                        f"\n[bold]── ({done}/{len(targets)}):[/bold] {report.target_url}"
+                    )
+                    print_report(report, console)
+        else:
+            for idx, target in enumerate(targets, 1):
+                if len(targets) > 1:
+                    console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
+                report = run_one(target)
+                all_reports.append(report)
+                total_findings += len(report.findings)
+                print_report(report, console)
     finally:
         probe.close()
         agent.close()
