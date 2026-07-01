@@ -242,8 +242,6 @@ class Scanner:
         # If the response is identical to baseline, this param ignores the value.
         # Skip it immediately — avoids 100s of wasted requests on dead params.
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
-            # Step 1: '*' — reveals if the param has ANY effect on the response.
-            # Dead params → skip immediately (1 request).
             star_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="*",
@@ -252,29 +250,34 @@ class Scanner:
             star_score, _ = self.detector.quick_score(baseline, star_probe)
 
             if star_score == 0.0 and star_probe.status_code == baseline.status_code:
-                return None  # dead param, skip silently
+                return None  # dead param
 
-            # Step 2: quote probe — look for SQL errors or status change.
             quote_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="'",
             )
             report.total_requests += 1
-            pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
 
-            # Immediate SQL error or status change → confirmed.
-            if pre_score >= 0.75:
-                return self._build_finding(
-                    point, quote_probe, baseline, pre_ev, pre_score
+            # Check SQL errors and status change DIRECTLY — do not rely only on
+            # quick_score which may miss unrecognised error patterns.
+            quote_errors = self.detector.find_sql_errors(quote_probe.response_body)
+            status_changed = quote_probe.status_code != baseline.status_code
+
+            if quote_errors or status_changed:
+                pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
+                evidence = pre_ev or (
+                    f"SQL error: {quote_errors[0][:80]}" if quote_errors else
+                    f"Status {baseline.status_code} -> {quote_probe.status_code}"
                 )
+                confidence = max(pre_score, 0.85 if quote_errors else 0.75)
+                return self._build_finding(point, quote_probe, baseline, evidence, confidence)
 
-            # If quote score is the SAME as star score and it's only a body-length
-            # diff (score=0.4), this is a dynamic page that returns different content
-            # for ANY value — not SQLi-specific.  Skip the full payload suite.
+            # No SQL errors and no status change — check if quote is more
+            # interesting than '*'. If both give the same body-diff score,
+            # this param is just dynamic (returns different content for any value).
+            pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
             if pre_score <= star_score and pre_score < 0.6:
-                return None
-
-            # Param reacts differently to a quote than to '*' — worth probing further.
+                return None  # dynamic page, not SQLi-specific
 
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
