@@ -67,6 +67,8 @@ python -m llmsql -u "http://target?id=1" \
 --guess-params         Mine common param names on each URL (query,q,id,...)
 --param-wordlist FILE  Custom parameter-name wordlist
 --openapi SRC          Import Swagger/OpenAPI spec (URL/file/site root)
+--timeout SECS         HTTP request timeout for LLMSQL's own requests (default 15)
+--sqlmap-timeout SECS  Max seconds per sqlmap target before kill/skip (0 = none)
 --tamper LIST          Evasion chain applied to payloads (space2comment,...)
 --no-auto-tamper       Don't auto-try evasion when a WAF/block is detected
 --list-tamper          List available tamper techniques
@@ -214,8 +216,12 @@ endpoints at level 5. This also covers verbatim-SQL bugs (like BrokenCrystals
 
 ```bash
 python -m llmsql --openapi https://target/ --guess-params \
-  --then-sqlmap --sqlmap-profile exploit
+  --then-sqlmap --sqlmap-profile exploit --sqlmap-timeout 300
 ```
+
+`--sqlmap-timeout` caps each sqlmap target (here 5 min) so one slow endpoint
+can't hang the whole run — it's killed (with its children) and the run moves on.
+Without a timeout, Ctrl+C is passed to sqlmap's interactive menu instead.
 
 Flow: `discover -> liveness -> LLMSQL scan -> sqlmap -p <param> on real hits`.
 For each confirmed finding LLMSQL builds a focused sqlmap command (`-p` for

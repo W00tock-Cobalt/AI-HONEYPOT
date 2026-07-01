@@ -101,6 +101,8 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("-p", "--param", action="append", dest="params",
                    help="Test only this parameter (repeatable)")
     p.add_argument("--proxy", help="HTTP proxy URL")
+    p.add_argument("--timeout", type=float, default=15.0,
+                   help="HTTP request timeout in seconds for LLMSQL's own requests (default: 15)")
 
     # Scan depth
     p.add_argument("--level", type=int, default=1, choices=[1, 2, 3],
@@ -152,6 +154,9 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--then-sqlmap", action="store_true",
                    help="Scan with LLMSQL first, then run sqlmap ONLY on the confirmed "
                         "injectable URLs (fast + deep exploitation of real hits)")
+    p.add_argument("--sqlmap-timeout", type=int, default=0,
+                   help="Max seconds per sqlmap target before it's killed and skipped "
+                        "(0 = no limit). Prevents one endpoint from hanging the run")
 
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
@@ -299,6 +304,51 @@ def interactive_sqlmap(console, profile: str, base_args: str, extra: str) -> str
     return edited or composed
 
 
+def launch_sqlmap(cmd: str, timeout: int, console) -> int:
+    """
+    Run a sqlmap command.
+
+    - timeout == 0: interactive mode — parent ignores SIGINT so Ctrl+C reaches
+      sqlmap's own [C]ontinue/[Q]uit menu.
+    - timeout > 0: automated mode — sqlmap runs in its own process group and is
+      killed (with its children) if it exceeds the timeout.
+    """
+    import os
+    import signal
+    import subprocess
+
+    if timeout and timeout > 0:
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            console.print(
+                f"[yellow]sqlmap exceeded {timeout}s — killing and moving on[/yellow]"
+            )
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return 124  # conventional timeout exit code
+        except KeyboardInterrupt:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            raise
+
+    # Interactive: hand Ctrl+C to sqlmap's own menu
+    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return subprocess.run(cmd, shell=True).returncode
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
 def grab_cookie(
     url: str,
     headers: dict[str, str] | None = None,
@@ -352,6 +402,7 @@ def sqlmap_handoff(
     console,
     verbose: bool = False,
     menu: bool = False,
+    timeout: int = 0,
 ) -> int:
     """Emit a sqlmap target list + command; optionally run sqlmap."""
     from urllib.parse import urlparse
@@ -417,20 +468,13 @@ def sqlmap_handoff(
 
     if run:
         import shutil
-        import signal
-        import subprocess
         if not shutil.which("sqlmap"):
             console.print("[yellow]sqlmap not found on PATH; command printed above.[/yellow]")
             return 1
-        console.print("[cyan]Launching sqlmap...[/cyan] [dim](Ctrl+C hands the menu to sqlmap)[/dim]\n")
-        # Ignore SIGINT in the parent so Ctrl+C goes to sqlmap's own handler
-        # (which shows its [C]ontinue/[Q]uit menu) instead of killing us.
-        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            proc = subprocess.run(cmd, shell=True)
-            return proc.returncode
-        finally:
-            signal.signal(signal.SIGINT, prev)
+        hint = f" [dim](timeout {timeout}s)[/dim]" if timeout else \
+            " [dim](Ctrl+C hands the menu to sqlmap)[/dim]"
+        console.print(f"[cyan]Launching sqlmap...[/cyan]{hint}\n")
+        return launch_sqlmap(cmd, timeout, console)
     return 0
 
 
@@ -612,6 +656,7 @@ def main(argv: list[str] | None = None) -> int:
         alive, status_map = probe_alive(
             targets,
             threads=args.probe_threads,
+            timeout=min(args.timeout, 8.0),
             headers=probe_headers,
             proxy=args.proxy,
         )
@@ -642,6 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             console=console,
             verbose=args.verbose,
             menu=args.sqlmap_menu,
+            timeout=args.sqlmap_timeout,
         )
 
     tamper_chain = []
@@ -664,6 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         use_llm = False
 
     probe = HttpProbe(
+        timeout=args.timeout,
         proxy=args.proxy,
         default_headers={"User-Agent": default_ua},
         cookies=cookies,
@@ -767,6 +814,7 @@ def main(argv: list[str] | None = None) -> int:
             cookie=args.cookie,
             console=console,
             menu=args.sqlmap_menu,
+            timeout=args.sqlmap_timeout,
         )
 
     return 1 if total_findings else 0
@@ -780,11 +828,10 @@ def run_sqlmap_on_findings(
     cookie: str | None,
     console,
     menu: bool = False,
+    timeout: int = 0,
 ) -> int:
     """Run sqlmap against only the URLs LLMSQL confirmed as injectable."""
     import shutil
-    import signal
-    import subprocess
     from urllib.parse import urlparse, urlunparse
 
     from llmsql.models import ParamLocation
@@ -855,11 +902,7 @@ def run_sqlmap_on_findings(
         console.print(f"[bold]({i}/{len(jobs)})[/bold] {cmd}")
         if not have_sqlmap:
             continue
-        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            subprocess.run(cmd, shell=True)
-        finally:
-            signal.signal(signal.SIGINT, prev)
+        launch_sqlmap(cmd, timeout, console)
 
     if not have_sqlmap:
         console.print(
