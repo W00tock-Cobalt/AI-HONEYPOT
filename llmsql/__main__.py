@@ -420,11 +420,16 @@ def sqlmap_handoff(
     urls: list[str] = []
     seen: set[str] = set()
     for t in targets:
-        has_q = bool(urlparse(t).query)
-        candidates = [t] if has_q else []
-        if not has_q and mine:
-            sep = "?"
-            candidates = [f"{t}{sep}{p}=1" for p in mine]
+        parsed_t = urlparse(t)
+        has_q = bool(parsed_t.query)
+        if has_q:
+            # URL already has real params from OpenAPI/crawl — use as-is
+            candidates = [t]
+        elif mine:
+            # Bare URL — expand with top mined param names for discovery
+            candidates = [f"{t}?{p}=1" for p in mine]
+        else:
+            candidates = [t]
         for c in candidates:
             if c not in seen:
                 seen.add(c)
@@ -855,23 +860,30 @@ def run_sqlmap_on_findings(
 
     from llmsql.models import ParamLocation
 
-    # Build one sqlmap invocation per confirmed finding
-    jobs: list[tuple[str, str]] = []  # (url, extra_flags)
-    seen: set[tuple[str, str]] = set()
+    # Deduplicate: one sqlmap job per unique *base URL*.
+    # --guess-params can produce many findings for the same endpoint (one per
+    # guessed param). We only need to run sqlmap once per URL — it will probe
+    # all parameters itself. If there's a confirmed param, we add -p to focus.
+    best_finding: dict[str, object] = {}  # base_url -> (extra, confidence)
     for report in reports:
+        # Canonical base: strip mined params so /count?query=test&page=1 → /count?query=test
+        from urllib.parse import parse_qs, urlencode
+        raw_parsed = urlparse(report.target_url)
+        raw_qs = parse_qs(raw_parsed.query, keep_blank_values=True)
         for f in report.findings:
             base = report.target_url
             extra = ""
             if f.location in (ParamLocation.QUERY, ParamLocation.BODY):
-                # Ensure the URL carries the param, then focus sqlmap on it
-                if f"{f.param}=" not in (urlparse(base).query or ""):
-                    sep = "&" if urlparse(base).query else "?"
-                    base = f"{base}{sep}{f.param}=1"
+                # Rebuild URL with only the real confirmed param
+                spec_params = {k: v for k, v in raw_qs.items() if k == f.param}
+                if not spec_params:
+                    spec_params = {f.param: ["1"]}
+                clean_url = urlunparse(raw_parsed._replace(
+                    query=urlencode({k: v[0] for k, v in spec_params.items()})
+                ))
+                base = clean_url
                 extra = f"-p {f.param}"
-                if f.location == ParamLocation.BODY and report.target_url:
-                    extra = f"-p {f.param}"
             elif f.location == ParamLocation.PATH:
-                # Mark the injectable path segment with '*'
                 idx = None
                 if f.param.startswith("path[") and "]" in f.param:
                     try:
@@ -886,10 +898,11 @@ def run_sqlmap_on_findings(
             else:
                 continue
 
-            key = (base, extra)
-            if key not in seen:
-                seen.add(key)
-                jobs.append(key)
+            prev = best_finding.get(base)
+            if prev is None or f.confidence > prev[1]:
+                best_finding[base] = (extra, f.confidence)
+
+    jobs = [(url, data[0]) for url, data in best_finding.items()]
 
     if not jobs:
         console.print(

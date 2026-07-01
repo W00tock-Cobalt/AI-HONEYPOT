@@ -39,9 +39,11 @@ class SqlDetector:
             score = max(score, 0.85)
             evidence_parts.append(f"SQL error: {errors[0][:120]}")
 
-        # Status code change
+        # Status code change — only meaningful alongside a SQL error in the body.
+        # A bare HTTP 500 just means "server crashed on invalid input", which is
+        # common for any unexpected value, not specific to SQLi.
         if baseline.status_code != injected.status_code:
-            if injected.status_code >= 500:
+            if injected.status_code >= 500 and errors:
                 score = max(score, 0.5)
                 evidence_parts.append(
                     f"Status {baseline.status_code} -> {injected.status_code}"
