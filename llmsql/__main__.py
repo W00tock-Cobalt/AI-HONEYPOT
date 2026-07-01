@@ -807,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
     )
+    scanner._sleep_ms = args.sleep * 1000
     if tamper_chain:
         console.print(f"[dim]Tamper chain: {', '.join(tamper_chain)}[/dim]")
     if test_path:

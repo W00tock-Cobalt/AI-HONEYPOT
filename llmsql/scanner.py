@@ -55,6 +55,7 @@ class Scanner:
         self.show_response = show_response
         self.continue_on_found = continue_on_found
         self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
+        self._sleep_ms = 3000  # calibrated by CLI --sleep
 
     def scan(
         self,
@@ -100,6 +101,19 @@ class Scanner:
         report.total_requests += 1
         self.on_progress(f"[*] Baseline: HTTP {baseline.status_code} ({baseline.response_time_ms:.0f}ms)")
 
+        # Detect DB/backend offline — tell the user clearly rather than silently
+        # returning 0 findings for every payload.
+        if self.detector.is_db_offline(baseline):
+            report.errors.append(
+                f"DB/backend appears OFFLINE ({baseline.response_body[:120].strip()}) — "
+                f"SQLi cannot be detected at runtime. Vulnerability may still exist in code."
+            )
+            self.on_progress(
+                f"[!] DB appears OFFLINE — runtime detection not possible on this URL"
+            )
+            report.duration_seconds = time.perf_counter() - start
+            return report
+
         # Skip dead endpoints — no point fuzzing a route that doesn't exist
         if not self.include_dead and baseline.status_code in (0, 404, 405, 501):
             report.errors.append(
@@ -125,29 +139,53 @@ class Scanner:
             )
             return report
 
-        for point in points:
-            # Once we have a confirmed finding on this URL, skip remaining
-            # guessed params — they're testing the same endpoint redundantly.
-            if report.findings and not self.continue_on_found:
-                skipped = sum(1 for p in points if p.name != point.name)
-                if skipped and not getattr(report, '_skip_logged', False):
-                    report._skip_logged = True
-                    self.on_progress(
-                        f"[*] SQLi confirmed — skipping remaining parameters on this URL"
-                    )
-                break
+        import concurrent.futures as _cf
 
-            self.on_progress(f"\n[+] Testing parameter: {point.name} ({point.location.value})")
-            finding = self._test_parameter(
+        def _test_one(point):
+            self.on_progress(
+                f"\n[+] Testing: {point.name} ({point.location.value})"
+            )
+            return self._test_parameter(
                 url, method, data, content_type, extra_headers,
                 point, baseline, report,
             )
-            if finding:
-                report.findings.append(finding)
-                self.on_progress(
-                    f"[!] VULNERABLE: {point.name} — {finding.injection_type.value} "
-                    f"(confidence {finding.confidence:.0%})"
-                )
+
+        # Run param tests concurrently — big speed win when there are many params.
+        # Cap at 4 workers to avoid hammering the target.
+        workers = min(4, len(points))
+        if workers > 1 and not self.continue_on_found:
+            with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(_test_one, p): p for p in points}
+                for fut in _cf.as_completed(futures):
+                    finding = fut.result()
+                    if finding:
+                        report.findings.append(finding)
+                        self.on_progress(
+                            f"[!] VULNERABLE: {finding.param} — "
+                            f"{finding.injection_type.value} "
+                            f"(confidence {finding.confidence:.0%})"
+                        )
+                        if not self.continue_on_found:
+                            # Cancel pending futures
+                            for f in futures:
+                                f.cancel()
+        else:
+            for point in points:
+                if report.findings and not self.continue_on_found:
+                    if not getattr(report, '_skip_logged', False):
+                        report._skip_logged = True
+                        self.on_progress(
+                            "[*] SQLi confirmed — skipping remaining parameters"
+                        )
+                    break
+                finding = _test_one(point)
+                if finding:
+                    report.findings.append(finding)
+                    self.on_progress(
+                        f"[!] VULNERABLE: {finding.param} — "
+                        f"{finding.injection_type.value} "
+                        f"(confidence {finding.confidence:.0%})"
+                    )
 
         report.duration_seconds = time.perf_counter() - start
         self.on_progress(
@@ -228,6 +266,10 @@ class Scanner:
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload=payload,
             )
+            # Tag time-based payloads so the timing detector calibrates threshold
+            _sleep_kw = ("sleep", "waitfor", "pg_sleep", "benchmark")
+            if any(kw in payload.lower() for kw in _sleep_kw):
+                injected._expected_sleep_ms = getattr(self, '_sleep_ms', 3000)
             report.exchanges.append(injected)
             report.total_requests += 1
 
@@ -351,6 +393,34 @@ class Scanner:
                 return self._build_finding(
                     point, best_exchange, baseline, best_evidence, best_score
                 )
+
+        # Boolean-blind pair testing — catches blind SQLi that produces no errors.
+        # Only run if error-based/timing detection found nothing so far.
+        if best_score < 0.7 and not self.fast:
+            from llmsql.payloads import BOOLEAN_PAIRS
+            for true_pl, false_pl in BOOLEAN_PAIRS[:4]:
+                true_ex = self.probe.send(
+                    url, method, data, content_type, extra_headers,
+                    inject_point=point, payload=true_pl,
+                )
+                false_ex = self.probe.send(
+                    url, method, data, content_type, extra_headers,
+                    inject_point=point, payload=false_pl,
+                )
+                report.total_requests += 2
+                score, evidence = self.detector.boolean_blind_score(
+                    baseline, true_ex, false_ex
+                )
+                self.on_progress(
+                    f"    [bool] T={true_ex.status_code}/{len(true_ex.response_body)}b "
+                    f"F={false_ex.status_code}/{len(false_ex.response_body)}b "
+                    f"score={score:.2f}"
+                )
+                if score >= 0.7:
+                    return self._build_finding(
+                        point, true_ex, baseline, evidence, score,
+                        inj_type=InjectionType.BOOLEAN_BLIND,
+                    )
 
         # If continue_on_found, return the best interim finding (or final one)
         interim = getattr(report, '_interim_findings', [])

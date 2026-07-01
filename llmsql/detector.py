@@ -25,6 +25,49 @@ class SqlDetector:
         """True when the baseline response itself contains SQL error text."""
         return bool(self.find_sql_errors(baseline.response_body))
 
+    _CONN_REFUSED = re.compile(
+        r"ECONNREFUSED|connection refused|connect ECONNREFUSED|"
+        r"ETIMEDOUT|ENOTFOUND|socket hang up",
+        re.IGNORECASE,
+    )
+
+    def is_db_offline(self, exchange: HttpExchange) -> bool:
+        """True when the response indicates the DB/backend is unreachable."""
+        return bool(self._CONN_REFUSED.search(exchange.response_body))
+
+    def boolean_blind_score(
+        self,
+        baseline: HttpExchange,
+        true_exchange: HttpExchange,
+        false_exchange: HttpExchange,
+    ) -> tuple[float, str]:
+        """
+        Compare a true-condition response vs a false-condition response.
+        A significant diff between true/false (while both differ from baseline)
+        is a strong boolean-blind indicator.
+        """
+        b_len = len(baseline.response_body)
+        t_len = len(true_exchange.response_body)
+        f_len = len(false_exchange.response_body)
+
+        if b_len == 0 or t_len == 0 or f_len == 0:
+            return 0.0, ""
+
+        # True and false should differ from each other — that's the signal.
+        tf_diff = abs(t_len - f_len) / max(t_len, f_len)
+        # True should resemble baseline (valid query still returns data).
+        tb_diff = abs(t_len - b_len) / max(t_len, b_len)
+
+        if tf_diff > 0.15 and tb_diff < 0.25:
+            evidence = (
+                f"Boolean blind: true={t_len}b vs false={f_len}b "
+                f"({tf_diff:.0%} diff), baseline={b_len}b"
+            )
+            confidence = min(0.9, 0.5 + tf_diff)
+            return confidence, evidence
+
+        return 0.0, ""
+
     def quick_score(
         self,
         baseline: HttpExchange,
@@ -90,12 +133,17 @@ class SqlDetector:
                     f"Body length changed {base_len} -> {inj_len} ({ratio:.0%})"
                 )
 
-        # Timing anomaly (time-based blind hint)
-        if injected.response_time_ms - baseline.response_time_ms > 2500:
+        # Timing anomaly (time-based blind hint).
+        # Threshold is 60% of the expected sleep time so we catch it even with
+        # some network variance. Stored on the exchange when time payloads are used.
+        expected_sleep_ms = getattr(injected, '_expected_sleep_ms', 2000)
+        delay = injected.response_time_ms - baseline.response_time_ms
+        if delay > expected_sleep_ms * 0.6:
+            score = max(score, 0.75)
+            evidence_parts.append(f"Delay +{delay:.0f}ms (expected ~{expected_sleep_ms}ms)")
+        elif delay > 2500:
             score = max(score, 0.6)
-            evidence_parts.append(
-                f"Delay +{injected.response_time_ms - baseline.response_time_ms:.0f}ms"
-            )
+            evidence_parts.append(f"Delay +{delay:.0f}ms")
 
         # Payload reflected with error context
         if injected.payload and injected.payload in injected.response_body:
