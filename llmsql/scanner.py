@@ -396,9 +396,8 @@ class Scanner:
                 best_exchange = injected
                 best_evidence = evidence
 
-            # Confirmed finding — lower threshold when we have multiple consistent hits
-            confirm_threshold = 0.85 if attempts <= 2 else 0.75
-            if score >= confirm_threshold:
+            # Confirmed finding — require strong evidence (0.85+)
+            if score >= 0.85:
                 finding = self._build_finding(point, injected, baseline, best_evidence, score)
                 if not self.continue_on_found:
                     return finding
@@ -479,9 +478,23 @@ class Scanner:
                     point, best_exchange, baseline, best_evidence, best_score
                 )
 
-        # Boolean-blind pair testing — catches blind SQLi that produces no errors.
-        # Only run if error-based/timing detection found nothing so far.
-        if best_score < 0.7 and not self.fast:
+        # Boolean-blind pair testing.
+        # Guard against SPA false positives: Angular/React apps return different
+        # body lengths for ANY param change (routing). Only run when:
+        # - A prior payload already scored >= 0.35 (param reacts to SQL chars)
+        # - Not --fast mode
+        # - Not a SPA-like URL
+        # - Only query/body params (path segments are too noisy)
+        is_spa_like = any(seg in url for seg in (
+            "/@ng/", "/Edge/", "/Trident/", "/%5C/", "/index.html", "/2fa/",
+        ))
+        run_bool_blind = (
+            best_score >= 0.35
+            and not self.fast
+            and not is_spa_like
+            and point.location.value in ("query", "body", "json")
+        )
+        if run_bool_blind:
             from llmsql.payloads import BOOLEAN_PAIRS
             for true_pl, false_pl in BOOLEAN_PAIRS[:4]:
                 true_ex = self.probe.send(
@@ -496,17 +509,12 @@ class Scanner:
                 score, evidence = self.detector.boolean_blind_score(
                     baseline, true_ex, false_ex
                 )
-                self.on_progress(
-                    f"    [bool] T={true_ex.status_code}/{len(true_ex.response_body)}b "
-                    f"F={false_ex.status_code}/{len(false_ex.response_body)}b "
-                    f"score={score:.2f}"
-                )
-                if score >= 0.7:
+                # Require large diff (>40%) to avoid SPA routing false positives
+                if score >= 0.85:
                     return self._build_finding(
                         point, true_ex, baseline, evidence, score,
                         inj_type=InjectionType.BOOLEAN_BLIND,
                     )
-
         # If continue_on_found, return the best interim finding (or final one)
         interim = getattr(report, '_interim_findings', [])
         if interim:
@@ -524,9 +532,10 @@ class Scanner:
         db_hint: Optional[str] = None,
         inj_type: Optional[InjectionType] = None,
     ) -> Finding:
-        # PATH injection: a 4xx response from a modified path segment is just routing
-        # (the route doesn't exist), not SQLi. Require an SQL error in the body.
-        if point.location.value == "path" and injected.status_code in (400, 404, 405):
+        # PATH injection: changing a path segment almost always changes the HTTP
+        # response (different route, 404, etc.) — that alone is NOT SQLi.
+        # Require actual SQL error text in the body for any path-segment finding.
+        if point.location.value == "path":
             if not self.detector.find_sql_errors(injected.response_body):
                 return None
 

@@ -558,8 +558,13 @@ _STATIC_EXT = frozenset({
     ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf", ".zip", ".gz",
     ".tar", ".mp4", ".mp3", ".webm", ".wav",
 })
-_STATIC_SEGS = ("/assets/", "/static/", "/images/", "/img/", "/fonts/",
-                "/dist/", "/build/", "/vendor/", "/node_modules/")
+_STATIC_SEGS = (
+    "/assets/", "/static/", "/images/", "/img/", "/fonts/",
+    "/dist/", "/build/", "/vendor/", "/node_modules/",
+    "/@ng/",    # Angular internal routes
+    "/Trident/", "/Edge/", "/MSIE/",  # browser sniffing paths
+    "/%5C/",    # backslash encoded — SPA artifact
+)
 
 
 def _is_static(url: str) -> bool:
