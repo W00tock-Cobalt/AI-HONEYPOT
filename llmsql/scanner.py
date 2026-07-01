@@ -189,16 +189,24 @@ class Scanner:
             with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {ex.submit(_test_one, p): p for p in points}
                 for fut in _cf.as_completed(futures):
-                    finding = fut.result()
+                    try:
+                        finding = fut.result()
+                    except _cf.CancelledError:
+                        continue  # skipped after first finding confirmed
+                    except Exception as e:
+                        report.errors.append(f"Param test error: {e}")
+                        continue
                     if finding:
                         report.findings.append(finding)
                         self.on_progress(
-                            f"[!] VULNERABLE: {finding.param} — "
-                            f"{finding.injection_type.value} "
-                            f"(confidence {finding.confidence:.0%})"
+                            f"[!] VULNERABLE: {url}\n"
+                            f"    Param: {finding.param} ({finding.location.value}) "
+                            f"| Type: {finding.injection_type.value} "
+                            f"| DB: {finding.db_type or '?'} "
+                            f"| Confidence: {finding.confidence:.0%}\n"
+                            f"    PoC: {finding.poc_curl}"
                         )
                         if not self.continue_on_found:
-                            # Cancel pending futures
                             for f in futures:
                                 f.cancel()
         else:
@@ -214,9 +222,12 @@ class Scanner:
                 if finding:
                     report.findings.append(finding)
                     self.on_progress(
-                        f"[!] VULNERABLE: {finding.param} — "
-                        f"{finding.injection_type.value} "
-                        f"(confidence {finding.confidence:.0%})"
+                        f"[!] VULNERABLE: {url}\n"
+                        f"    Param: {finding.param} ({finding.location.value}) "
+                        f"| Type: {finding.injection_type.value} "
+                        f"| DB: {finding.db_type or '?'} "
+                        f"| Confidence: {finding.confidence:.0%}\n"
+                        f"    PoC: {finding.poc_curl}"
                     )
 
         report.duration_seconds = time.perf_counter() - start
@@ -513,6 +524,12 @@ class Scanner:
         db_hint: Optional[str] = None,
         inj_type: Optional[InjectionType] = None,
     ) -> Finding:
+        # PATH injection: a 4xx response from a modified path segment is just routing
+        # (the route doesn't exist), not SQLi. Require an SQL error in the body.
+        if point.location.value == "path" and injected.status_code in (400, 404, 405):
+            if not self.detector.find_sql_errors(injected.response_body):
+                return None
+
         db = db_hint or self.detector.guess_db_from_errors(injected.response_body)
         itype = inj_type or self.detector.infer_injection_type(baseline, injected, evidence)
         severity = Severity.HIGH if confidence >= 0.8 else Severity.MEDIUM
