@@ -6,13 +6,14 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 from llmsql.models import ScanReport, Severity
 
 
 def print_report(report: ScanReport, console: Console | None = None) -> None:
-    """Print human-readable scan report."""
+    """Print a human-readable scan report to the console."""
     con = console or Console()
 
     con.print(Panel.fit(
@@ -24,15 +25,6 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
         border_style="cyan",
     ))
 
-    if report.injection_points:
-        table = Table(title="Injection Points")
-        table.add_column("Parameter")
-        table.add_column("Location")
-        table.add_column("Original Value")
-        for p in report.injection_points:
-            table.add_row(p.name, p.location.value, p.original_value[:60])
-        con.print(table)
-
     if report.findings:
         con.print(f"\n[bold red]Found {len(report.findings)} vulnerability/vulnerabilities[/bold red]\n")
         for i, f in enumerate(report.findings, 1):
@@ -43,13 +35,23 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
                 Severity.LOW: "blue",
                 Severity.INFO: "dim",
             }.get(f.severity, "white")
-            con.print(Panel(
-                f"[bold]Parameter:[/bold] {f.param} ({f.location.value})\n"
-                f"[bold]Type:[/bold] {f.injection_type.value}\n"
-                f"[bold]Payload:[/bold] {f.payload}\n"
+
+            # Core finding info
+            details = (
+                f"[bold]Parameter:[/bold]  {f.param} ({f.location.value})\n"
+                f"[bold]Type:[/bold]       {f.injection_type.value}\n"
+                f"[bold]DB:[/bold]         {f.db_type or 'unknown'}\n"
                 f"[bold]Confidence:[/bold] {f.confidence:.0%}\n"
-                f"[bold]DB:[/bold] {f.db_type or 'unknown'}\n"
-                f"[bold]Evidence:[/bold] {f.evidence}",
+                f"[bold]Payload:[/bold]    {f.payload}\n"
+                f"[bold]Evidence:[/bold]   {f.evidence}"
+            )
+
+            # Append PoC curl command if available
+            if f.poc_curl:
+                details += f"\n\n[bold]PoC:[/bold]\n  [cyan]{f.poc_curl}[/cyan]"
+
+            con.print(Panel(
+                details,
                 title=f"[{color}]Finding #{i} — {f.severity.value.upper()}[/{color}]",
                 border_style=color,
             ))
@@ -63,17 +65,17 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
 
     if report.agent_log:
         con.print("\n[dim]Agent log:[/dim]")
-        for line in report.agent_log[-10:]:
+        for line in report.agent_log[-5:]:
             con.print(f"  [dim]{line}[/dim]")
 
 
 def export_json(report: ScanReport) -> dict[str, Any]:
-    """Export report as JSON-serializable dict."""
+    """Serialize a ScanReport to a JSON-compatible dict."""
 
     def _serialize(obj):
-        if hasattr(obj, "value"):  # Enum
+        if hasattr(obj, "value"):          # Enum → string
             return obj.value
-        if hasattr(obj, "__dataclass_fields__"):
+        if hasattr(obj, "__dataclass_fields__"):  # dataclass → dict
             return {k: _serialize(v) for k, v in asdict(obj).items()}
         if isinstance(obj, list):
             return [_serialize(i) for i in obj]
@@ -85,6 +87,6 @@ def export_json(report: ScanReport) -> dict[str, Any]:
 
 
 def save_json(report: ScanReport, path: str) -> None:
-    """Write report to JSON file."""
+    """Write a JSON report file."""
     with open(path, "w") as f:
         json.dump(export_json(report), f, indent=2)

@@ -18,6 +18,39 @@ from llmsql.models import (
 from llmsql.payloads import SEED_PAYLOADS
 
 
+def _build_poc(exchange) -> tuple[str, str]:
+    """Build a curl PoC + raw HTTP summary from the confirming exchange."""
+    from urllib.parse import urlparse
+    url = exchange.url
+    method = exchange.method.upper()
+    hdrs = exchange.request_headers or {}
+
+    extra_h = "".join(
+        f' -H "{k}: {v}"'
+        for k, v in hdrs.items()
+        if k.lower() not in ("user-agent", "accept-encoding", "connection", "host")
+    )
+    if method == "GET":
+        curl = f'curl -si "{url}"{extra_h}'
+    else:
+        ct = hdrs.get("Content-Type", hdrs.get("content-type", "application/json"))
+        body = (exchange.request_body or "").replace("'", "\\'")
+        curl = (
+            f'curl -si -X {method}{extra_h}'
+            f' -H "Content-Type: {ct}"'
+            f" --data '{body}'"
+            f' "{url}"'
+        )
+
+    parsed = urlparse(url)
+    path_qs = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+    raw = f"{method} {path_qs} HTTP/1.1\nHost: {parsed.netloc}\n\n"
+    raw += f"→ HTTP {exchange.status_code}\n"
+    raw += exchange.response_body[:300]
+
+    return curl, raw
+
+
 class Scanner:
     """AI-powered SQL injection scanner."""
 
@@ -480,6 +513,7 @@ class Scanner:
         db = db_hint or self.detector.guess_db_from_errors(injected.response_body)
         itype = inj_type or self.detector.infer_injection_type(baseline, injected, evidence)
         severity = Severity.HIGH if confidence >= 0.8 else Severity.MEDIUM
+        poc_curl, poc_req = _build_poc(injected)
         return Finding(
             param=point.name,
             location=point.location,
@@ -489,6 +523,8 @@ class Scanner:
             evidence=evidence,
             confidence=confidence,
             db_type=db,
+            poc_curl=poc_curl,
+            poc_request=poc_req,
         )
 
     @staticmethod

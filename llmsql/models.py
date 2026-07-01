@@ -33,19 +33,17 @@ class ParamLocation(str, Enum):
 
 @dataclass
 class InjectionPoint:
-    """A parameter that can be tested for SQL injection."""
-
+    """A parameter that will be tested for SQL injection."""
     name: str
     location: ParamLocation
     original_value: str
-    json_path: Optional[str] = None  # e.g. "user.name" for nested JSON
-    path_index: Optional[int] = None  # index of URL path segment for PATH injection
+    json_path: Optional[str] = None   # e.g. "user.name" for nested JSON bodies
+    path_index: Optional[int] = None  # URL path segment index for PATH injection
 
 
 @dataclass
 class HttpExchange:
-    """Request/response pair for analysis."""
-
+    """One HTTP request/response pair captured during scanning."""
     method: str
     url: str
     status_code: int
@@ -60,9 +58,8 @@ class HttpExchange:
 
 @dataclass
 class AgentDecision:
-    """LLM agent's next action."""
-
-    action: str  # "inject", "confirm", "skip", "done"
+    """What the LLM agent decided to do next."""
+    action: str  # "inject" | "confirm" | "skip" | "done"
     payload: Optional[str] = None
     injection_type: Optional[InjectionType] = None
     reasoning: str = ""
@@ -72,8 +69,7 @@ class AgentDecision:
 
 @dataclass
 class Finding:
-    """Confirmed or suspected SQL injection."""
-
+    """A confirmed (or suspected) SQL injection vulnerability."""
     param: str
     location: ParamLocation
     injection_type: InjectionType
@@ -83,12 +79,13 @@ class Finding:
     confidence: float
     db_type: Optional[str] = None
     reasoning: str = ""
+    poc_curl: str = ""      # Ready-to-run curl PoC command
+    poc_request: str = ""   # Raw HTTP request for the confirming exchange
 
 
 @dataclass
 class ScanReport:
-    """Complete scan results."""
-
+    """Complete results of one target scan."""
     target_url: str
     injection_points: list[InjectionPoint] = field(default_factory=list)
     exchanges: list[HttpExchange] = field(default_factory=list)

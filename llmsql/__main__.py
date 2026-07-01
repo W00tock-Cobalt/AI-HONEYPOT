@@ -88,6 +88,10 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--openapi",
                    help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
                         "to discover endpoints WITH their real parameter names")
+    p.add_argument("--auto", action="store_true",
+                   help="Smart discovery: probe for Swagger/OpenAPI first, "
+                        "fall back to katana crawl if no spec found. "
+                        "Use with -u <site> for zero-config scanning.")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
@@ -549,6 +553,65 @@ def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | N
     return True, ollama_base_url(host), None
 
 
+def _auto_discover(args, targets: list[str], console) -> None:
+    """
+    Smart target discovery for --auto mode.
+
+    1. Probe for Swagger/OpenAPI spec on the site root.
+    2. If found: set args.openapi so the spec importer runs.
+    3. If not found: run katana to crawl the site, store results in args._auto_targets.
+    """
+    site = targets[0]
+    console.print(f"[*] Auto-discovery: {site}")
+
+    # Try OpenAPI first
+    try:
+        from llmsql.openapi import load_openapi
+        spec_hits = load_openapi(
+            site,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+        )
+        if spec_hits:
+            console.print(
+                f"[green]✓[/green] OpenAPI spec found — "
+                f"{len(spec_hits)} endpoint(s) imported"
+            )
+            args.openapi = site  # trigger the spec importer
+            return
+    except Exception:
+        pass
+
+    # No spec — fall back to katana crawl
+    import shutil
+    import subprocess as _sp
+    if not shutil.which("katana"):
+        console.print(
+            "[yellow]No OpenAPI spec and katana not found — "
+            "scanning root with --guess-params[/yellow]"
+        )
+        args.guess_params = True
+        return
+
+    console.print("[dim]No OpenAPI spec — crawling with katana...[/dim]")
+    try:
+        result = _sp.run(
+            ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
+            capture_output=True, text=True, timeout=120,
+        )
+        crawled = sorted({l.strip() for l in result.stdout.splitlines() if l.strip()})
+        if crawled:
+            console.print(f"[green]✓[/green] katana found {len(crawled)} URL(s)")
+            args._auto_targets = crawled
+        else:
+            console.print("[yellow]katana found no URLs — scanning root only[/yellow]")
+            args._auto_targets = targets
+    except Exception as e:
+        console.print(f"[yellow]katana error: {e} — scanning root only[/yellow]")
+        args._auto_targets = targets
+
+    args.guess_params = True  # always mine params in crawl mode
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     console = Console()
@@ -566,6 +629,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     targets = collect_targets(args)
+
+    # --auto: smart discovery — probe for Swagger/OpenAPI first,
+    # fall back to katana crawl if no spec is found.
+    if args.auto and targets and not args.openapi:
+        _auto_discover(args, targets, console)
+        # If --auto ran katana it may have replaced targets; re-read
+        if hasattr(args, '_auto_targets'):
+            targets = args._auto_targets
 
     # OpenAPI/Swagger import — discover endpoints with their real param names
     # spec_extras maps url -> (method, body, content_type, inject_headers)
