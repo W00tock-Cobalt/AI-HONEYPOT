@@ -93,6 +93,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
                    help="Extra header (Name: Value or Name=Value)")
     p.add_argument("--cookie", help="Cookie string (name=value; name2=value2)")
+    p.add_argument("--grab-cookie", nargs="?", const="__FIRST__", metavar="URL",
+                   help="Fetch a URL (or the first target) and capture its Set-Cookie "
+                        "session cookie, then reuse it for the scan and sqlmap handoff")
+    p.add_argument("--login-url", help="POST credentials here to obtain a session cookie")
+    p.add_argument("--login-data", help="Login POST body (form or JSON) for --login-url")
     p.add_argument("-p", "--param", action="append", dest="params",
                    help="Test only this parameter (repeatable)")
     p.add_argument("--proxy", help="HTTP proxy URL")
@@ -127,6 +132,17 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Do not auto-try evasion payloads when a WAF/block is detected")
     p.add_argument("--list-tamper", action="store_true",
                    help="List available tamper techniques and exit")
+
+    # sqlmap handoff — use LLMSQL for discovery, sqlmap for exploitation
+    p.add_argument("--sqlmap", action="store_true",
+                   help="Don't scan; discover injectable URLs and emit a sqlmap "
+                        "target list + command (recon -> sqlmap handoff)")
+    p.add_argument("--run-sqlmap", action="store_true",
+                   help="Like --sqlmap, but also execute sqlmap if it is installed")
+    p.add_argument("--sqlmap-out", default="llmsql-sqlmap-urls.txt",
+                   help="File to write discovered sqlmap targets (default: llmsql-sqlmap-urls.txt)")
+    p.add_argument("--sqlmap-args", default="--batch --random-agent --level 3 --risk 2",
+                   help="Extra sqlmap args (default: '--batch --random-agent --level 3 --risk 2')")
 
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
@@ -225,6 +241,114 @@ def probe_alive(
 
     alive = [u for u in urls if status_map.get(u, 0) not in dead_statuses]
     return alive, status_map
+
+
+def grab_cookie(
+    url: str,
+    headers: dict[str, str] | None = None,
+    login_url: str | None = None,
+    login_data: str | None = None,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    """
+    Obtain session cookies from a target.
+
+    If login_url/login_data are given, POST them first (form or JSON). Then
+    read the cookie jar. Returns (cookie_string, cookie_dict).
+    """
+    import httpx
+
+    kwargs = {"timeout": 15.0, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        kwargs["proxy"] = proxy
+    jar: dict[str, str] = {}
+    with httpx.Client(**kwargs) as c:
+        try:
+            if login_url and login_data:
+                is_json = login_data.strip().startswith("{")
+                if is_json:
+                    import json as _json
+                    c.post(login_url, json=_json.loads(login_data), headers=headers or {})
+                else:
+                    from urllib.parse import parse_qsl
+                    c.post(login_url, data=dict(parse_qsl(login_data)), headers=headers or {})
+            else:
+                c.get(url, headers=headers or {})
+        except httpx.HTTPError:
+            pass
+        for cookie in c.cookies.jar:
+            jar[cookie.name] = cookie.value
+
+    cookie_str = "; ".join(f"{k}={v}" for k, v in jar.items())
+    return cookie_str, jar
+
+
+def sqlmap_handoff(
+    targets: list[str],
+    guess_params: list[str] | None,
+    out_file: str,
+    sqlmap_args: str,
+    run: bool,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+) -> int:
+    """Emit a sqlmap target list + command; optionally run sqlmap."""
+    from urllib.parse import urlparse
+
+    # Expand: keep URLs that already have params; for bare URLs, if param
+    # mining is on, append a few high-value candidate params so sqlmap has
+    # something to test.
+    mine = (guess_params or [])[:6]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for t in targets:
+        has_q = bool(urlparse(t).query)
+        candidates = [t] if has_q else []
+        if not has_q and mine:
+            sep = "?"
+            candidates = [f"{t}{sep}{p}=1" for p in mine]
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                urls.append(c)
+
+    if not urls:
+        console.print("[yellow]No parameterized URLs to hand to sqlmap.[/yellow]")
+        return 2
+
+    with open(out_file, "w") as f:
+        f.write("\n".join(urls) + "\n")
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" --cookie '{cookie}'"
+
+    cmd = f"sqlmap -m {out_file} {sqlmap_args}{header_args}"
+
+    console.print(f"[green]✓[/green] Wrote {len(urls)} targets to [bold]{out_file}[/bold]")
+    console.print("\n[bold]Run sqlmap:[/bold]")
+    console.print(f"  {cmd}\n")
+    console.print(
+        "[dim]Tip: for per-parameter focus add -p <name>; "
+        "for the BrokenCrystals raw-SQL bug, sqlmap error-based will flag "
+        "/api/testimonials/count?query=...[/dim]"
+    )
+
+    if run:
+        import shutil
+        import subprocess
+        if not shutil.which("sqlmap"):
+            console.print("[yellow]sqlmap not found on PATH; command printed above.[/yellow]")
+            return 1
+        console.print("[cyan]Launching sqlmap...[/cyan]\n")
+        proc = subprocess.run(cmd, shell=True)
+        return proc.returncode
+    return 0
 
 
 def has_injectable_params(url: str, test_path: bool = False) -> bool:
@@ -351,6 +475,29 @@ def main(argv: list[str] | None = None) -> int:
     content_type = headers.get("Content-Type") or headers.get("content-type")
     max_attempts = args.max_attempts or level_to_attempts(args.level)
 
+    # Auto-grab a session cookie (optionally via login) and reuse everywhere
+    if args.grab_cookie or (args.login_url and args.login_data):
+        seed_url = args.grab_cookie
+        if not seed_url or seed_url == "__FIRST__":
+            seed_url = targets[0]
+        console.print("[*] Grabbing session cookie...")
+        cookie_str, jar = grab_cookie(
+            seed_url,
+            headers=headers,
+            login_url=args.login_url,
+            login_data=args.login_data,
+            proxy=args.proxy,
+        )
+        if jar:
+            cookies.update(jar)
+            if not args.cookie:
+                args.cookie = cookie_str
+            else:
+                args.cookie = args.cookie.rstrip("; ") + "; " + cookie_str
+            console.print(f"[green]✓[/green] Captured cookie(s): {', '.join(jar.keys())}")
+        else:
+            console.print("[yellow]No Set-Cookie returned by the target[/yellow]")
+
     # Parameter mining wordlist
     guess_params = None
     if args.guess_params or args.param_wordlist:
@@ -364,6 +511,19 @@ def main(argv: list[str] | None = None) -> int:
                 guess_params = list(COMMON_PARAMS)
         else:
             guess_params = list(COMMON_PARAMS)
+
+    # sqlmap handoff: use LLMSQL only for discovery, then hand to sqlmap
+    if args.sqlmap or args.run_sqlmap:
+        return sqlmap_handoff(
+            targets=targets,
+            guess_params=guess_params,
+            out_file=args.sqlmap_out,
+            sqlmap_args=args.sqlmap_args,
+            run=args.run_sqlmap,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+        )
 
     tamper_chain = []
     if args.tamper:
