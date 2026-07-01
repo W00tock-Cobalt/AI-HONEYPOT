@@ -37,6 +37,7 @@ class Scanner:
         auto_tamper: bool = True,
         show_response: bool = False,
         continue_on_found: bool = False,
+        seed_payloads: Optional[list[str]] = None,
     ):
         self.agent = agent
         self.probe = probe
@@ -53,6 +54,7 @@ class Scanner:
         self.auto_tamper = auto_tamper
         self.show_response = show_response
         self.continue_on_found = continue_on_found
+        self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
 
     def scan(
         self,
@@ -166,7 +168,10 @@ class Scanner:
         report: ScanReport,
     ) -> Optional[Finding]:
         """Test a single injection point with LLM-guided payloads."""
-        payloads = list(SEED_PAYLOADS[:5])
+        if self._seed_payloads is not None:
+            payloads = list(self._seed_payloads)
+        else:
+            payloads = list(SEED_PAYLOADS[:5])
 
         # In fast mode, skip the per-parameter LLM suggestion call (slow on
         # local models). Rely on seed payloads + heuristics, use the LLM only

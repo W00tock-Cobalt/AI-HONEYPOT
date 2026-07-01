@@ -118,6 +118,14 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--fast", action="store_true",
                    help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only "
                         "(much faster with local models like llama3.2)")
+    p.add_argument("--payloads", default="sqlmap",
+                   choices=["sqlmap", "embedded", "error", "boolean", "union", "time", "stacked"],
+                   help="Payload source: 'sqlmap' reads from sqlmap XML library, "
+                        "'embedded' uses built-in set, or pick a technique (default: sqlmap)")
+    p.add_argument("--sqlmap-data", metavar="DIR",
+                   help="Path to sqlmap data/xml/payloads dir (auto-detected if not set)")
+    p.add_argument("--sleep", type=int, default=3,
+                   help="Sleep seconds for time-based payloads (default: 3)")
     p.add_argument("--continue-on-found", action="store_true",
                    help="Keep probing a parameter even after confirming SQLi "
                         "(finds additional injection types before handing to sqlmap)")
@@ -621,7 +629,13 @@ def main(argv: list[str] | None = None) -> int:
     headers = parse_headers(args.headers)
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
-    max_attempts = args.max_attempts or level_to_attempts(args.level)
+    # In full payload mode (not fast), allow enough attempts to use all payloads
+    if args.max_attempts:
+        max_attempts = args.max_attempts
+    elif args.fast:
+        max_attempts = 10
+    else:
+        max_attempts = level_to_attempts(args.level)
 
     # Auto-grab a session cookie (optionally via login) and reuse everywhere
     if args.grab_cookie or (args.login_url and args.login_data):
@@ -711,6 +725,24 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.sqlmap_timeout,
         )
 
+    # Load payload library
+    from llmsql.sqlmap_payloads import get_payloads, load_sqlmap_payloads
+    if args.payloads in ("sqlmap", "embedded"):
+        seed_payloads, payload_src = load_sqlmap_payloads(
+            data_dir=getattr(args, "sqlmap_data", None),
+            sleep=args.sleep,
+        )
+    else:
+        seed_payloads = get_payloads(techniques=[args.payloads], sleep=args.sleep)
+        payload_src = f"{args.payloads} technique ({len(seed_payloads)} payloads)"
+    # When --fast: use only the first 10 payloads (quick triage) per param
+    if args.fast:
+        display_payloads = seed_payloads[:10]
+        payload_src += " [fast: first 10]"
+    else:
+        display_payloads = seed_payloads
+    console.print(f"[dim]Payloads: {payload_src}[/dim]")
+
     tamper_chain = []
     if args.tamper:
         from llmsql.tamper import TAMPERS
@@ -763,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
         auto_tamper=not args.no_auto_tamper,
         show_response=args.show_response,
         continue_on_found=args.continue_on_found,
+        seed_payloads=display_payloads,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
