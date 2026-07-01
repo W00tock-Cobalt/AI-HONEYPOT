@@ -27,6 +27,13 @@ _ACTION_PARAM_MAP: dict[str, list[str]] = {
 }
 
 
+# Cap on guessed params tried against a generic URL (no existing params, no
+# recognised ?action=). Prevents a single slow/SPA URL from ballooning into
+# 90+ precheck rounds; COMMON_PARAMS is ordered with the most likely SQLi
+# vectors first, so a smaller slice still covers the common cases.
+_MAX_GUESS_PARAMS_GENERIC = 25
+
+
 class HttpProbe:
     """Send HTTP requests with payload injection at specific points."""
 
@@ -105,7 +112,15 @@ class HttpProbe:
                 # Short REST-focused list: search, filter, id, q are most common SQLi vectors
                 candidate_params = ["q", "search", "query", "id", "filter", "name",
                                     "email", "username", "orderBy", "sort"]
+            elif not existing and not action_val:
+                # Generic page (no existing params, no known ?action=) — this is
+                # usually an SPA route or static-ish page. Cap the guess list so
+                # a single URL can't balloon into 90+ precheck rounds; the most
+                # common SQLi param names are listed first in COMMON_PARAMS.
+                candidate_params = list(guess_params)[:_MAX_GUESS_PARAMS_GENERIC]
             else:
+                # URL already has real params (from a spec/crawl) — worth the
+                # full mining pass since we know this endpoint takes input.
                 candidate_params = list(guess_params)
 
             seen_params = set(existing)

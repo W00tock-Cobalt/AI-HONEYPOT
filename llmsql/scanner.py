@@ -292,6 +292,13 @@ class Scanner:
                 # metacharacter. If it triggers the SAME status change, the
                 # break isn't SQL-specific — don't confirm. If the control
                 # succeeds normally, the quote-specific failure is a real signal.
+                # Rate-limit / WAF short-circuit: don't waste a control request
+                # disambiguating a 429 — it's never SQLi, and burning a control +
+                # possible full suite on every param during a rate-limit window
+                # is what makes scans take minutes on a single slow URL.
+                if quote_probe.status_code == 429:
+                    return None
+
                 control_probe = self.probe.send(
                     url, method, data, content_type, extra_headers,
                     inject_point=point, payload="zzz9x8y7w6v5",
@@ -300,10 +307,12 @@ class Scanner:
                 control_broke = control_probe.status_code == quote_probe.status_code
 
                 if control_broke:
-                    # Generic "any weird value breaks this" — not SQL-specific.
-                    # Don't confirm here; let the full payload suite look for
-                    # a technique-specific signal (timing, boolean, UNION, etc).
-                    pass
+                    # Generic "any weird value breaks this" — not SQL-specific
+                    # (confirmed by the control test). Skip immediately rather
+                    # than running the full payload suite, which would waste
+                    # dozens of requests chasing a non-SQL error on every
+                    # ambiguous param.
+                    return None
                 else:
                     # Control succeeds, quote breaks it → SQL-specific signal.
                     # Try a comment-based "fix": if closing/commenting the quote
