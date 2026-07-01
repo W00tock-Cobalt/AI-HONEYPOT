@@ -1,11 +1,13 @@
-"""OpenAPI / Swagger import — expand a spec into concrete testable URLs.
+"""OpenAPI / Swagger import — expand a spec into concrete testable targets.
 
-Turns a Swagger/OpenAPI document into a list of URLs whose real parameter
-names are known, so injectable params like /api/testimonials/count?query=...
-are discovered without guessing.
+Turns a Swagger/OpenAPI document into a list of SpecTarget objects whose real
+parameter names are known, so injectable params like /api/testimonials/count?query=...
+are discovered without guessing. Handles both GET (query params) and
+POST/PUT/PATCH (JSON request bodies).
 """
 
 import json
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -65,10 +67,19 @@ def _base_url(spec: dict[str, Any], spec_url: Optional[str]) -> str:
     return ""
 
 
-def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[str]:
-    """Expand an OpenAPI/Swagger spec into concrete GET-testable URLs."""
+@dataclass
+class SpecTarget:
+    """A concrete testable endpoint from an OpenAPI spec."""
+    url: str
+    method: str = "GET"
+    body: Optional[str] = None
+    content_type: Optional[str] = None
+
+
+def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[SpecTarget]:
+    """Expand an OpenAPI/Swagger spec into concrete testable targets."""
     base = _base_url(spec, spec_url)
-    urls: list[str] = []
+    targets: list[SpecTarget] = []
     seen: set[str] = set()
 
     paths = spec.get("paths", {}) or {}
@@ -77,13 +88,13 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[st
             continue
 
         for method, op in methods.items():
-            if method.lower() not in ("get",):
-                continue  # focus on GET; body params handled elsewhere
+            method_lower = method.lower()
+            if method_lower not in ("get", "post", "put", "patch"):
+                continue
             if not isinstance(op, dict):
                 continue
 
             params = op.get("parameters", []) or []
-            # Include path-level params too
             if isinstance(methods.get("parameters"), list):
                 params = methods["parameters"] + params
 
@@ -114,11 +125,69 @@ def expand_spec(spec: dict[str, Any], spec_url: Optional[str] = None) -> list[st
             if query_pairs:
                 url += "?" + "&".join(query_pairs)
 
-            if url not in seen:
-                seen.add(url)
-                urls.append(url)
+            # Build JSON body for POST/PUT/PATCH from requestBody schema
+            body = None
+            content_type = None
+            if method_lower in ("post", "put", "patch"):
+                body, content_type = _build_request_body(op)
 
-    return urls
+            key = f"{method_lower}:{url}:{body or ''}"
+            if key not in seen:
+                seen.add(key)
+                targets.append(SpecTarget(
+                    url=url,
+                    method=method_lower.upper(),
+                    body=body,
+                    content_type=content_type,
+                ))
+
+    return targets
+
+
+def _build_request_body(op: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Build a concrete JSON body from a requestBody schema."""
+    import json as _json
+
+    rb = op.get("requestBody", {}) or {}
+    content = rb.get("content", {}) or {}
+
+    for ct in ("application/json", "text/json", "*/*"):
+        schema_wrap = content.get(ct, {})
+        if not schema_wrap:
+            continue
+        schema = schema_wrap.get("schema", {}) or {}
+        obj = _schema_to_example(schema)
+        if obj is not None:
+            return _json.dumps(obj), "application/json"
+
+    return None, None
+
+
+def _schema_to_example(schema: dict[str, Any], depth: int = 0) -> Any:
+    """Recursively build a minimal example from a JSON schema."""
+    if depth > 4:
+        return None
+    if not schema:
+        return None
+
+    stype = schema.get("type")
+    if stype == "object" or "properties" in schema:
+        props = schema.get("properties", {}) or {}
+        return {k: _schema_to_example(v, depth + 1) for k, v in props.items()} or {"id": "1"}
+    if stype == "array":
+        items = schema.get("items", {}) or {}
+        return [_schema_to_example(items, depth + 1)]
+    if stype == "integer" or stype == "number":
+        return 1
+    if stype == "boolean":
+        return True
+    # string default
+    name_hint = schema.get("title", "").lower()
+    if "email" in name_hint:
+        return "admin@example.com"
+    if "password" in name_hint:
+        return "password"
+    return "1"
 
 
 def load_openapi(
@@ -126,7 +195,7 @@ def load_openapi(
     timeout: float = 15.0,
     headers: Optional[dict[str, str]] = None,
     verify_ssl: bool = True,
-) -> list[str]:
+) -> list[SpecTarget]:
     """
     Load an OpenAPI/Swagger spec from a URL or local file and expand it.
 
@@ -140,7 +209,7 @@ def load_openapi(
     if not source.startswith("http"):
         with open(source) as f:
             spec = json.load(f)
-        return expand_spec(spec, None)
+        return expand_spec(spec, None)  # type: ignore[return-value]
 
     client = httpx.Client(timeout=timeout, verify=verify_ssl, follow_redirects=True)
     spec_urls_gql: list[str] = []
@@ -191,7 +260,12 @@ def load_openapi(
 
     if not spec:
         return []
-    urls = expand_spec(spec, spec_url)
+    targets = expand_spec(spec, spec_url)
     for gql_url in spec_urls_gql:
-        urls.append(f"{gql_url}?query={{testimonialsCount(query:\"1\")}}")
-    return urls
+        targets.append(SpecTarget(
+            url=f"{gql_url}?query={{testimonialsCount(query:\"1\")}}",
+            method="POST",
+            body='{"query":"{testimonialsCount(query:\\"1\\")}"}',
+            content_type="application/json",
+        ))
+    return targets

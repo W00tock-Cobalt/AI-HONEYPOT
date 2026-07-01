@@ -158,6 +158,8 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--then-sqlmap", action="store_true",
                    help="Scan with LLMSQL first, then run sqlmap ONLY on the confirmed "
                         "injectable URLs (fast + deep exploitation of real hits)")
+    p.add_argument("--ask", action="store_true",
+                   help="After Stage 1, show all findings and ask before launching sqlmap")
     p.add_argument("--sqlmap-timeout", type=int, default=0,
                    help="Max seconds per sqlmap target before it's killed and skipped "
                         "(0 = no limit). Prevents one endpoint from hanging the run")
@@ -555,26 +557,34 @@ def main(argv: list[str] | None = None) -> int:
     targets = collect_targets(args)
 
     # OpenAPI/Swagger import — discover endpoints with their real param names
+    # spec_extras maps url -> (method, body, content_type) for POST targets
+    spec_extras: dict[str, tuple[str, Optional[str], Optional[str]]] = {}
     if args.openapi:
         from llmsql.openapi import load_openapi
         console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
         try:
-            spec_urls = load_openapi(
+            spec_targets = load_openapi(
                 args.openapi,
                 headers={
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
                 },
             )
-            if spec_urls:
-                console.print(f"[green]✓[/green] {len(spec_urls)} endpoints from spec")
-                targets.extend(spec_urls)
+            if spec_targets:
+                console.print(
+                    f"[green]✓[/green] {len(spec_targets)} endpoints from spec "
+                    f"[dim]({sum(1 for t in spec_targets if t.method != 'GET')} POST/PUT)[/dim]"
+                )
+                for st in spec_targets:
+                    targets.append(st.url)
+                    if st.method != "GET" or st.body:
+                        spec_extras[st.url] = (st.method, st.body, st.content_type)
             else:
                 console.print("[yellow]No endpoints parsed from spec[/yellow]")
         except Exception as e:
             console.print(f"[yellow]OpenAPI import failed: {e}[/yellow]")
         # De-dup after merge
-        seen_t = set()
+        seen_t: set[str] = set()
         targets = [t for t in targets if not (t in seen_t or seen_t.add(t))]
 
     if not targets:
@@ -768,11 +778,13 @@ def main(argv: list[str] | None = None) -> int:
     total_findings = 0
     try:
         def run_one(target: str):
+            # Use method/body from OpenAPI spec if available, else CLI args
+            spec_method, spec_body, spec_ct = spec_extras.get(target, (None, None, None))
             return scanner.scan(
                 url=target,
-                method=args.method,
-                data=args.data,
-                content_type=content_type,
+                method=spec_method or args.method,
+                data=spec_body or args.data,
+                content_type=spec_ct or content_type,
                 extra_headers=headers,
                 params=args.params,
             )
@@ -857,6 +869,18 @@ def main(argv: list[str] | None = None) -> int:
                 "[yellow]No confirmed SQLi found — nothing to hand to sqlmap.[/yellow]"
             )
         else:
+            if args.ask or args.sqlmap_menu:
+                console.print(
+                    f"\n[bold]Run sqlmap on {total_findings} confirmed finding(s)?[/bold] "
+                    f"[dim](profile: {args.sqlmap_profile})[/dim]"
+                )
+                try:
+                    answer = input("  [Y/n]: ").strip().lower()
+                except EOFError:
+                    answer = "y"
+                if answer not in ("", "y", "yes"):
+                    console.print("[dim]Skipped sqlmap. Run manually using the commands above.[/dim]")
+                    return 1 if total_findings else 0
             console.print(
                 f"[bold cyan]━━━ Stage 2 starting[/bold cyan] — "
                 f"running sqlmap on [bold]{total_findings}[/bold] confirmed finding(s)"
