@@ -32,6 +32,34 @@ def _is_ollama_backend(base_url: str) -> bool:
     return "11434" in lower or "ollama" in lower
 
 
+def _coerce_payload(value: Any) -> Optional[str]:
+    """Normalize a single payload to a string (small models emit dicts/lists)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in ("payload", "value", "input", "text", "sql"):
+            if key in value and isinstance(value[key], (str, int, float)):
+                return str(value[key])
+        return None
+    return None
+
+
+def _coerce_payloads(values: Any) -> list[str]:
+    """Normalize a list of payloads to clean strings."""
+    if not isinstance(values, list):
+        values = [values]
+    out: list[str] = []
+    for v in values:
+        s = _coerce_payload(v)
+        if s:
+            out.append(s)
+    return out
+
+
 class LlmAgent:
     """OpenAI-compatible LLM backend; defaults to local Ollama."""
 
@@ -148,7 +176,7 @@ class LlmAgent:
         )
         try:
             result = self._chat(AGENT_SYSTEM_PROMPT, prompt)
-            return result.get("payloads", [])[:5]
+            return _coerce_payloads(result.get("payloads", []))[:5]
         except Exception:
             return []
 
@@ -201,7 +229,7 @@ Decide the next action."""
 
         return AgentDecision(
             action=action,
-            payload=result.get("payload"),
+            payload=_coerce_payload(result.get("payload")),
             injection_type=inj_type,
             reasoning=result.get("reasoning", ""),
             confidence=float(result.get("confidence", 0.0)),

@@ -155,6 +155,8 @@ class Scanner:
         seen = set()
         unique_payloads = []
         for p in payloads:
+            if not isinstance(p, str):
+                continue
             if p not in seen:
                 seen.add(p)
                 unique_payloads.append(p)
