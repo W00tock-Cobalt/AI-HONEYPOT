@@ -55,14 +55,24 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s -u "http://testphp.vulnweb.com/artists.php?artist=1"
   %(prog)s -u "http://target/search" --data "q=test" --method POST
+  %(prog)s -l urls.txt --only-with-params        # scan a URL list
+  katana -u https://target -f qurl -silent | %(prog)s --stdin --only-with-params
   %(prog)s -u "http://target/page?id=1" --model qwen2.5-coder:7b
   %(prog)s -u "http://target/page?id=1" --no-llm          # heuristic-only
-  %(prog)s -u "http://target/page?id=1" --no-start-ollama # Ollama already running
+
+Note: a bare host with no ?params has nothing to inject. Crawl first
+(katana/gau/hakrawler) to collect parameterized URLs, then pipe them in.
         """,
     )
 
     # Target (sqlmap-style)
-    p.add_argument("-u", "--url", required=True, help="Target URL")
+    p.add_argument("-u", "--url", help="Target URL")
+    p.add_argument("-l", "--list", dest="url_list",
+                   help="File with target URLs, one per line (e.g. katana output)")
+    p.add_argument("--stdin", action="store_true",
+                   help="Read target URLs from stdin (e.g. katana ... | llmsql --stdin)")
+    p.add_argument("--only-with-params", action="store_true",
+                   help="Skip URLs that have no injectable parameters (recommended for crawl input)")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET", help="HTTP method (default: GET)")
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
@@ -105,6 +115,44 @@ Examples:
 
 def level_to_attempts(level: int) -> int:
     return {1: 5, 2: 8, 3: 15}[level]
+
+
+def collect_targets(args) -> list[str]:
+    """Gather target URLs from -u, -l file, and/or stdin."""
+    targets: list[str] = []
+    if args.url:
+        targets.append(args.url.strip())
+
+    if args.url_list:
+        try:
+            with open(args.url_list) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        targets.append(line)
+        except OSError as e:
+            raise SystemExit(f"Cannot read --list file: {e}")
+
+    if args.stdin or (not sys.stdin.isatty() and not args.url and not args.url_list):
+        for line in sys.stdin:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                targets.append(line)
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique
+
+
+def has_injectable_params(url: str) -> bool:
+    """Quick check: does the URL carry query parameters?"""
+    from urllib.parse import urlparse
+    return bool(urlparse(url).query)
 
 
 def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | None]:
@@ -152,6 +200,34 @@ def main(argv: list[str] | None = None) -> int:
         f"AI-powered SQL injection scanner [dim](Ollama backend)[/dim]\n"
     )
 
+    targets = collect_targets(args)
+    if not targets:
+        console.print(
+            "[red]No targets.[/red] Provide one of:\n"
+            "  -u \"http://host/page?id=1\"\n"
+            "  -l urls.txt            (file of URLs)\n"
+            "  --stdin                (pipe URLs in)\n\n"
+            "[dim]Tip: a bare host with no parameters has nothing to inject. "
+            "Crawl first, e.g.:[/dim]\n"
+            "  [dim]katana -u https://target -f qurl -silent | "
+            "python -m llmsql --stdin --only-with-params[/dim]"
+        )
+        return 2
+
+    # For crawl input, it's common to only care about parameterized URLs
+    if args.only_with_params:
+        before = len(targets)
+        targets = [t for t in targets if has_injectable_params(t)]
+        skipped = before - len(targets)
+        if skipped:
+            console.print(f"[dim]Skipped {skipped} URL(s) without query parameters[/dim]")
+        if not targets:
+            console.print("[yellow]No URLs with parameters to test.[/yellow]")
+            return 2
+
+    if len(targets) > 1:
+        console.print(f"[*] {len(targets)} targets queued\n")
+
     headers = parse_headers(args.headers)
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
@@ -189,26 +265,49 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    all_reports = []
+    total_findings = 0
     try:
-        report = scanner.scan(
-            url=args.url,
-            method=args.method,
-            data=args.data,
-            content_type=content_type,
-            extra_headers=headers,
-            params=args.params,
-        )
+        for idx, target in enumerate(targets, 1):
+            if len(targets) > 1:
+                console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
+            report = scanner.scan(
+                url=target,
+                method=args.method,
+                data=args.data,
+                content_type=content_type,
+                extra_headers=headers,
+                params=args.params,
+            )
+            all_reports.append(report)
+            total_findings += len(report.findings)
+            print_report(report, console)
     finally:
         probe.close()
         agent.close()
 
-    print_report(report, console)
-
     if args.output:
-        save_json(report, args.output)
+        if len(all_reports) == 1:
+            save_json(all_reports[0], args.output)
+        else:
+            _save_multi(all_reports, args.output)
         console.print(f"\n[dim]Report saved to {args.output}[/dim]")
 
-    return 1 if report.findings else 0
+    if len(targets) > 1:
+        console.print(
+            f"\n[bold]Summary:[/bold] {len(targets)} targets scanned, "
+            f"{total_findings} finding(s)"
+        )
+
+    return 1 if total_findings else 0
+
+
+def _save_multi(reports, path: str) -> None:
+    """Save multiple scan reports to a single JSON file."""
+    import json
+    from llmsql.report import export_json
+    with open(path, "w") as f:
+        json.dump([export_json(r) for r in reports], f, indent=2)
 
 
 if __name__ == "__main__":
