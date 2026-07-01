@@ -124,6 +124,17 @@ class Scanner:
             return report
 
         for point in points:
+            # Once we have a confirmed finding on this URL, skip remaining
+            # guessed params — they're testing the same endpoint redundantly.
+            if report.findings and not self.continue_on_found:
+                skipped = sum(1 for p in points if p.name != point.name)
+                if skipped and not getattr(report, '_skip_logged', False):
+                    report._skip_logged = True
+                    self.on_progress(
+                        f"[*] SQLi confirmed — skipping remaining parameters on this URL"
+                    )
+                break
+
             self.on_progress(f"\n[+] Testing parameter: {point.name} ({point.location.value})")
             finding = self._test_parameter(
                 url, method, data, content_type, extra_headers,
