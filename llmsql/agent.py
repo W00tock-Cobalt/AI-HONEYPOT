@@ -8,34 +8,78 @@ from typing import Any, Optional
 import httpx
 
 from llmsql.models import AgentDecision, HttpExchange, InjectionPoint, InjectionType
+from llmsql.ollama import (
+    DEFAULT_OLLAMA_API_KEY,
+    DEFAULT_OLLAMA_MODEL,
+    ollama_base_url,
+)
 from llmsql.payloads import AGENT_SYSTEM_PROMPT, ANALYZE_TARGET_PROMPT
 
 
+def _default_base_url() -> str:
+    host = os.getenv("OLLAMA_HOST")
+    if host:
+        return ollama_base_url(host)
+    return ollama_base_url()
+
+
+def _default_model() -> str:
+    return os.getenv("OLLAMA_MODEL") or os.getenv("LLMSQL_MODEL") or DEFAULT_OLLAMA_MODEL
+
+
+def _is_ollama_backend(base_url: str) -> bool:
+    lower = base_url.lower()
+    return "11434" in lower or "ollama" in lower
+
+
 class LlmAgent:
-    """OpenAI-compatible LLM backend for scan decisions."""
+    """OpenAI-compatible LLM backend; defaults to local Ollama."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         temperature: float = 0.2,
     ):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
-        self.base_url = (base_url or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
-        self.model = model
+        self.base_url = (base_url or _default_base_url()).rstrip("/")
+        self.is_ollama = _is_ollama_backend(self.base_url)
+        self.model = model or _default_model()
         self.temperature = temperature
-        self._client = httpx.Client(timeout=60.0)
+
+        if api_key:
+            self.api_key = api_key
+        elif self.is_ollama:
+            self.api_key = DEFAULT_OLLAMA_API_KEY
+        else:
+            self.api_key = os.getenv("OPENAI_API_KEY", "")
+
+        self._client = httpx.Client(timeout=120.0)
 
     def close(self):
         self._client.close()
 
     def _chat(self, system: str, user: str) -> dict[str, Any]:
         """Call chat completions and parse JSON response."""
-        if not self.api_key:
+        if not self.api_key and not self.is_ollama:
             raise RuntimeError(
-                "No LLM API key. Set OPENAI_API_KEY or pass --api-key"
+                "No LLM API key. Set OPENAI_API_KEY, use Ollama (default), or pass --api-key"
             )
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+
+        # JSON mode — supported by Ollama and OpenAI
+        if self.is_ollama:
+            body["format"] = "json"
+        else:
+            body["response_format"] = {"type": "json_object"}
 
         resp = self._client.post(
             f"{self.base_url}/chat/completions",
@@ -43,15 +87,7 @@ class LlmAgent:
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "temperature": self.temperature,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "response_format": {"type": "json_object"},
-            },
+            json=body,
         )
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
@@ -61,7 +97,6 @@ class LlmAgent:
     def _parse_json(text: str) -> dict[str, Any]:
         """Extract JSON from LLM output."""
         text = text.strip()
-        # Strip markdown fences if present
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\n?", "", text)
             text = re.sub(r"\n?```$", "", text)

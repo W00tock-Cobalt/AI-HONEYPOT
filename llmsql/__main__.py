@@ -15,6 +15,11 @@ from rich.console import Console
 from llmsql import __version__
 from llmsql.agent import LlmAgent
 from llmsql.http_probe import HttpProbe
+from llmsql.ollama import (
+    DEFAULT_OLLAMA_MODEL,
+    ensure_ready,
+    ollama_base_url,
+)
 from llmsql.report import print_report, save_json
 from llmsql.scanner import Scanner
 
@@ -50,9 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   %(prog)s -u "http://testphp.vulnweb.com/artists.php?artist=1"
   %(prog)s -u "http://target/search" --data "q=test" --method POST
-  %(prog)s -u "http://target/api" --data '{"id":1}' -H "Content-Type: application/json"
-  %(prog)s -u "http://target/page?id=1" --no-llm   # heuristic-only mode
-  %(prog)s -u "http://target/page?id=1" -p id      # test specific param only
+  %(prog)s -u "http://target/page?id=1" --model qwen2.5-coder:7b
+  %(prog)s -u "http://target/page?id=1" --no-llm          # heuristic-only
+  %(prog)s -u "http://target/page?id=1" --no-start-ollama # Ollama already running
         """,
     )
 
@@ -75,10 +80,17 @@ Examples:
     p.add_argument("--max-attempts", type=int, default=None,
                    help="Max payloads per parameter (default: level-based)")
 
-    # LLM backend
-    p.add_argument("--api-key", help="LLM API key (or OPENAI_API_KEY env)")
-    p.add_argument("--base-url", help="OpenAI-compatible API base URL")
-    p.add_argument("--model", default="gpt-4o-mini", help="LLM model (default: gpt-4o-mini)")
+    # LLM backend — Ollama is default
+    p.add_argument("--ollama-host", default=None,
+                   help="Ollama host (default: http://127.0.0.1:11434)")
+    p.add_argument("--model", default=DEFAULT_OLLAMA_MODEL,
+                   help=f"Ollama/LLM model (default: {DEFAULT_OLLAMA_MODEL})")
+    p.add_argument("--no-start-ollama", action="store_true",
+                   help="Do not auto-start Ollama; expect it already running")
+    p.add_argument("--no-pull", action="store_true",
+                   help="Do not auto-pull model if missing")
+    p.add_argument("--api-key", help="Override API key (for non-Ollama backends)")
+    p.add_argument("--base-url", help="Override LLM base URL (skips Ollama default)")
     p.add_argument("--no-llm", action="store_true",
                    help="Heuristic-only mode (no LLM, works offline)")
 
@@ -95,26 +107,61 @@ def level_to_attempts(level: int) -> int:
     return {1: 5, 2: 8, 3: 15}[level]
 
 
+def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | None]:
+    """
+    Prepare LLM backend. Returns (use_llm, base_url, error_message).
+    """
+    if args.no_llm:
+        return False, None, None
+
+    # Explicit remote backend (OpenAI, LiteLLM, etc.)
+    if args.base_url:
+        import os
+        if not args.api_key and not os.getenv("OPENAI_API_KEY"):
+            return False, None, (
+                "Remote LLM backend requires --api-key or OPENAI_API_KEY. "
+                "Omit --base-url to use local Ollama."
+            )
+        return True, args.base_url.rstrip("/"), None
+
+    # Default: local Ollama background
+    host = args.ollama_host
+    status = console.print if args.verbose else lambda m: console.print(f"[dim]{m}[/dim]")
+
+    ok, msg = ensure_ready(
+        model=args.model,
+        host=host,
+        auto_start=not args.no_start_ollama,
+        auto_pull=not args.no_pull,
+        on_status=status,
+    )
+    if not ok:
+        return False, None, msg
+
+    if not args.verbose:
+        console.print(f"[green]✓[/green] {msg}")
+    return True, ollama_base_url(host), None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     console = Console()
 
-    console.print(f"[bold cyan]LLMSQL v{__version__}[/bold cyan] — AI-powered SQL injection scanner\n")
+    console.print(
+        f"[bold cyan]LLMSQL v{__version__}[/bold cyan] — "
+        f"AI-powered SQL injection scanner [dim](Ollama backend)[/dim]\n"
+    )
 
     headers = parse_headers(args.headers)
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
     max_attempts = args.max_attempts or level_to_attempts(args.level)
-    use_llm = not args.no_llm
 
-    if use_llm and not args.api_key:
-        import os
-        if not os.getenv("OPENAI_API_KEY"):
-            console.print(
-                "[yellow]No API key found. Running in heuristic-only mode. "
-                "Set OPENAI_API_KEY or pass --api-key for AI-guided scanning.[/yellow]\n"
-            )
-            use_llm = False
+    use_llm, base_url, llm_error = setup_llm_backend(args, console)
+    if llm_error:
+        console.print(f"[yellow]{llm_error}[/yellow]")
+        console.print("[yellow]Falling back to heuristic-only mode.[/yellow]\n")
+        use_llm = False
 
     probe = HttpProbe(
         proxy=args.proxy,
@@ -124,8 +171,8 @@ def main(argv: list[str] | None = None) -> int:
 
     agent = LlmAgent(
         api_key=args.api_key,
-        base_url=args.base_url,
-        model=args.model,
+        base_url=base_url,
+        model=args.model if use_llm else DEFAULT_OLLAMA_MODEL,
     )
 
     def progress(msg: str):
