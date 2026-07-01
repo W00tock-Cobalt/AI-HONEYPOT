@@ -210,27 +210,39 @@ class Scanner:
         # If the response is identical to baseline, this param ignores the value.
         # Skip it immediately — avoids 100s of wasted requests on dead params.
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
-            # Step 1: '*' — not a SQL metachar but reveals if param has any effect
+            # Step 1: '*' — reveals if the param has ANY effect on the response.
+            # Dead params → skip immediately (1 request).
             star_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="*",
             )
             report.total_requests += 1
             star_score, _ = self.detector.quick_score(baseline, star_probe)
+
             if star_score == 0.0 and star_probe.status_code == baseline.status_code:
                 return None  # dead param, skip silently
-            # Step 2: param is live — probe with a quote for immediate SQL errors
+
+            # Step 2: quote probe — look for SQL errors or status change.
             quote_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="'",
             )
             report.total_requests += 1
             pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
+
+            # Immediate SQL error or status change → confirmed.
             if pre_score >= 0.75:
                 return self._build_finding(
                     point, quote_probe, baseline, pre_ev, pre_score
                 )
-            # Param is live but no immediate SQLi — run the full payload suite
+
+            # If quote score is the SAME as star score and it's only a body-length
+            # diff (score=0.4), this is a dynamic page that returns different content
+            # for ANY value — not SQLi-specific.  Skip the full payload suite.
+            if pre_score <= star_score and pre_score < 0.6:
+                return None
+
+            # Param reacts differently to a quote than to '*' — worth probing further.
 
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
