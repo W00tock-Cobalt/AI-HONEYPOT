@@ -801,21 +801,30 @@ def main(argv: list[str] | None = None) -> int:
         probe.close()
         agent.close()
 
+    console.print(
+        f"\n[bold green]━━━ Stage 1 complete[/bold green] — "
+        f"{len(targets)} URL(s) scanned, "
+        f"[bold]{total_findings}[/bold] finding(s)"
+    )
+
     if args.output:
         if len(all_reports) == 1:
             save_json(all_reports[0], args.output)
         else:
             _save_multi(all_reports, args.output)
-        console.print(f"\n[dim]Report saved to {args.output}[/dim]")
+        console.print(f"[dim]LLMSQL report saved to {args.output}[/dim]")
 
-    if len(targets) > 1:
-        console.print(
-            f"\n[bold]Summary:[/bold] {len(targets)} targets scanned, "
-            f"{total_findings} finding(s)"
-        )
-
-    # Stage 2: hand the CONFIRMED injectable URLs to sqlmap for exploitation
+    # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
     if args.then_sqlmap:
+        if total_findings == 0:
+            console.print(
+                "[yellow]No confirmed SQLi found — nothing to hand to sqlmap.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[bold cyan]━━━ Stage 2 starting[/bold cyan] — "
+                f"running sqlmap on [bold]{total_findings}[/bold] confirmed finding(s)"
+            )
         run_sqlmap_on_findings(
             all_reports,
             profile=args.sqlmap_profile,
@@ -902,14 +911,18 @@ def run_sqlmap_on_findings(
         header_args += f" --cookie '{cookie}'"
 
     console.print(
-        f"\n[bold cyan]Stage 2:[/bold cyan] exploiting {len(jobs)} confirmed "
-        f"injectable URL(s) with sqlmap [dim](profile: {profile})[/dim]\n"
+        f"\n[bold cyan]Stage 2 — sqlmap targets ({len(jobs)}):[/bold cyan] "
+        f"[dim]profile: {profile}[/dim]"
     )
+    for i, (url, extra) in enumerate(jobs, 1):
+        console.print(f"  {i}) {url}  [dim]{extra}[/dim]")
+    console.print()
 
     have_sqlmap = shutil.which("sqlmap") is not None
     for i, (url, extra) in enumerate(jobs, 1):
         cmd = f"sqlmap -u '{url}' {base_args} {sqlmap_args} {extra}{header_args}".strip()
-        console.print(f"[bold]({i}/{len(jobs)})[/bold] {cmd}")
+        console.print(f"\n[bold]━━━ sqlmap ({i}/{len(jobs)}):[/bold] {url}")
+        console.print(f"[dim]{cmd}[/dim]")
         if not have_sqlmap:
             continue
         launch_sqlmap(cmd, timeout, console)
