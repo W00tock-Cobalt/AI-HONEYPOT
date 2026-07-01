@@ -149,6 +149,9 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Extra sqlmap args appended to the profile (e.g. '--dbms=postgresql -p query')")
     p.add_argument("--sqlmap-menu", action="store_true",
                    help="Interactively choose the sqlmap profile and edit flags before running")
+    p.add_argument("--then-sqlmap", action="store_true",
+                   help="Scan with LLMSQL first, then run sqlmap ONLY on the confirmed "
+                        "injectable URLs (fast + deep exploitation of real hits)")
 
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
@@ -754,7 +757,119 @@ def main(argv: list[str] | None = None) -> int:
             f"{total_findings} finding(s)"
         )
 
+    # Stage 2: hand the CONFIRMED injectable URLs to sqlmap for exploitation
+    if args.then_sqlmap:
+        run_sqlmap_on_findings(
+            all_reports,
+            profile=args.sqlmap_profile,
+            sqlmap_args=args.sqlmap_args,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            menu=args.sqlmap_menu,
+        )
+
     return 1 if total_findings else 0
+
+
+def run_sqlmap_on_findings(
+    reports,
+    profile: str,
+    sqlmap_args: str,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+    menu: bool = False,
+) -> int:
+    """Run sqlmap against only the URLs LLMSQL confirmed as injectable."""
+    import shutil
+    import signal
+    import subprocess
+    from urllib.parse import urlparse, urlunparse
+
+    from llmsql.models import ParamLocation
+
+    # Build one sqlmap invocation per confirmed finding
+    jobs: list[tuple[str, str]] = []  # (url, extra_flags)
+    seen: set[tuple[str, str]] = set()
+    for report in reports:
+        for f in report.findings:
+            base = report.target_url
+            extra = ""
+            if f.location in (ParamLocation.QUERY, ParamLocation.BODY):
+                # Ensure the URL carries the param, then focus sqlmap on it
+                if f"{f.param}=" not in (urlparse(base).query or ""):
+                    sep = "&" if urlparse(base).query else "?"
+                    base = f"{base}{sep}{f.param}=1"
+                extra = f"-p {f.param}"
+                if f.location == ParamLocation.BODY and report.target_url:
+                    extra = f"-p {f.param}"
+            elif f.location == ParamLocation.PATH:
+                # Mark the injectable path segment with '*'
+                idx = None
+                if f.param.startswith("path[") and "]" in f.param:
+                    try:
+                        idx = int(f.param[5:f.param.index("]")])
+                    except ValueError:
+                        idx = None
+                parsed = urlparse(base)
+                segs = parsed.path.split("/")
+                if idx is not None and 0 <= idx < len(segs):
+                    segs[idx] = segs[idx] + "*"
+                    base = urlunparse(parsed._replace(path="/".join(segs)))
+            else:
+                continue
+
+            key = (base, extra)
+            if key not in seen:
+                seen.add(key)
+                jobs.append(key)
+
+    if not jobs:
+        console.print(
+            "\n[yellow]No confirmed injectable URLs to hand to sqlmap.[/yellow] "
+            "[dim](nothing to exploit)[/dim]"
+        )
+        return 0
+
+    base_args = SQLMAP_PROFILES.get(profile, SQLMAP_PROFILES["normal"])
+    if menu:
+        base_args = interactive_sqlmap(console, profile, base_args, sqlmap_args)
+        sqlmap_args = ""
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" --cookie '{cookie}'"
+
+    console.print(
+        f"\n[bold cyan]Stage 2:[/bold cyan] exploiting {len(jobs)} confirmed "
+        f"injectable URL(s) with sqlmap [dim](profile: {profile})[/dim]\n"
+    )
+
+    have_sqlmap = shutil.which("sqlmap") is not None
+    for i, (url, extra) in enumerate(jobs, 1):
+        cmd = f"sqlmap -u '{url}' {base_args} {sqlmap_args} {extra}{header_args}".strip()
+        console.print(f"[bold]({i}/{len(jobs)})[/bold] {cmd}")
+        if not have_sqlmap:
+            continue
+        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            subprocess.run(cmd, shell=True)
+        finally:
+            signal.signal(signal.SIGINT, prev)
+
+    if not have_sqlmap:
+        console.print(
+            "\n[yellow]sqlmap not on PATH — commands printed above to run manually.[/yellow]"
+        )
+    else:
+        console.print(
+            "\n[dim]sqlmap results saved under ~/.local/share/sqlmap/output/<host>/[/dim]"
+        )
+    return 0
 
 
 def _save_multi(reports, path: str) -> None:

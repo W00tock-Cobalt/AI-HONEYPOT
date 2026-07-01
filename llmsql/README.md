@@ -205,6 +205,23 @@ python -m llmsql -u "https://target/x?id=1" --run-sqlmap \
 Ctrl+C during a run is passed to sqlmap's own `[C]ontinue/[Q]uit` menu (LLMSQL
 ignores the signal so it won't crash the run).
 
+### Scan with both (recommended for large target lists)
+
+`--then-sqlmap` runs LLMSQL's fast error-based scan first, then launches sqlmap
+**only on the URLs LLMSQL confirmed injectable** — so you don't blast all N
+endpoints at level 5. This also covers verbatim-SQL bugs (like BrokenCrystals
+`?query=`) that sqlmap's heuristics sometimes dismiss but LLMSQL catches.
+
+```bash
+python -m llmsql --openapi https://target/ --guess-params \
+  --then-sqlmap --sqlmap-profile exploit
+```
+
+Flow: `discover -> liveness -> LLMSQL scan -> sqlmap -p <param> on real hits`.
+For each confirmed finding LLMSQL builds a focused sqlmap command (`-p` for
+query/body params, a `*` URI marker for path params) and runs it. sqlmap output
+lands in `~/.local/share/sqlmap/output/<host>/`.
+
 You don't strictly need all four tools — LLMSQL already does liveness probing
 (httpx's role) and can crawl input from katana OR import an OpenAPI spec. A
 minimal chain is just **llmsql --openapi ... --run-sqlmap**.
