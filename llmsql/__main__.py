@@ -117,7 +117,16 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--probe-threads", type=int, default=20,
                    help="Concurrency for liveness probe (default: 20)")
     p.add_argument("--include-404", dest="include_dead", action="store_true",
-                   help="Test endpoints even if baseline is 404/405 (dead routes)")
+                   help="Test endpoints even if baseline is 404/405/401/403 (dead/auth-gated)")
+
+    # WAF evasion
+    p.add_argument("--tamper",
+                   help="Comma-separated tamper chain applied to every payload "
+                        "(e.g. space2comment,randomcase,charencode)")
+    p.add_argument("--no-auto-tamper", action="store_true",
+                   help="Do not auto-try evasion payloads when a WAF/block is detected")
+    p.add_argument("--list-tamper", action="store_true",
+                   help="List available tamper techniques and exit")
 
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
@@ -269,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     console = Console()
 
+    if args.list_tamper:
+        from llmsql.tamper import available
+        console.print("[bold]Available tamper techniques:[/bold]")
+        for name in available():
+            console.print(f"  {name}")
+        return 0
+
     console.print(
         f"[bold cyan]LLMSQL v{__version__}[/bold cyan] — "
         f"AI-powered SQL injection scanner [dim](Ollama backend)[/dim]\n"
@@ -349,6 +365,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             guess_params = list(COMMON_PARAMS)
 
+    tamper_chain = []
+    if args.tamper:
+        from llmsql.tamper import TAMPERS
+        for name in args.tamper.split(","):
+            name = name.strip()
+            if name and name in TAMPERS:
+                tamper_chain.append(name)
+            elif name:
+                console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
+
     default_ua = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -413,10 +439,14 @@ def main(argv: list[str] | None = None) -> int:
         include_dead=args.include_dead,
         fast=args.fast,
         guess_params=guess_params,
+        tamper=tamper_chain,
+        auto_tamper=not args.no_auto_tamper,
         on_progress=progress if args.verbose else lambda m: (
-            console.print(m) if m.startswith(("[!]", "[+]", "[*] Scan", "[*] Found")) else None
+            console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
     )
+    if tamper_chain:
+        console.print(f"[dim]Tamper chain: {', '.join(tamper_chain)}[/dim]")
     if test_path:
         console.print("[dim]Path-segment injection: enabled[/dim]")
     if guess_params:

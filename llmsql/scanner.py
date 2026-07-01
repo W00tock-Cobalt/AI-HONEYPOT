@@ -33,6 +33,8 @@ class Scanner:
         include_dead: bool = False,
         fast: bool = False,
         guess_params: Optional[list[str]] = None,
+        tamper: Optional[list[str]] = None,
+        auto_tamper: bool = True,
     ):
         self.agent = agent
         self.probe = probe
@@ -45,6 +47,8 @@ class Scanner:
         self.include_dead = include_dead
         self.fast = fast
         self.guess_params = guess_params
+        self.tamper = tamper or []
+        self.auto_tamper = auto_tamper
 
     def scan(
         self,
@@ -102,6 +106,19 @@ class Scanner:
             )
             return report
 
+        # Skip auth-gated / WAF-blocked baselines — can't test unauthenticated
+        if not self.include_dead and baseline.status_code in (401, 403):
+            report.errors.append(
+                f"Skipped: baseline HTTP {baseline.status_code} "
+                f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "
+                f"or --cookie, or use --include-404 to force)"
+            )
+            report.duration_seconds = time.perf_counter() - start
+            self.on_progress(
+                f"[*] Skipping (baseline HTTP {baseline.status_code}, needs auth/bypass)"
+            )
+            return report
+
         for point in points:
             self.on_progress(f"\n[+] Testing parameter: {point.name} ({point.location.value})")
             finding = self._test_parameter(
@@ -152,6 +169,11 @@ class Scanner:
             except Exception as e:
                 report.errors.append(f"LLM suggest failed for {point.name}: {e}")
 
+        # Apply explicit tamper chain up front, if requested
+        if self.tamper:
+            from llmsql.tamper import apply_tamper
+            payloads = [apply_tamper(p, self.tamper) for p in payloads if isinstance(p, str)]
+
         seen = set()
         unique_payloads = []
         for p in payloads:
@@ -165,10 +187,21 @@ class Scanner:
         best_exchange: Optional[HttpExchange] = None
         best_evidence = ""
         attempts = 0
+        real_attempts = 0  # excludes WAF-blocked requests
+        blocked = 0
+        tamper_triggered = bool(self.tamper)
+        # Hard ceiling so tamper expansion can't run away
+        request_ceiling = self.max_attempts * 6 + 10
 
-        for payload in unique_payloads:
-            if attempts >= self.max_attempts:
+        idx = 0
+        while idx < len(unique_payloads):
+            # Budget is spent on requests that actually reach the app, not on
+            # ones the WAF refuses — otherwise blocked seeds exhaust the budget
+            # before tamper variants get a turn.
+            if real_attempts >= self.max_attempts or attempts >= request_ceiling:
                 break
+            payload = unique_payloads[idx]
+            idx += 1
             attempts += 1
 
             injected = self.probe.send(
@@ -178,11 +211,36 @@ class Scanner:
             report.exchanges.append(injected)
             report.total_requests += 1
 
+            is_blocked = self._is_blocked(baseline, injected)
+            if not is_blocked:
+                real_attempts += 1
+
             score, evidence = self.detector.quick_score(baseline, injected)
             self.on_progress(
                 f"    [{attempts}] payload={payload[:40]!r} score={score:.2f} "
                 f"HTTP {injected.status_code}"
             )
+
+            # WAF/block detection: baseline was OK but payload is refused.
+            if is_blocked:
+                blocked += 1
+                if (self.auto_tamper and not tamper_triggered and blocked >= 2):
+                    tamper_triggered = True
+                    from llmsql.tamper import AUTO_TAMPER_CHAIN, tamper_variants
+                    added = 0
+                    for base in list(unique_payloads):
+                        for variant in tamper_variants(base, AUTO_TAMPER_CHAIN):
+                            if variant not in seen:
+                                seen.add(variant)
+                                unique_payloads.append(variant)
+                                added += 1
+                    msg = (
+                        f"WAF/filter suspected on {point.name} "
+                        f"(baseline {baseline.status_code} -> {injected.status_code}); "
+                        f"queued {added} tamper variants"
+                    )
+                    report.agent_log.append(msg)
+                    self.on_progress(f"    [!] {msg}")
 
             if score > best_score:
                 best_score = score
@@ -281,6 +339,16 @@ class Scanner:
             evidence=evidence,
             confidence=confidence,
             db_type=db,
+        )
+
+    @staticmethod
+    def _is_blocked(baseline: HttpExchange, injected: HttpExchange) -> bool:
+        """Payload refused by a WAF/filter while the endpoint itself is live."""
+        block_codes = {403, 406, 429, 501, 999}
+        return (
+            baseline.status_code not in block_codes
+            and 200 <= baseline.status_code < 400
+            and injected.status_code in block_codes
         )
 
     @staticmethod

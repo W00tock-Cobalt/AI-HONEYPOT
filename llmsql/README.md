@@ -67,6 +67,10 @@ python -m llmsql -u "http://target?id=1" \
 --guess-params         Mine common param names on each URL (query,q,id,...)
 --param-wordlist FILE  Custom parameter-name wordlist
 --openapi SRC          Import Swagger/OpenAPI spec (URL/file/site root)
+--tamper LIST          Evasion chain applied to payloads (space2comment,...)
+--no-auto-tamper       Don't auto-try evasion when a WAF/block is detected
+--list-tamper          List available tamper techniques
+--include-404          Test even auth-gated/dead baselines (401/403/404/405)
 -t, --threads N        Scan N targets concurrently
 --fast                 Skip per-param LLM suggestion (heuristics + confirm only)
 --probe / --no-probe   Liveness pre-filter (httpx-style, auto-on for crawls)
@@ -150,6 +154,26 @@ python -m llmsql -u "https://target/api/x" --param-wordlist params.txt -v
 With `--openapi`, an exposed spec (very common — see Swagger UIs) turns into a
 full, precise target list including `?query=`, path IDs, etc. This is how a
 tester who read the Swagger doc finds `/api/testimonials/count?query=...`.
+
+## WAF / filter evasion
+
+If a WAF blocks payloads (baseline `200` but injected `403/406/429`), LLMSQL
+detects it and automatically retries with tamper/evasion variants
+(comment-spacing, random case, char-encoding, double URL-encoding, MySQL
+versioned comments). You can also force a chain:
+
+```bash
+python -m llmsql -u "https://target/x?id=1" --tamper space2comment,randomcase
+python -m llmsql --list-tamper          # see all techniques
+```
+
+Endpoints whose baseline is `401`/`403` are treated as auth-gated and skipped;
+supply credentials to test them:
+
+```bash
+python -m llmsql --openapi https://target/ \
+  -H "Authorization: Bearer <token>" --cookie "connect.sid=..."
+```
 
 ## Crawl + scan (katana / gau)
 
