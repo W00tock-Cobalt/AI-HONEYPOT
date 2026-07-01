@@ -96,7 +96,6 @@ class Scanner:
             return report
 
         report.injection_points = points
-        self.on_progress(f"[*] Found {len(points)} injection point(s)")
 
         # Baseline request
         baseline = self.probe.send(url, method, data, content_type, extra_headers)
