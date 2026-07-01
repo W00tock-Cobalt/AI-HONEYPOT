@@ -293,6 +293,7 @@ def sqlmap_handoff(
     headers: dict[str, str],
     cookie: str | None,
     console,
+    verbose: bool = False,
 ) -> int:
     """Emit a sqlmap target list + command; optionally run sqlmap."""
     from urllib.parse import urlparse
@@ -330,7 +331,17 @@ def sqlmap_handoff(
 
     cmd = f"sqlmap -m {out_file} {sqlmap_args}{header_args}"
 
-    console.print(f"[green]✓[/green] Wrote {len(urls)} targets to [bold]{out_file}[/bold]")
+    console.print(f"[green]✓[/green] Wrote {len(urls)} sqlmap targets to [bold]{out_file}[/bold]")
+    # Always show what will be tested (this is the "did it cover my URLs?" answer)
+    show = urls if (verbose or len(urls) <= 40) else urls[:40]
+    for u in show:
+        console.print(f"    [cyan]->[/cyan] {u}")
+    if len(show) < len(urls):
+        console.print(f"    [dim]... and {len(urls) - len(show)} more (see {out_file})[/dim]")
+    console.print(
+        f"\n[dim]sqlmap will test each URL's parameters sequentially "
+        f"(~100+ techniques per param).[/dim]"
+    )
     console.print("\n[bold]Run sqlmap:[/bold]")
     console.print(f"  {cmd}\n")
     console.print(
@@ -512,29 +523,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             guess_params = list(COMMON_PARAMS)
 
-    # sqlmap handoff: use LLMSQL only for discovery, then hand to sqlmap
-    if args.sqlmap or args.run_sqlmap:
-        return sqlmap_handoff(
-            targets=targets,
-            guess_params=guess_params,
-            out_file=args.sqlmap_out,
-            sqlmap_args=args.sqlmap_args,
-            run=args.run_sqlmap,
-            headers=headers,
-            cookie=args.cookie,
-            console=console,
-        )
-
-    tamper_chain = []
-    if args.tamper:
-        from llmsql.tamper import TAMPERS
-        for name in args.tamper.split(","):
-            name = name.strip()
-            if name and name in TAMPERS:
-                tamper_chain.append(name)
-            elif name:
-                console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
-
     default_ua = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -543,11 +531,12 @@ def main(argv: list[str] | None = None) -> int:
     probe_headers = dict(headers)
     probe_headers.setdefault("User-Agent", default_ua)
 
-    # Liveness pre-filter (httpx-style): drop dead URLs before the slow scan.
-    # On by default for crawl input; disable with --no-probe.
+    # Liveness pre-filter (httpx-style): drop dead URLs before the slow work.
+    # Runs before both the scan AND the sqlmap handoff so sqlmap isn't fed
+    # dead endpoints. On by default for crawl/spec input; disable with --no-probe.
     do_probe = (args.probe_alive or crawl_mode) and not args.no_probe and len(targets) > 1
     if do_probe:
-        console.print(f"[*] Probing {len(targets)} URLs for liveness...")
+        console.print(f"[*] Probing {len(targets)} URLs for liveness (httpx-style)...")
         alive, status_map = probe_alive(
             targets,
             threads=args.probe_threads,
@@ -559,10 +548,37 @@ def main(argv: list[str] | None = None) -> int:
             f"[*] Live: [green]{len(alive)}[/green]  "
             f"Dead/filtered: [dim]{dead}[/dim]"
         )
+        if args.verbose:
+            for u in alive:
+                console.print(f"    [green]live[/green] {u} ({status_map.get(u)})")
         targets = alive
         if not targets:
-            console.print("[yellow]No live targets to scan.[/yellow]")
+            console.print("[yellow]No live targets.[/yellow]")
             return 2
+
+    # sqlmap handoff: use LLMSQL only for discovery, then hand to sqlmap
+    if args.sqlmap or args.run_sqlmap:
+        return sqlmap_handoff(
+            targets=targets,
+            guess_params=guess_params,
+            out_file=args.sqlmap_out,
+            sqlmap_args=args.sqlmap_args,
+            run=args.run_sqlmap,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            verbose=args.verbose,
+        )
+
+    tamper_chain = []
+    if args.tamper:
+        from llmsql.tamper import TAMPERS
+        for name in args.tamper.split(","):
+            name = name.strip()
+            if name and name in TAMPERS:
+                tamper_chain.append(name)
+            elif name:
+                console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
 
     if len(targets) > 1:
         console.print(f"[*] {len(targets)} targets queued\n")
