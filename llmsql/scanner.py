@@ -36,6 +36,7 @@ class Scanner:
         tamper: Optional[list[str]] = None,
         auto_tamper: bool = True,
         show_response: bool = False,
+        continue_on_found: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -51,6 +52,7 @@ class Scanner:
         self.tamper = tamper or []
         self.auto_tamper = auto_tamper
         self.show_response = show_response
+        self.continue_on_found = continue_on_found
 
     def scan(
         self,
@@ -252,9 +254,18 @@ class Scanner:
                 best_exchange = injected
                 best_evidence = evidence
 
-            # High-confidence heuristic hit — confirm with LLM if available
+            # High-confidence heuristic hit
             if score >= 0.85:
-                return self._build_finding(point, injected, baseline, best_evidence, score)
+                finding = self._build_finding(point, injected, baseline, best_evidence, score)
+                if not self.continue_on_found:
+                    return finding
+                # continue_on_found: record but keep probing for other inj types
+                if not hasattr(report, '_interim_findings'):
+                    report._interim_findings = []
+                report._interim_findings.append(finding)
+                self.on_progress(
+                    f"    [!] confirmed (score {score:.0%}) — continuing for more types"
+                )
 
             # LLM-guided continuation
             if self.use_llm and score >= 0.3:
@@ -268,13 +279,18 @@ class Scanner:
                     )
 
                     if decision.action == "confirm" and decision.confidence >= 0.7:
-                        return self._build_finding(
+                        finding = self._build_finding(
                             point, injected, baseline,
                             decision.reasoning or evidence,
                             decision.confidence,
                             db_hint=decision.db_hint,
                             inj_type=decision.injection_type,
                         )
+                        if not self.continue_on_found:
+                            return finding
+                        if not hasattr(report, '_interim_findings'):
+                            report._interim_findings = []
+                        report._interim_findings.append(finding)
 
                     if decision.action == "inject" and decision.payload:
                         if decision.payload not in seen:
@@ -319,6 +335,11 @@ class Scanner:
                 return self._build_finding(
                     point, best_exchange, baseline, best_evidence, best_score
                 )
+
+        # If continue_on_found, return the best interim finding (or final one)
+        interim = getattr(report, '_interim_findings', [])
+        if interim:
+            return interim[-1]
 
         return None
 

@@ -116,7 +116,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--threads", "-t", type=int, default=1,
                    help="Concurrent targets to scan (default: 1)")
     p.add_argument("--fast", action="store_true",
-                   help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only")
+                   help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only "
+                        "(much faster with local models like llama3.2)")
+    p.add_argument("--continue-on-found", action="store_true",
+                   help="Keep probing a parameter even after confirming SQLi "
+                        "(finds additional injection types before handing to sqlmap)")
     p.add_argument("--probe", dest="probe_alive", action="store_true",
                    help="Pre-filter dead URLs with a liveness check (auto-on for crawl input)")
     p.add_argument("--no-probe", action="store_true",
@@ -743,6 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         tamper=tamper_chain,
         auto_tamper=not args.no_auto_tamper,
         show_response=args.show_response,
+        continue_on_found=args.continue_on_found,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
