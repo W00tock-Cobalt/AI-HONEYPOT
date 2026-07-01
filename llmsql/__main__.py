@@ -141,8 +141,14 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Like --sqlmap, but also execute sqlmap if it is installed")
     p.add_argument("--sqlmap-out", default="llmsql-sqlmap-urls.txt",
                    help="File to write discovered sqlmap targets (default: llmsql-sqlmap-urls.txt)")
-    p.add_argument("--sqlmap-args", default="--batch --random-agent --level 3 --risk 2",
-                   help="Extra sqlmap args (default: '--batch --random-agent --level 3 --risk 2')")
+    p.add_argument("--sqlmap-profile", choices=["stealth", "normal", "aggressive", "exploit", "nuclear"],
+                   default="normal",
+                   help="sqlmap intensity preset (default: normal). "
+                        "aggressive=level5/risk3; exploit=+auto-dump; nuclear=+all techniques/tampers")
+    p.add_argument("--sqlmap-args", default="",
+                   help="Extra sqlmap args appended to the profile (e.g. '--dbms=postgresql -p query')")
+    p.add_argument("--sqlmap-menu", action="store_true",
+                   help="Interactively choose the sqlmap profile and edit flags before running")
 
     # LLM backend — Ollama is default
     p.add_argument("--ollama-host", default=None,
@@ -243,6 +249,53 @@ def probe_alive(
     return alive, status_map
 
 
+# sqlmap intensity presets. Each is a full base flag string.
+SQLMAP_PROFILES = {
+    # cautious: low level/risk, delay, safe techniques
+    "stealth": "--batch --random-agent --level 1 --risk 1 --delay 1 --time-sec 2 --technique=BEU",
+    # balanced default
+    "normal": "--batch --random-agent --level 3 --risk 2 --threads 4",
+    # loud: max level/risk, more threads
+    "aggressive": "--batch --random-agent --level 5 --risk 3 --threads 10",
+    # aggressive + automatic exploitation (enumerate + dump everything)
+    "exploit": (
+        "--batch --random-agent --level 5 --risk 3 --threads 10 "
+        "--dbs --tables --dump-all --exclude-sysdbs"
+    ),
+    # everything on: all techniques, tamper suite, full retrieval, banner/users/etc.
+    "nuclear": (
+        "--batch --random-agent --level 5 --risk 3 --threads 10 "
+        "--technique=BEUSTQ -a --dump-all --exclude-sysdbs "
+        "--tamper=space2comment,between,randomcase,charencode"
+    ),
+}
+
+
+def interactive_sqlmap(console, profile: str, base_args: str, extra: str) -> str:
+    """Let the user pick a profile and edit the final flag string."""
+    console.print("\n[bold]sqlmap intensity profile:[/bold]")
+    names = list(SQLMAP_PROFILES.keys())
+    for i, name in enumerate(names, 1):
+        marker = " [dim](current)[/dim]" if name == profile else ""
+        console.print(f"  {i}) {name}{marker}")
+    try:
+        choice = input(f"Choose profile [{names.index(profile) + 1}]: ").strip()
+    except EOFError:
+        choice = ""
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        profile = names[int(choice) - 1]
+        base_args = SQLMAP_PROFILES[profile]
+
+    composed = f"{base_args} {extra}".strip()
+    console.print(f"\n[bold]Flags:[/bold] {composed}")
+    console.print("[dim]Press Enter to accept, or type a full replacement flag string:[/dim]")
+    try:
+        edited = input("> ").strip()
+    except EOFError:
+        edited = ""
+    return edited or composed
+
+
 def grab_cookie(
     url: str,
     headers: dict[str, str] | None = None,
@@ -288,12 +341,14 @@ def sqlmap_handoff(
     targets: list[str],
     guess_params: list[str] | None,
     out_file: str,
+    profile: str,
     sqlmap_args: str,
     run: bool,
     headers: dict[str, str],
     cookie: str | None,
     console,
     verbose: bool = False,
+    menu: bool = False,
 ) -> int:
     """Emit a sqlmap target list + command; optionally run sqlmap."""
     from urllib.parse import urlparse
@@ -322,6 +377,13 @@ def sqlmap_handoff(
     with open(out_file, "w") as f:
         f.write("\n".join(urls) + "\n")
 
+    # Compose flags: profile base + user extras, optionally via interactive menu
+    base_args = SQLMAP_PROFILES.get(profile, SQLMAP_PROFILES["normal"])
+    if menu:
+        final_flags = interactive_sqlmap(console, profile, base_args, sqlmap_args)
+    else:
+        final_flags = f"{base_args} {sqlmap_args}".strip()
+
     header_args = ""
     for k, v in (headers or {}).items():
         if k.lower() != "user-agent":
@@ -329,7 +391,7 @@ def sqlmap_handoff(
     if cookie:
         header_args += f" --cookie '{cookie}'"
 
-    cmd = f"sqlmap -m {out_file} {sqlmap_args}{header_args}"
+    cmd = f"sqlmap -m {out_file} {final_flags}{header_args}"
 
     console.print(f"[green]✓[/green] Wrote {len(urls)} sqlmap targets to [bold]{out_file}[/bold]")
     # Always show what will be tested (this is the "did it cover my URLs?" answer)
@@ -342,7 +404,7 @@ def sqlmap_handoff(
         f"\n[dim]sqlmap will test each URL's parameters sequentially "
         f"(~100+ techniques per param).[/dim]"
     )
-    console.print("\n[bold]Run sqlmap:[/bold]")
+    console.print(f"\n[bold]Run sqlmap[/bold] [dim](profile: {profile})[/dim]:")
     console.print(f"  {cmd}\n")
     console.print(
         "[dim]Tip: for per-parameter focus add -p <name>; "
@@ -352,13 +414,20 @@ def sqlmap_handoff(
 
     if run:
         import shutil
+        import signal
         import subprocess
         if not shutil.which("sqlmap"):
             console.print("[yellow]sqlmap not found on PATH; command printed above.[/yellow]")
             return 1
-        console.print("[cyan]Launching sqlmap...[/cyan]\n")
-        proc = subprocess.run(cmd, shell=True)
-        return proc.returncode
+        console.print("[cyan]Launching sqlmap...[/cyan] [dim](Ctrl+C hands the menu to sqlmap)[/dim]\n")
+        # Ignore SIGINT in the parent so Ctrl+C goes to sqlmap's own handler
+        # (which shows its [C]ontinue/[Q]uit menu) instead of killing us.
+        prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            proc = subprocess.run(cmd, shell=True)
+            return proc.returncode
+        finally:
+            signal.signal(signal.SIGINT, prev)
     return 0
 
 
@@ -562,12 +631,14 @@ def main(argv: list[str] | None = None) -> int:
             targets=targets,
             guess_params=guess_params,
             out_file=args.sqlmap_out,
+            profile=args.sqlmap_profile,
             sqlmap_args=args.sqlmap_args,
             run=args.run_sqlmap,
             headers=headers,
             cookie=args.cookie,
             console=console,
             verbose=args.verbose,
+            menu=args.sqlmap_menu,
         )
 
     tamper_chain = []

