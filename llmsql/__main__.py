@@ -445,7 +445,19 @@ def grab_cookie(
                     c.post(login_url, json=_json.loads(login_data), headers=headers or {})
                 else:
                     from urllib.parse import parse_qsl
-                    c.post(login_url, data=dict(parse_qsl(login_data)), headers=headers or {})
+                    data = dict(parse_qsl(login_data))
+                    # CSRF-aware login: GET the login page first (also seeds the
+                    # session cookie) and merge any pre-filled hidden fields
+                    # (anti-CSRF tokens like DVWA's user_token) that the user's
+                    # static --login-data can't know. User-supplied values win.
+                    try:
+                        page = c.get(login_url, headers=headers or {})
+                        from llmsql.param_discovery import hidden_form_fields
+                        for k, v in hidden_form_fields(page.text).items():
+                            data.setdefault(k, v)
+                    except httpx.HTTPError:
+                        pass
+                    c.post(login_url, data=data, headers=headers or {})
             else:
                 c.get(url, headers=headers or {})
         except httpx.HTTPError:

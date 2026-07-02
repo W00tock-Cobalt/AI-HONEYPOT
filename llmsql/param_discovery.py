@@ -129,6 +129,49 @@ def _parse_html(html: str) -> _FormParser:
     return parser
 
 
+class _HiddenFieldParser(HTMLParser):
+    """Collect ``name -> value`` for form inputs that already carry a value.
+
+    Used for CSRF/anti-forgery tokens (``user_token``, ``csrf_token``,
+    ``authenticity_token``, ``_token`` …) and other pre-filled hidden fields
+    that must be echoed back for a login POST to succeed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.fields: dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in ("input", "textarea"):
+            return
+        d = {k.lower(): (v or "") for k, v in attrs}
+        name = d.get("name")
+        if not name:
+            return
+        itype = d.get("type", "").lower()
+        # Skip fields the caller supplies themselves (creds/submit buttons).
+        if itype in ("submit", "reset", "button", "image", "file"):
+            return
+        value = d.get("value", "")
+        # Only keep fields that actually have a value (tokens, hidden state).
+        if value != "" and name not in self.fields:
+            self.fields[name] = value
+
+
+def hidden_form_fields(html: str) -> dict[str, str]:
+    """Return pre-filled form field values (CSRF tokens, hidden state) from HTML.
+
+    This lets a login POST automatically carry anti-CSRF tokens (e.g. DVWA's
+    ``user_token``) that a static ``--login-data`` string can't know in advance.
+    """
+    p = _HiddenFieldParser()
+    try:
+        p.feed(html or "")
+    except Exception:
+        pass
+    return p.fields
+
+
 def _params_from_query_strings(text: str) -> list[str]:
     """Pull param names out of any ?a=b&c=d fragments in the text."""
     names: list[str] = []

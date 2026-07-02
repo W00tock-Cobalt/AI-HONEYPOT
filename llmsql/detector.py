@@ -71,6 +71,26 @@ class SqlDetector:
         """True when the response indicates the DB/backend is unreachable."""
         return bool(self._CONN_REFUSED.search(exchange.response_body))
 
+    _PASSWORD_INPUT = re.compile(r'type=["\']?password', re.IGNORECASE)
+
+    def looks_like_login_page(self, exchange: HttpExchange) -> bool:
+        """Heuristic: is this response a login form (likely an auth redirect)?
+
+        Used to warn when an unauthenticated scan is silently bounced to a login
+        page (e.g. DVWA redirecting protected pages to login.php) — otherwise the
+        scan just reports 0 findings with no explanation.
+        """
+        body = exchange.response_body or ""
+        if not self._PASSWORD_INPUT.search(body):
+            return False
+        low = body.lower()
+        signals = (
+            "user_token", "csrf", 'action="login', "action='login", "/login",
+            "sign in", "signin", "log in", "please log in",
+            "authentication required", "loginform",
+        )
+        return any(s in low for s in signals)
+
     def boolean_blind_score(
         self,
         baseline: HttpExchange,

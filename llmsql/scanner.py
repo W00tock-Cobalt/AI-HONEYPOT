@@ -193,6 +193,31 @@ class Scanner:
             )
             return report
 
+        # Login-wall detection: if an unauthenticated request got bounced to a
+        # login page, say so clearly instead of silently reporting 0 findings.
+        # (Advisory only — we still scan whatever we can see.)
+        if self.detector.looks_like_login_page(baseline):
+            from urllib.parse import urlparse as _up_login
+            path_l = _up_login(url).path.lower()
+            is_login_path = any(
+                k in path_l for k in
+                ("login", "signin", "sign-in", "auth", "session", "sso", "logon")
+            )
+            authed = bool(
+                (extra_headers and any(k.lower() == "authorization" for k in extra_headers))
+                or self.probe.cookies
+            )
+            if not is_login_path and not authed:
+                report.add_error(
+                    "Baseline looks like a LOGIN page — this URL likely redirected "
+                    "to login because the scan is unauthenticated. Authenticate with "
+                    "--login-url/--login-data (CSRF tokens auto-handled) or --cookie."
+                )
+                self.on_progress(
+                    "[!] Login wall detected (redirected to login) — "
+                    "authenticate to reach protected pages"
+                )
+
         # Organic parameter discovery: mine the live baseline response for
         # parameter names the target itself advertises (form fields, links,
         # JS fetch URLs, JSON keys). This adapts to arbitrary apps instead of
