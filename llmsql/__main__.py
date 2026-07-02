@@ -105,6 +105,23 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                         "session cookie, then reuse it for the scan and sqlmap handoff")
     p.add_argument("--login-url", help="POST credentials here to obtain a session cookie")
     p.add_argument("--login-data", help="Login POST body (form or JSON) for --login-url")
+
+    # Authenticated scanning (bearer/JWT token auth)
+    p.add_argument("--auth-url",
+                   help="Login endpoint to POST credentials to and extract a bearer/JWT "
+                        "token for authenticated scanning")
+    p.add_argument("--auth-data",
+                   help="Credentials body for --auth-url (JSON or form)")
+    p.add_argument("--auth-token",
+                   help="Use this bearer/JWT token directly (skips login)")
+    p.add_argument("--auth-token-path",
+                   help="Dotted JSON path to the token in the login response "
+                        "(e.g. 'authentication.token'); auto-detected if omitted")
+    p.add_argument("--auth-header", default="Authorization",
+                   help="Header to carry the token (default: Authorization)")
+    p.add_argument("--no-auto-auth", action="store_true",
+                   help="Disable automatic authentication for recognized apps "
+                        "(e.g. Juice Shop login-SQLi self-auth)")
     p.add_argument("-p", "--param", action="append", dest="params",
                    help="Test only this parameter (repeatable)")
     p.add_argument("--proxy", help="HTTP proxy URL")
@@ -665,6 +682,9 @@ def _auto_discover(args, targets: list[str], console) -> None:
         if app_id:
             app = KNOWN_APPS[app_id]
             known_app_seeds = get_seed_urls(site, app_id)
+            # Expose auth config so main() can auto-authenticate this app
+            if app.auth:
+                args._known_app_auth = (site, app.auth)
             console.print(
                 f"[green]✓ Recognized target as {app.name}[/green] — "
                 f"seeding {len(known_app_seeds)} known-vulnerable endpoint(s)"
@@ -852,6 +872,42 @@ def main(argv: list[str] | None = None) -> int:
             console.print(f"[green]✓[/green] Captured cookie(s): {', '.join(jar.keys())}")
         else:
             console.print("[yellow]No Set-Cookie returned by the target[/yellow]")
+
+    # ---- Authenticated scanning: obtain a bearer/JWT token --------------
+    # Priority: explicit --auth-token > --auth-url/--auth-data login >
+    # known-app auto-auth (e.g. Juice Shop login-SQLi self-auth).
+    from llmsql.auth import obtain_token
+    auth_token: Optional[str] = None
+    if args.auth_token:
+        auth_token = args.auth_token
+        console.print("[green]✓[/green] Using supplied auth token")
+    elif args.auth_url and args.auth_data:
+        console.print(f"[*] Authenticating via {args.auth_url} ...")
+        auth_token, msg = obtain_token(
+            args.auth_url, args.auth_data, headers=headers,
+            token_path=args.auth_token_path, proxy=args.proxy,
+        )
+        console.print(f"[green]✓[/green] {msg}" if auth_token else f"[yellow]{msg}[/yellow]")
+    elif not args.no_auto_auth and hasattr(args, "_known_app_auth"):
+        site, (login_path, login_body, tok_path) = args._known_app_auth
+        login_url = site.rstrip("/") + login_path
+        console.print(f"[*] Auto-authenticating recognized app via {login_url} ...")
+        auth_token, msg = obtain_token(
+            login_url, login_body, headers=headers,
+            token_path=tok_path, proxy=args.proxy,
+        )
+        if auth_token:
+            console.print(
+                f"[green]✓ Authenticated[/green] — token obtained, "
+                f"authenticated endpoints are now in scope"
+            )
+        else:
+            console.print(f"[yellow]Auto-auth failed: {msg}[/yellow]")
+
+    if auth_token:
+        # Attach to every request. Not treated as an injection point
+        # (Authorization is in the http_probe skip list).
+        headers[args.auth_header] = f"Bearer {auth_token}"
 
     # Parameter mining wordlist
     guess_params = None
