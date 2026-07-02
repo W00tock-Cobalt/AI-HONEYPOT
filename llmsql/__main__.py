@@ -83,7 +83,10 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--no-path", dest="no_path", action="store_true",
                    help="Disable path-segment testing even in crawl mode")
     p.add_argument("--guess-params", action="store_true",
-                   help="Mine common param names (query,q,id,search,...) on each URL")
+                   help="Mine common param names (query,q,id,search,...) on each URL. "
+                        "ON BY DEFAULT; this flag is kept for compatibility.")
+    p.add_argument("--no-guess-params", action="store_true",
+                   help="Disable common-param mining (organic discovery still runs)")
     p.add_argument("--param-wordlist",
                    help="File of parameter names to guess (implies --guess-params)")
     p.add_argument("--no-organic", dest="organic", action="store_false",
@@ -95,9 +98,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
                         "to discover endpoints WITH their real parameter names")
     p.add_argument("--auto", action="store_true",
-                   help="Smart discovery: probe for Swagger/OpenAPI first, "
-                        "fall back to katana crawl if no spec found. "
-                        "Use with -u <site> for zero-config scanning.")
+                   help="Force smart discovery (Swagger probe + app fingerprint "
+                        "+ katana crawl). This is ON BY DEFAULT for a single -u "
+                        "target; the flag just forces it on for list/stdin input.")
+    p.add_argument("--no-auto", action="store_true",
+                   help="Disable the default auto-discovery for a single -u target")
     p.add_argument("--crawl", action="store_true",
                    help="Run katana on each seed target to discover URLs "
                         "(works without --auto; crawls authenticated when a "
@@ -148,8 +153,9 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Max payloads per parameter (default: level-based)")
 
     # Performance
-    p.add_argument("--threads", "-t", type=int, default=1,
-                   help="Concurrent targets to scan (default: 1)")
+    p.add_argument("--threads", "-t", type=int, default=None,
+                   help="Concurrent targets to scan (default: auto — 1 for a "
+                        "single target, up to 8 when many targets are discovered)")
     p.add_argument("--fast", action="store_true",
                    help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only "
                         "(much faster with local models like llama3.2)")
@@ -878,11 +884,21 @@ def main(argv: list[str] | None = None) -> int:
 
     targets = collect_targets(args)
 
-    # --auto: smart discovery — probe for Swagger/OpenAPI first,
-    # fall back to katana crawl if no spec is found.
-    if args.auto and targets and not args.openapi:
+    # Zero-config defaults: auto-discovery runs automatically for a single -u
+    # site (bare scanning) so the user doesn't have to pass --auto every time.
+    # It's skipped for list/stdin input (those already come from a crawler) and
+    # when an explicit --openapi spec is given, and can be forced with --auto or
+    # disabled with --no-auto.
+    single_seed = bool(args.url) and not args.url_list and not args.stdin
+    auto_on = (
+        (args.auto or single_seed)
+        and not args.no_auto
+        and not args.openapi
+        and bool(targets)
+    )
+    if auto_on:
         _auto_discover(args, targets, console)
-        # If --auto ran katana it may have replaced targets; re-read
+        # If auto ran katana it may have replaced targets; re-read
         if hasattr(args, '_auto_targets'):
             targets = args._auto_targets
 
@@ -1072,9 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
             proxy=args.proxy, timeout=min(args.timeout, 10.0),
         )
 
-    # Parameter mining wordlist
+    # Parameter mining wordlist — ON by default (disable with --no-guess-params).
     guess_params = None
-    if args.guess_params or args.param_wordlist:
+    if (not args.no_guess_params) or args.param_wordlist or args.guess_params:
         from llmsql.payloads import COMMON_PARAMS
         if args.param_wordlist:
             try:
@@ -1182,8 +1198,16 @@ def main(argv: list[str] | None = None) -> int:
             elif name:
                 console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
 
+    # Auto-scale concurrency: 1 for a single target, up to 8 when discovery
+    # expanded the run into many targets — unless the user set -t explicitly.
+    if args.threads is None:
+        args.threads = min(8, max(1, len(targets))) if len(targets) > 1 else 1
+
     if len(targets) > 1:
-        console.print(f"[*] {len(targets)} targets queued\n")
+        console.print(
+            f"[*] {len(targets)} targets queued "
+            f"[dim](scanning with {args.threads} thread(s))[/dim]\n"
+        )
 
     use_llm, base_url, llm_error = setup_llm_backend(args, console)
     if llm_error:

@@ -30,10 +30,18 @@ pip install httpx rich python-dotenv
 # Install Ollama (one-time): https://ollama.com
 # LLMSQL auto-starts ollama serve and pulls llama3.2 on first run
 
-# Full pipeline: discover via OpenAPI, scan, hand to sqlmap
-python -m llmsql \
-  --openapi https://target/ \
-  --guess-params --fast -t 8 \
+# ZERO-CONFIG: just point it at a site. Auto-discovery (Swagger probe + app
+# fingerprint + crawl), organic param discovery, param mining, and ALL injection
+# types (error/boolean/time/NoSQL/auth-bypass) are ON BY DEFAULT.
+python -m llmsql -u https://target/
+
+# Same for a whole list — threads auto-scale, findings grouped per host
+python -m llmsql -l urls.txt
+
+# Opt OUT of pieces if you need to trim: --no-auto --no-guess-params --no-organic
+
+# Full pipeline: discover, scan, hand to sqlmap
+python -m llmsql -u https://target/ \
   --then-sqlmap --ask \
   --sqlmap-profile exploit --sqlmap-timeout 300 \
   -o report.json -v
