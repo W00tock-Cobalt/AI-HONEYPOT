@@ -98,6 +98,12 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Smart discovery: probe for Swagger/OpenAPI first, "
                         "fall back to katana crawl if no spec found. "
                         "Use with -u <site> for zero-config scanning.")
+    p.add_argument("--crawl", action="store_true",
+                   help="Run katana on each seed target to discover URLs "
+                        "(works without --auto; crawls authenticated when a "
+                        "--cookie/--login session is set)")
+    p.add_argument("--crawl-depth", type=int, default=3,
+                   help="katana crawl depth for --auto/--crawl (default: 3)")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET",
                    help="HTTP method(s), comma-separated to try several "
@@ -691,6 +697,66 @@ def organic_expand_targets(
     return targets + discovered
 
 
+def katana_crawl(
+    site: str,
+    console,
+    depth: int = 3,
+    headers: dict[str, str] | None = None,
+    cookie: str | None = None,
+    verbose: bool = False,
+    timeout: int = 120,
+) -> list[str]:
+    """Crawl a site with katana and return discovered (non-static) URLs.
+
+    Passes auth headers/cookie through to katana so authenticated areas are
+    crawled too. Returns [] if katana isn't installed or finds nothing.
+    """
+    import shutil
+    if not shutil.which("katana"):
+        console.print(
+            "[yellow]katana is not installed — cannot crawl.[/yellow] "
+            "[dim](https://github.com/projectdiscovery/katana)[/dim]"
+        )
+        return []
+
+    cmd = ["katana", "-u", site, "-jc", "-silent", "-d", str(depth)]
+    for k, v in (headers or {}).items():
+        if k.lower() == "user-agent":
+            cmd += ["-H", f"User-Agent: {v}"]
+        else:
+            cmd += ["-H", f"{k}: {v}"]
+    if cookie:
+        cmd += ["-H", f"Cookie: {cookie}"]
+
+    console.print(f"[*] Crawling with katana (depth {depth})...")
+    import subprocess as _sp
+    try:
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        console.print(f"[yellow]katana failed to run: {e}[/yellow]")
+        return []
+
+    raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    crawled = sorted({u for u in raw if not _is_static(u)})
+    filtered = len(raw) - len(crawled)
+    if crawled:
+        console.print(
+            f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
+            f"[dim]({filtered} static assets filtered out)[/dim]"
+        )
+        show_n = crawled if verbose else crawled[:15]
+        for u in show_n:
+            console.print(f"    [cyan]->[/cyan] {u}")
+        if len(show_n) < len(crawled):
+            console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
+    else:
+        console.print(
+            f"[yellow]katana ran but found no usable URLs[/yellow] "
+            f"[dim]({len(raw)} raw hits, all static/filtered)[/dim]"
+        )
+    return crawled
+
+
 def _auto_discover(args, targets: list[str], console) -> None:
     """
     Smart target discovery for --auto mode. Fully transparent: every step
@@ -770,42 +836,11 @@ def _auto_discover(args, targets: list[str], console) -> None:
         console.print(f"[dim]App fingerprinting skipped: {e}[/dim]")
 
     # ---- Step 2: crawl to discover additional URLs ------------------------
-    crawled: list[str] = []
-    import shutil
-    if not shutil.which("katana"):
-        console.print(
-            "[yellow]katana is not installed — cannot crawl for additional URLs.[/yellow]\n"
-            "[dim]Install it (https://github.com/projectdiscovery/katana) for --auto "
-            "to discover URLs automatically, or pass -l/--stdin with URLs yourself.[/dim]"
-        )
-    else:
-        console.print("[*] Crawling with katana to discover additional URLs...")
-        import subprocess as _sp
-        try:
-            result = _sp.run(
-                ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
-                capture_output=True, text=True, timeout=120,
-            )
-            raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-            crawled = sorted({u for u in raw if not _is_static(u)})
-            filtered = len(raw) - len(crawled)
-            if crawled:
-                console.print(
-                    f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
-                    f"[dim]({filtered} static assets filtered out)[/dim]"
-                )
-                show_n = crawled if args.verbose else crawled[:15]
-                for u in show_n:
-                    console.print(f"    [cyan]->[/cyan] {u}")
-                if len(show_n) < len(crawled):
-                    console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
-            else:
-                console.print(
-                    f"[yellow]katana ran but found no usable URLs[/yellow] "
-                    f"[dim]({len(raw)} raw hits, all static/filtered)[/dim]"
-                )
-        except Exception as e:
-            console.print(f"[yellow]katana failed to run: {e}[/yellow]")
+    crawled = katana_crawl(
+        site, console,
+        depth=getattr(args, "crawl_depth", 3),
+        verbose=args.verbose,
+    )
 
     # ---- Merge: known-app seeds + katana crawl (+ root as last resort) ----
     known_urls = [u for _, u, _, _ in known_app_seeds]
@@ -983,6 +1018,28 @@ def main(argv: list[str] | None = None) -> int:
         # Attach to every request. Not treated as an injection point
         # (Authorization is in the http_probe skip list).
         headers[args.auth_header] = f"Bearer {auth_token}"
+
+    # Explicit katana crawl (--crawl): discover URLs on each seed, authenticated
+    # with whatever session (cookie/token) we just established. Runs regardless
+    # of --auto.
+    if args.crawl:
+        crawl_headers = dict(headers)
+        crawl_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+        seen_c = set(targets)
+        added: list[str] = []
+        for seed in list(targets)[:10]:
+            for u in katana_crawl(
+                seed, console, depth=args.crawl_depth,
+                headers=crawl_headers, cookie=args.cookie, verbose=args.verbose,
+            ):
+                if u not in seen_c:
+                    seen_c.add(u)
+                    added.append(u)
+        if added:
+            console.print(f"[green]✓ Crawl added {len(added)} new target(s)[/green]")
+            targets = targets + added
 
     # Organic target expansion: crawl the seed page(s) one level to add the
     # forms/links they point at as scan targets. Skipped for large crawl lists

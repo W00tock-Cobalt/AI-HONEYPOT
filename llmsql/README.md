@@ -70,6 +70,9 @@ python -m llmsql --openapi https://target/ \
 --param-wordlist FILE  Custom param wordlist
 --no-organic           Disable organic param/target discovery from responses
                        (on by default: forms, links, JS, JSON keys)
+--crawl                Run katana on each seed to discover URLs (any run, not
+                       just --auto; crawls authenticated with --cookie/--login)
+--crawl-depth N        katana crawl depth for --auto/--crawl (default 3)
 --path                 Test URL path segments too
 --fast                 Error-based payloads only (quick triage)
 --payloads MODE        {sqlmap|embedded|error|boolean|union|time|stacked}
