@@ -25,6 +25,8 @@ def _build_poc(exchange) -> tuple[str, str]:
     method = exchange.method.upper()
     hdrs = exchange.request_headers or {}
 
+    # Build header flags once; Content-Type is included here so we must not
+    # add it a second time for the POST branch (that caused a duplicate header).
     extra_h = "".join(
         f' -H "{k}: {v}"'
         for k, v in hdrs.items()
@@ -33,12 +35,14 @@ def _build_poc(exchange) -> tuple[str, str]:
     if method == "GET":
         curl = f'curl -si "{url}"{extra_h}'
     else:
-        ct = hdrs.get("Content-Type", hdrs.get("content-type", "application/json"))
-        body = (exchange.request_body or "").replace("'", "\\'")
+        import shlex
+        # Ensure a Content-Type is present even if the caller didn't set one
+        has_ct = any(k.lower() == "content-type" for k in hdrs)
+        ct_flag = "" if has_ct else ' -H "Content-Type: application/json"'
+        body = exchange.request_body or ""
         curl = (
-            f'curl -si -X {method}{extra_h}'
-            f' -H "Content-Type: {ct}"'
-            f" --data '{body}'"
+            f'curl -si -X {method}{extra_h}{ct_flag}'
+            f" --data {shlex.quote(body)}"
             f' "{url}"'
         )
 
