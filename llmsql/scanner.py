@@ -314,26 +314,44 @@ class Scanner:
                 )
 
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
+            # Inject relative to the ORIGINAL value, not by replacing it. Real
+            # SQLi context is preserved by appending: for q=apple the probe
+            # sends q=apple' which yields `LIKE '%apple'%'` -> syntax error.
+            # Replacing (q=') often returns empty results with no error and
+            # misses the vulnerability (confirmed on OWASP Juice Shop search).
+            orig = point.original_value or ""
             star_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
-                inject_point=point, payload="*",
+                inject_point=point, payload=orig + "*",
             )
             report.add_request()
             star_score, _ = self.detector.quick_score(baseline, star_probe)
 
-            if star_score == 0.0 and star_probe.status_code == baseline.status_code:
-                return None  # dead param
-
+            # Always send the quote probe — it's the primary SQLi signal.
+            # (Previously we skipped it when the star probe looked 'dead', which
+            # missed error-based SQLi on search endpoints where a wildcard
+            # returns empty results but a quote triggers a SQL error.)
             quote_probe = self.probe.send(
                 url, method, data, content_type, extra_headers,
-                inject_point=point, payload="'",
+                inject_point=point, payload=orig + "'",
             )
             report.add_request()
 
-            # Check SQL errors and status change DIRECTLY — do not rely only on
-            # quick_score which may miss unrecognised error patterns.
             quote_errors = self.detector.find_sql_errors(quote_probe.response_body)
             status_changed = quote_probe.status_code != baseline.status_code
+
+            # Truly dead param: neither the wildcard NOR the quote changed
+            # anything (same status, no SQL errors, no body diff). Skip it.
+            star_identical = (
+                star_score == 0.0 and star_probe.status_code == baseline.status_code
+            )
+            quote_identical = (
+                not quote_errors
+                and not status_changed
+                and len(quote_probe.response_body) == len(baseline.response_body)
+            )
+            if star_identical and quote_identical:
+                return None  # dead param — ignores its value entirely
 
             if quote_errors:
                 # Explicit SQL error text — confirmed, no ambiguity.
@@ -362,7 +380,7 @@ class Scanner:
 
                 control_probe = self.probe.send(
                     url, method, data, content_type, extra_headers,
-                    inject_point=point, payload="zzz9x8y7w6v5",
+                    inject_point=point, payload=orig + "zzz9x8y7w6v5",
                 )
                 report.add_request()
                 control_broke = control_probe.status_code == quote_probe.status_code
@@ -381,7 +399,7 @@ class Scanner:
                     # value lands inside a SQL statement.
                     fix_probe = self.probe.send(
                         url, method, data, content_type, extra_headers,
-                        inject_point=point, payload="'--",
+                        inject_point=point, payload=orig + "'--",
                     )
                     report.add_request()
                     fix_confirms = fix_probe.status_code == baseline.status_code
