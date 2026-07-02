@@ -163,7 +163,7 @@ class SqlDetector:
         # _expected_sleep_ms). For other payloads use a high fixed threshold so
         # slow servers don't generate false positives on every request.
         delay = injected.response_time_ms - baseline.response_time_ms
-        expected_sleep_ms = getattr(injected, '_expected_sleep_ms', None)
+        expected_sleep_ms = injected.expected_sleep_ms
         if expected_sleep_ms is not None and delay > expected_sleep_ms * 0.6:
             score = max(score, 0.8)
             evidence_parts.append(

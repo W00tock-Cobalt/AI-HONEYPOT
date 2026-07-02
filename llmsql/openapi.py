@@ -283,17 +283,24 @@ def load_openapi(
                 continue
 
             text = resp.text.strip()
-            if not text.startswith("{"):
-                last_probe_log.append(
-                    SpecProbeResult(cand, resp.status_code, "200 but not a JSON object")
-                )
-                continue
 
-            try:
-                data = resp.json()
-            except (json.JSONDecodeError, ValueError):
+            # Try JSON first; fall back to YAML if pyyaml is available
+            data = None
+            if text.startswith("{") or text.startswith("["):
+                try:
+                    data = resp.json()
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            if data is None and (text.startswith("openapi:") or text.startswith("swagger:")):
+                try:
+                    import yaml  # type: ignore[import]
+                    data = yaml.safe_load(text)
+                except (ImportError, Exception):
+                    pass
+
+            if data is None:
                 last_probe_log.append(
-                    SpecProbeResult(cand, resp.status_code, "200 but invalid JSON")
+                    SpecProbeResult(cand, resp.status_code, "200 but not parseable JSON or YAML")
                 )
                 continue
 
@@ -322,6 +329,9 @@ def load_openapi(
                     if r.status_code < 500 and (
                         "data" in r.text or "errors" in r.text
                     ):
+                        # GraphQL is live — add a minimal introspection target.
+                        # Do NOT add app-specific queries here; let param mining
+                        # discover injectable fields on the target naturally.
                         spec_urls_gql.append(gql_url)
                         break
                 except (httpx.HTTPError, OSError):
@@ -333,10 +343,13 @@ def load_openapi(
         return []
     targets = expand_spec(spec, spec_url)
     for gql_url in spec_urls_gql:
+        # Add a generic GraphQL endpoint for param-mining / injection tests.
+        # A bare POST target lets the scanner discover injectable fields via
+        # --guess-params rather than hard-coding app-specific query names.
         targets.append(SpecTarget(
-            url=f"{gql_url}?query={{testimonialsCount(query:\"1\")}}",
+            url=gql_url,
             method="POST",
-            body='{"query":"{testimonialsCount(query:\\"1\\")}"}',
+            body='{"query":"{__typename}"}',
             content_type="application/json",
         ))
     return targets

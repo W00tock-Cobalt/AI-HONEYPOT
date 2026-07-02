@@ -54,6 +54,9 @@ class HttpExchange:
     response_body: str
     injected_param: Optional[str] = None
     payload: Optional[str] = None
+    # Set by scanner when payload is a time-based probe; used by detector
+    # to calibrate the timing threshold.
+    expected_sleep_ms: Optional[float] = None
 
 
 @dataclass
@@ -95,3 +98,25 @@ class ScanReport:
     duration_seconds: float = 0.0
     llm_model: str = ""
     total_requests: int = 0
+
+    def __post_init__(self):
+        import threading
+        # Lock used by scanner when multiple param-test threads write to this report
+        self._lock: threading.Lock = threading.Lock()
+
+    def add_request(self, exchange: Optional["HttpExchange"] = None) -> None:
+        """Thread-safe request counter increment."""
+        with self._lock:
+            self.total_requests += 1
+            if exchange is not None:
+                self.exchanges.append(exchange)
+
+    def add_error(self, msg: str) -> None:
+        """Thread-safe error append."""
+        with self._lock:
+            self.errors.append(msg)
+
+    def add_log(self, msg: str) -> None:
+        """Thread-safe agent log append."""
+        with self._lock:
+            self.agent_log.append(msg)

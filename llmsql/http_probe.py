@@ -348,7 +348,9 @@ class HttpProbe:
             body = urlencode(form, doseq=True)
 
         elif point.location == ParamLocation.JSON and data and point.json_path:
-            obj = json.loads(data)
+            # deepcopy so injecting one JSON key doesn't contaminate later requests
+            import copy
+            obj = copy.deepcopy(json.loads(data))
             self._set_json_path(obj, point.json_path, payload)
             body = json.dumps(obj)
             if not content_type:

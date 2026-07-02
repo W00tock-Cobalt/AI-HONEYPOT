@@ -124,7 +124,7 @@ class Scanner:
             points = [p for p in points if p.name in allowed]
 
         if not points:
-            report.errors.append("No injection points found")
+            report.add_error("No injection points found")
             report.duration_seconds = time.perf_counter() - start
             return report
 
@@ -132,14 +132,14 @@ class Scanner:
 
         # Baseline request
         baseline = self.probe.send(url, method, data, content_type, extra_headers)
-        report.exchanges.append(baseline)
-        report.total_requests += 1
+        report.add_request(baseline)
+        report.add_request()
         self.on_progress(f"[*] Baseline: HTTP {baseline.status_code} ({baseline.response_time_ms:.0f}ms)")
 
         # Detect DB/backend offline — tell the user clearly rather than silently
         # returning 0 findings for every payload.
         if self.detector.is_db_offline(baseline):
-            report.errors.append(
+            report.add_error(
                 f"DB/backend appears OFFLINE ({baseline.response_body[:120].strip()}) — "
                 f"SQLi cannot be detected at runtime. Vulnerability may still exist in code."
             )
@@ -151,7 +151,7 @@ class Scanner:
 
         # Skip dead endpoints — no point fuzzing a route that doesn't exist
         if not self.include_dead and baseline.status_code in (0, 404, 405, 501):
-            report.errors.append(
+            report.add_error(
                 f"Skipped: baseline HTTP {baseline.status_code} "
                 f"(endpoint dead/unroutable; use --include-404 to force)"
             )
@@ -163,7 +163,7 @@ class Scanner:
 
         # Skip auth-gated / WAF-blocked baselines — can't test unauthenticated
         if not self.include_dead and baseline.status_code in (401, 403):
-            report.errors.append(
+            report.add_error(
                 f"Skipped: baseline HTTP {baseline.status_code} "
                 f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "
                 f"or --cookie, or use --include-404 to force)"
@@ -194,7 +194,7 @@ class Scanner:
                     except _cf.CancelledError:
                         continue  # skipped after first finding confirmed
                     except Exception as e:
-                        report.errors.append(f"Param test error: {e}")
+                        report.add_error(f"Param test error: {e}")
                         continue
                     if finding:
                         report.findings.append(finding)
@@ -265,7 +265,7 @@ class Scanner:
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="' OR '1'='1'--",
             )
-            report.total_requests += 1
+            report.add_request()
             score, evidence = self.detector.quick_score(baseline, bypass_probe)
             if score >= 0.85:
                 return self._build_finding(
@@ -278,7 +278,7 @@ class Scanner:
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="*",
             )
-            report.total_requests += 1
+            report.add_request()
             star_score, _ = self.detector.quick_score(baseline, star_probe)
 
             if star_score == 0.0 and star_probe.status_code == baseline.status_code:
@@ -288,7 +288,7 @@ class Scanner:
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload="'",
             )
-            report.total_requests += 1
+            report.add_request()
 
             # Check SQL errors and status change DIRECTLY — do not rely only on
             # quick_score which may miss unrecognised error patterns.
@@ -324,7 +324,7 @@ class Scanner:
                     url, method, data, content_type, extra_headers,
                     inject_point=point, payload="zzz9x8y7w6v5",
                 )
-                report.total_requests += 1
+                report.add_request()
                 control_broke = control_probe.status_code == quote_probe.status_code
 
                 if control_broke:
@@ -343,7 +343,7 @@ class Scanner:
                         url, method, data, content_type, extra_headers,
                         inject_point=point, payload="'--",
                     )
-                    report.total_requests += 1
+                    report.add_request()
                     fix_confirms = fix_probe.status_code == baseline.status_code
 
                     evidence = (
@@ -380,11 +380,11 @@ class Scanner:
                 )
                 if llm_payloads:
                     payloads = llm_payloads + payloads
-                    report.agent_log.append(
+                    report.add_log(
                         f"LLM suggested {len(llm_payloads)} payloads for {point.name}"
                     )
             except Exception as e:
-                report.errors.append(f"LLM suggest failed for {point.name}: {e}")
+                report.add_error(f"LLM suggest failed for {point.name}: {e}")
 
         # Apply explicit tamper chain up front, if requested
         if self.tamper:
@@ -428,9 +428,9 @@ class Scanner:
             # Tag time-based payloads so the timing detector calibrates threshold
             _sleep_kw = ("sleep", "waitfor", "pg_sleep", "benchmark")
             if any(kw in payload.lower() for kw in _sleep_kw):
-                injected._expected_sleep_ms = getattr(self, '_sleep_ms', 3000)
-            report.exchanges.append(injected)
-            report.total_requests += 1
+                injected.expected_sleep_ms = self._sleep_ms
+            report.add_request(injected)
+            report.add_request()
 
             is_blocked = self._is_blocked(baseline, injected)
             if not is_blocked:
@@ -463,7 +463,7 @@ class Scanner:
                         f"(baseline {baseline.status_code} -> {injected.status_code}); "
                         f"queued {added} tamper variants"
                     )
-                    report.agent_log.append(msg)
+                    report.add_log(msg)
                     self.on_progress(f"    [!] {msg}")
 
             if score > best_score:
@@ -491,7 +491,7 @@ class Scanner:
                         baseline, injected, point, score, evidence,
                         attempts, self.max_attempts,
                     )
-                    report.agent_log.append(
+                    report.add_log(
                         f"{point.name}: {decision.action} — {decision.reasoning[:100]}"
                     )
 
@@ -512,14 +512,14 @@ class Scanner:
                     if decision.action == "inject" and decision.payload:
                         if decision.payload not in seen:
                             unique_payloads.append(decision.payload)
-                            report.agent_log.append(
+                            report.add_log(
                                 f"LLM next payload: {decision.payload[:60]}"
                             )
 
                     if decision.action in ("skip", "done"):
                         break
                 except Exception as e:
-                    report.errors.append(f"LLM analyze failed: {e}")
+                    report.add_error(f"LLM analyze failed: {e}")
 
         # Final check on best candidate
         if best_exchange and best_score >= 0.6:
@@ -546,7 +546,7 @@ class Scanner:
                             reasoning=confirm.get("reasoning", ""),
                         )
                 except Exception as e:
-                    report.errors.append(f"LLM confirm failed: {e}")
+                    report.add_error(f"LLM confirm failed: {e}")
 
             if best_score >= 0.75:
                 return self._build_finding(
@@ -580,7 +580,8 @@ class Scanner:
                     url, method, data, content_type, extra_headers,
                     inject_point=point, payload=false_pl,
                 )
-                report.total_requests += 2
+                report.add_request()
+                report.add_request()
                 score, evidence = self.detector.boolean_blind_score(
                     baseline, true_ex, false_ex
                 )

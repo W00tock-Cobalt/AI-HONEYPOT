@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import sys
+from typing import Optional
 
 from rich.console import Console
 
@@ -1109,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
             console=console,
             menu=args.sqlmap_menu,
             timeout=args.sqlmap_timeout,
+            spec_extras=spec_extras,
         )
 
     return 1 if total_findings else 0
@@ -1123,6 +1125,7 @@ def run_sqlmap_on_findings(
     console,
     menu: bool = False,
     timeout: int = 0,
+    spec_extras: Optional[dict] = None,
 ) -> int:
     """Run sqlmap against only the URLs LLMSQL confirmed as injectable."""
     import shutil
@@ -1135,14 +1138,23 @@ def run_sqlmap_on_findings(
     # guessed param). We only need to run sqlmap once per URL — it will probe
     # all parameters itself. If there's a confirmed param, we add -p to focus.
     from urllib.parse import parse_qs, urlencode
-    best_finding: dict[str, tuple] = {}  # base_url -> (extra, confidence, db_type)
+    _spec_extras = spec_extras or {}
+    # base_url -> (param_extra, confidence, db_type, method, post_body, content_type)
+    best_finding: dict[str, tuple] = {}
     for report in reports:
         raw_parsed = urlparse(report.target_url)
         raw_qs = parse_qs(raw_parsed.query, keep_blank_values=True)
+        # Recover method/body from spec_extras if this was a POST finding
+        spec_data = _spec_extras.get(report.target_url, (None, None, None, None))
+        spec_method, spec_body, spec_ct, _ = spec_data
         for f in report.findings:
             base = report.target_url
-            extra = ""
-            if f.location in (ParamLocation.QUERY, ParamLocation.BODY):
+            param_extra = ""
+            method = spec_method or "GET"
+            post_body = spec_body
+            post_ct = spec_ct
+
+            if f.location == ParamLocation.QUERY:
                 spec_params = {k: v for k, v in raw_qs.items() if k == f.param}
                 if not spec_params:
                     spec_params = {f.param: ["1"]}
@@ -1150,7 +1162,22 @@ def run_sqlmap_on_findings(
                     query=urlencode({k: v[0] for k, v in spec_params.items()})
                 ))
                 base = clean_url
-                extra = f"-p {f.param}"
+                param_extra = f"-p {f.param}"
+
+            elif f.location in (ParamLocation.BODY, ParamLocation.JSON):
+                # POST body injection — pass method and data to sqlmap
+                param_extra = f"-p {f.param}"
+                if not post_body:
+                    post_body = f'{{"{f.param}": "1"}}'
+                    post_ct = "application/json"
+                method = method or "POST"
+
+            elif f.location == ParamLocation.HEADER:
+                param_extra = f'-p {f.param} --headers="{f.param}: *"'
+
+            elif f.location == ParamLocation.COOKIE:
+                param_extra = f'--cookie="{f.param}=*"'
+
             elif f.location == ParamLocation.PATH:
                 idx = None
                 if f.param.startswith("path[") and "]" in f.param:
@@ -1158,19 +1185,23 @@ def run_sqlmap_on_findings(
                         idx = int(f.param[5:f.param.index("]")])
                     except ValueError:
                         idx = None
-                parsed = urlparse(base)
-                segs = parsed.path.split("/")
+                parsed_p = urlparse(base)
+                segs = parsed_p.path.split("/")
                 if idx is not None and 0 <= idx < len(segs):
                     segs[idx] = segs[idx] + "*"
-                    base = urlunparse(parsed._replace(path="/".join(segs)))
-            else:
-                continue
+                    base = urlunparse(parsed_p._replace(path="/".join(segs)))
 
             prev = best_finding.get(base)
             if prev is None or f.confidence > prev[1]:
-                best_finding[base] = (extra, f.confidence, f.db_type)
+                best_finding[base] = (
+                    param_extra, f.confidence, f.db_type,
+                    method, post_body, post_ct,
+                )
 
-    jobs = [(url, data[0], data[2]) for url, data in best_finding.items()]
+    jobs = [
+        (url, d[0], d[2], d[3], d[4], d[5])
+        for url, d in best_finding.items()
+    ]
 
     if not jobs:
         console.print(
@@ -1195,15 +1226,22 @@ def run_sqlmap_on_findings(
         f"\n[bold cyan]Stage 2 — sqlmap targets ({len(jobs)}):[/bold cyan] "
         f"[dim]profile: {profile}[/dim]"
     )
-    for i, (url, extra, db) in enumerate(jobs, 1):
+    for i, (url, extra, db, method, body, ct) in enumerate(jobs, 1):
         db_tag = f"  [dim][{db}][/dim]" if db else ""
-        console.print(f"  {i}) {url}  [dim]{extra}[/dim]{db_tag}")
+        method_tag = f"  [dim]{method}[/dim]" if method and method != "GET" else ""
+        console.print(f"  {i}) {url}  [dim]{extra}[/dim]{method_tag}{db_tag}")
     console.print()
 
     have_sqlmap = shutil.which("sqlmap") is not None
-    for i, (url, extra, db) in enumerate(jobs, 1):
+    for i, (url, extra, db, method, body, ct) in enumerate(jobs, 1):
         dbms_flag = f"--dbms={db}" if db else ""
-        cmd = f"sqlmap -u '{url}' {base_args} {dbms_flag} {sqlmap_args} {extra}{header_args}".strip()
+        method_flag = ""
+        if method and method.upper() != "GET":
+            method_flag = f"--method={method.upper()}"
+            if body:
+                import shlex
+                method_flag += f" --data={shlex.quote(body)}"
+        cmd = f"sqlmap -u '{url}' {base_args} {dbms_flag} {method_flag} {sqlmap_args} {extra}{header_args}".strip()
         # collapse multiple spaces
         import re as _re
         cmd = _re.sub(r" {2,}", " ", cmd)
