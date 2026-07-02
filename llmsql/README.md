@@ -4,11 +4,12 @@
 
 LLMSQL's genuine value is as a **discovery and parameter-mining layer** that feeds sqlmap:
 
-1. **OpenAPI/Swagger import** — gets every endpoint *with real param names* (e.g. `?query=` on `/api/testimonials/count`) that a crawler won't see
-2. **Liveness filter** — drops dead/403 endpoints before sqlmap wastes time on them
-3. **Parameter mining** — tries common param names on bare URLs
-4. **GraphQL probe** — detects and adds GraphQL injection points
-5. **POST body expansion** — emits POST endpoints with concrete JSON bodies
+1. **Organic discovery** — mines parameter names *and follow-up targets from the target's own responses* (HTML forms, links, JS `fetch()` URLs, JSON keys). A bare `-u https://site` reaches the vulnerable `/search?searchquery=` a homepage form points at — no baked-in endpoint list, works on any app. On by default; disable with `--no-organic`.
+2. **OpenAPI/Swagger import** — gets every endpoint *with real param names* (e.g. `?query=` on `/api/testimonials/count`) that a crawler won't see
+3. **Liveness filter** — drops dead/403 endpoints before sqlmap wastes time on them
+4. **Parameter mining** — tries common param names on bare URLs (fallback wordlist)
+5. **GraphQL probe** — detects and adds GraphQL injection points
+6. **POST body expansion** — emits POST endpoints with concrete JSON bodies
 
 Then it hands confirmed findings to **sqlmap** for actual exploitation.
 
@@ -67,6 +68,8 @@ python -m llmsql --openapi https://target/ \
 --openapi SRC          Import Swagger/OpenAPI spec
 --guess-params         Mine common param names (query,id,search,...)
 --param-wordlist FILE  Custom param wordlist
+--no-organic           Disable organic param/target discovery from responses
+                       (on by default: forms, links, JS, JSON keys)
 --path                 Test URL path segments too
 --fast                 Error-based payloads only (quick triage)
 --payloads MODE        {sqlmap|embedded|error|boolean|union|time|stacked}

@@ -86,6 +86,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Mine common param names (query,q,id,search,...) on each URL")
     p.add_argument("--param-wordlist",
                    help="File of parameter names to guess (implies --guess-params)")
+    p.add_argument("--no-organic", dest="organic", action="store_false",
+                   default=True,
+                   help="Disable organic parameter discovery (mining param names "
+                        "from the target's own forms/links/JS/JSON responses). "
+                        "On by default so the scanner adapts to any app.")
     p.add_argument("--openapi",
                    help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
                         "to discover endpoints WITH their real parameter names")
@@ -616,6 +621,64 @@ def _is_static(url: str) -> bool:
     return any(s in url.lower() for s in _STATIC_SEGS)
 
 
+def organic_expand_targets(
+    targets: list[str],
+    headers: dict[str, str],
+    console,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+    timeout: float = 10.0,
+    max_seeds: int = 20,
+    max_new: int = 120,
+) -> list[str]:
+    """One-pass organic expansion: fetch each seed page and add scan targets it
+    points at (GET-form actions pre-filled with fields, and query-carrying
+    links). This lets ``-u https://site`` reach the vulnerable /search endpoint
+    a form points to — without a static endpoint list or an external crawler.
+
+    Bounded on purpose: only the first ``max_seeds`` targets are fetched and at
+    most ``max_new`` URLs are added, so it never turns into a full crawl.
+    """
+    import httpx
+
+    from llmsql.param_discovery import discover
+
+    existing = set(targets)
+    discovered: list[str] = []
+    kwargs: dict = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        kwargs["proxy"] = proxy
+
+    seeds = [t for t in targets if not _is_static(t)][:max_seeds]
+    with httpx.Client(**kwargs) as c:
+        for seed in seeds:
+            try:
+                resp = c.get(seed, headers=headers or {})
+            except (httpx.HTTPError, OSError):
+                continue
+            ct = resp.headers.get("content-type", "")
+            try:
+                _names, urls = discover(seed, resp.text, ct)
+            except Exception:
+                continue
+            for u in urls:
+                if u in existing or _is_static(u) or len(discovered) >= max_new:
+                    continue
+                existing.add(u)
+                discovered.append(u)
+
+    if discovered:
+        console.print(
+            f"[green]✓ Organic crawl found {len(discovered)} extra target(s)[/green] "
+            f"[dim](forms/links on the seed page(s))[/dim]"
+        )
+        for u in discovered[:15]:
+            console.print(f"    [cyan]->[/cyan] {u}")
+        if len(discovered) > 15:
+            console.print(f"    [dim]... and {len(discovered) - 15} more[/dim]")
+    return targets + discovered
+
+
 def _auto_discover(args, targets: list[str], console) -> None:
     """
     Smart target discovery for --auto mode. Fully transparent: every step
@@ -909,6 +972,19 @@ def main(argv: list[str] | None = None) -> int:
         # (Authorization is in the http_probe skip list).
         headers[args.auth_header] = f"Bearer {auth_token}"
 
+    # Organic target expansion: crawl the seed page(s) one level to add the
+    # forms/links they point at as scan targets. Skipped for large crawl lists
+    # (katana/gau already did the crawling) and when --no-organic is set.
+    if args.organic and len(targets) <= 20:
+        expand_headers = dict(headers)
+        expand_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+        targets = organic_expand_targets(
+            targets, expand_headers, console,
+            proxy=args.proxy, timeout=min(args.timeout, 10.0),
+        )
+
     # Parameter mining wordlist
     guess_params = None
     if args.guess_params or args.param_wordlist:
@@ -1062,6 +1138,7 @@ def main(argv: list[str] | None = None) -> int:
         show_response=args.show_response,
         continue_on_found=args.continue_on_found,
         seed_payloads=display_payloads,
+        organic=args.organic,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
@@ -1074,6 +1151,8 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[dim]Path-segment injection: enabled[/dim]")
     if guess_params:
         console.print(f"[dim]Parameter mining: {len(guess_params)} names per URL[/dim]")
+    if args.organic:
+        console.print("[dim]Organic discovery: params mined from each response (forms/links/JS/JSON)[/dim]")
 
     # Methods to try per target. --method may be comma-separated (e.g. GET,POST).
     cli_methods = [m.strip().upper() for m in args.method.split(",") if m.strip()] or ["GET"]

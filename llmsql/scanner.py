@@ -75,6 +75,7 @@ class Scanner:
         show_response: bool = False,
         continue_on_found: bool = False,
         seed_payloads: Optional[list[str]] = None,
+        organic: bool = True,
     ):
         self.agent = agent
         self.probe = probe
@@ -91,6 +92,7 @@ class Scanner:
         self.auto_tamper = auto_tamper
         self.show_response = show_response
         self.continue_on_found = continue_on_found
+        self.organic = organic  # mine params from the response itself
         self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
         self._sleep_ms = 3000  # calibrated by CLI --sleep
         # Precheck is always on unless explicitly disabled.
@@ -116,25 +118,9 @@ class Scanner:
         self.on_progress(f"[*] Target: {url}")
         self.on_progress(f"[*] Method: {method}")
 
-        # Discover injection points
-        points = self.probe.extract_injection_points(
-            url, method, data, content_type, extra_headers,
-            test_path=self.test_path,
-            path_all_segments=self.path_all_segments,
-            guess_params=self.guess_params,
-        )
-        if params:
-            allowed = set(params)
-            points = [p for p in points if p.name in allowed]
-
-        if not points:
-            report.add_error("No injection points found")
-            report.duration_seconds = time.perf_counter() - start
-            return report
-
-        report.injection_points = points
-
-        # Baseline request
+        # Baseline request FIRST — the clean response is what we mine for
+        # organically-discovered parameters (forms/links/JS/JSON keys), so we
+        # need it before deciding which points to test.
         baseline = self.probe.send(url, method, data, content_type, extra_headers)
         report.add_request(baseline)
         report.add_request()
@@ -206,6 +192,50 @@ class Scanner:
                 f"[*] Skipping (baseline HTTP {baseline.status_code}, needs auth/bypass)"
             )
             return report
+
+        # Organic parameter discovery: mine the live baseline response for
+        # parameter names the target itself advertises (form fields, links,
+        # JS fetch URLs, JSON keys). This adapts to arbitrary apps instead of
+        # relying on a baked-in wordlist.
+        discovered_params: Optional[list[str]] = None
+        if self.organic and method.upper() == "GET":
+            try:
+                ct = baseline.response_headers.get("content-type", "") \
+                    if baseline.response_headers else ""
+                from llmsql.param_discovery import discover
+                names, _param_urls = discover(url, baseline.response_body, ct)
+                if names:
+                    discovered_params = names
+                    report.add_log(
+                        f"Organic discovery: {len(names)} param name(s) from response "
+                        f"({', '.join(names[:8])}{'...' if len(names) > 8 else ''})"
+                    )
+                    self.on_progress(
+                        f"[*] Discovered {len(names)} parameter name(s) organically "
+                        f"from the response"
+                    )
+            except Exception as e:
+                report.add_error(f"Organic discovery failed: {e}")
+
+        # Discover injection points (query/path/body/header/cookie), seeding the
+        # organically-discovered names with priority.
+        points = self.probe.extract_injection_points(
+            url, method, data, content_type, extra_headers,
+            test_path=self.test_path,
+            path_all_segments=self.path_all_segments,
+            guess_params=self.guess_params,
+            discovered_params=discovered_params,
+        )
+        if params:
+            allowed = set(params)
+            points = [p for p in points if p.name in allowed]
+
+        if not points:
+            report.add_error("No injection points found")
+            report.duration_seconds = time.perf_counter() - start
+            return report
+
+        report.injection_points = points
 
         import concurrent.futures as _cf
 

@@ -70,8 +70,16 @@ class HttpProbe:
         test_path: bool = False,
         path_all_segments: bool = False,
         guess_params: Optional[list[str]] = None,
+        discovered_params: Optional[list[str]] = None,
     ) -> list[InjectionPoint]:
-        """Discover injectable parameters from URL path, query, body, headers."""
+        """Discover injectable parameters from URL path, query, body, headers.
+
+        ``discovered_params`` are parameter names harvested organically from the
+        target's own response (forms/links/JS/JSON) — see param_discovery. They
+        are tested with priority over the static wordlist because the target
+        itself advertised them, and (unlike guess_params) they are used even
+        when generic parameter mining is off.
+        """
         points: list[InjectionPoint] = []
 
         parsed = urlparse(url)
@@ -83,6 +91,11 @@ class HttpProbe:
                 return points
 
         query = parse_qs(parsed.query, keep_blank_values=True)
+        # `existing` tracks names already added (for dedup). `url_existing`
+        # tracks ONLY the URL's real query params — the mining heuristics below
+        # key off it so organic additions don't flip a bare endpoint into the
+        # "full wordlist" branch.
+        url_existing = set(query.keys())
         existing = set(query.keys())
         for name, values in query.items():
             points.append(InjectionPoint(
@@ -90,6 +103,18 @@ class HttpProbe:
                 location=ParamLocation.QUERY,
                 original_value=values[0] if values else "",
             ))
+
+        # Organically discovered params (from the page itself) always get tested
+        # as query params when the URL doesn't already carry them — this is the
+        # "works on anything" path that doesn't depend on the static wordlist.
+        for name in (discovered_params or []):
+            if name not in existing:
+                existing.add(name)
+                points.append(InjectionPoint(
+                    name=name,
+                    location=ParamLocation.QUERY,
+                    original_value="1",
+                ))
 
         # Parameter mining: add common param names the URL doesn't expose.
         if guess_params:
@@ -104,7 +129,7 @@ class HttpProbe:
             # The precheck will quickly skip dead ones anyway.
             path_lower = parsed.path.lower()
             is_rest_api = (
-                not existing  # no existing query params
+                not url_existing  # no real query params on the URL
                 and not action_val
                 and any(seg in path_lower for seg in ("/api/", "/rest/", "/v1/", "/v2/", "/graphql"))
             )
@@ -112,7 +137,7 @@ class HttpProbe:
                 # Short REST-focused list: search, filter, id, q are most common SQLi vectors
                 candidate_params = ["q", "search", "query", "id", "filter", "name",
                                     "email", "username", "orderBy", "sort"]
-            elif not existing and not action_val:
+            elif not url_existing and not action_val:
                 # Generic page (no existing params, no known ?action=) — this is
                 # usually an SPA route or static-ish page. Cap the guess list so
                 # a single URL can't balloon into 90+ precheck rounds; the most
