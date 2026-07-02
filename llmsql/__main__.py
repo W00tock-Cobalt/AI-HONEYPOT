@@ -134,9 +134,18 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Path to sqlmap data/xml/payloads dir (auto-detected if not set)")
     p.add_argument("--sleep", type=int, default=3,
                    help="Sleep seconds for time-based payloads (default: 3)")
-    p.add_argument("--continue-on-found", action="store_true",
-                   help="Keep probing a parameter even after confirming SQLi "
-                        "(finds additional injection types before handing to sqlmap)")
+    # Default: keep testing every parameter on every URL, even after confirming
+    # SQLi, so the FULL set of findings is known before ever asking about sqlmap.
+    # --stop-on-first-finding restores the old "stop at the first hit" behavior
+    # for faster (but less complete) scans.
+    p.add_argument("--continue-on-found", dest="continue_on_found",
+                   action="store_true", default=True,
+                   help="(default) Keep testing all parameters/URLs to find every "
+                        "SQLi point before offering to run sqlmap")
+    p.add_argument("--stop-on-first-finding", dest="continue_on_found",
+                   action="store_false",
+                   help="Stop testing a parameter/URL as soon as one finding is "
+                        "confirmed (faster, but may miss additional injection points)")
     p.add_argument("--probe", dest="probe_alive", action="store_true",
                    help="Pre-filter dead URLs with a liveness check (auto-on for crawl input)")
     p.add_argument("--no-probe", action="store_true",

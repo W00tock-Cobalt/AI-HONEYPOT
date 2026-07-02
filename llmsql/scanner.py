@@ -183,9 +183,11 @@ class Scanner:
             )
 
         # Run param tests concurrently — big speed win when there are many params.
-        # Cap at 4 workers to avoid hammering the target.
+        # Cap at 4 workers to avoid hammering the target. This runs whether or
+        # not continue_on_found is set; the only difference is whether we
+        # cancel remaining work after the first confirmed finding.
         workers = min(4, len(points))
-        if workers > 1 and not self.continue_on_found:
+        if workers > 1:
             with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {ex.submit(_test_one, p): p for p in points}
                 for fut in _cf.as_completed(futures):
@@ -249,6 +251,11 @@ class Scanner:
         report: ScanReport,
     ) -> Optional[Finding]:
         """Test a single injection point with LLM-guided payloads."""
+        # Local to this parameter's test run (NOT shared via `report` — this
+        # method may run concurrently for other parameters on the same report,
+        # and stashing scratch state on the shared object was a real race bug).
+        interim_findings: list[Finding] = []
+
         # Quick pre-check: send a single quote before running the full payload suite.
         # If the response is identical to baseline, this param ignores the value.
         # Skip it immediately — avoids 100s of wasted requests on dead params.
@@ -474,15 +481,14 @@ class Scanner:
             # Confirmed finding — require strong evidence (0.85+)
             if score >= 0.85:
                 finding = self._build_finding(point, injected, baseline, best_evidence, score)
-                if not self.continue_on_found:
-                    return finding
-                # continue_on_found: record but keep probing for other inj types
-                if not hasattr(report, '_interim_findings'):
-                    report._interim_findings = []
-                report._interim_findings.append(finding)
-                self.on_progress(
-                    f"    [!] confirmed (score {score:.0%}) — continuing for more types"
-                )
+                if finding is not None:
+                    if not self.continue_on_found:
+                        return finding
+                    # continue_on_found: record but keep probing for other inj types
+                    interim_findings.append(finding)
+                    self.on_progress(
+                        f"    [!] confirmed (score {score:.0%}) — continuing for more types"
+                    )
 
             # LLM-guided continuation — skipped in fast mode (heuristics only)
             if self.use_llm and not self.fast and score >= 0.3:
@@ -503,11 +509,10 @@ class Scanner:
                             db_hint=decision.db_hint,
                             inj_type=decision.injection_type,
                         )
-                        if not self.continue_on_found:
-                            return finding
-                        if not hasattr(report, '_interim_findings'):
-                            report._interim_findings = []
-                        report._interim_findings.append(finding)
+                        if finding is not None:
+                            if not self.continue_on_found:
+                                return finding
+                            interim_findings.append(finding)
 
                     if decision.action == "inject" and decision.payload:
                         if decision.payload not in seen:
@@ -591,10 +596,9 @@ class Scanner:
                         point, true_ex, baseline, evidence, score,
                         inj_type=InjectionType.BOOLEAN_BLIND,
                     )
-        # If continue_on_found, return the best interim finding (or final one)
-        interim = getattr(report, '_interim_findings', [])
-        if interim:
-            return interim[-1]
+        # If continue_on_found, return the highest-confidence interim finding
+        if interim_findings:
+            return max(interim_findings, key=lambda f: f.confidence)
 
         return None
 
