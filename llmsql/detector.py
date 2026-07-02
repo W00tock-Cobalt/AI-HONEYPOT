@@ -4,7 +4,7 @@ import re
 from typing import Optional
 
 from llmsql.models import HttpExchange, InjectionType
-from llmsql.payloads import SQL_ERROR_PATTERNS
+from llmsql.payloads import NOSQL_ERROR_PATTERNS, SQL_ERROR_PATTERNS
 
 
 class SqlDetector:
@@ -12,6 +12,42 @@ class SqlDetector:
 
     def __init__(self):
         self._patterns = [re.compile(p, re.IGNORECASE) for p in SQL_ERROR_PATTERNS]
+        self._nosql_patterns = [re.compile(p, re.IGNORECASE) for p in NOSQL_ERROR_PATTERNS]
+
+    def find_nosql_errors(self, text: str) -> list[str]:
+        """Return matched NoSQL (MongoDB/MarsDB) error strings."""
+        matches = []
+        for pattern in self._nosql_patterns:
+            for m in pattern.finditer(text):
+                matches.append(m.group(0))
+        return matches
+
+    def nosql_boolean_score(
+        self,
+        baseline: HttpExchange,
+        true_exchange: HttpExchange,
+        false_exchange: HttpExchange,
+    ) -> tuple[float, str]:
+        """
+        NoSQL boolean-injection check: the 'true' payload should return more/
+        different data than the 'false' payload (and differ from baseline),
+        indicating the boolean expression altered query evaluation.
+        """
+        if any(e.status_code >= 500 for e in (true_exchange, false_exchange)):
+            return 0.0, ""
+        b_len = len(baseline.response_body)
+        t_len = len(true_exchange.response_body)
+        f_len = len(false_exchange.response_body)
+        if t_len == 0 or f_len == 0:
+            return 0.0, ""
+        tf_diff = abs(t_len - f_len) / max(t_len, f_len)
+        # true should differ from false AND from the (non-matching) baseline
+        if tf_diff > 0.15 and t_len != b_len:
+            return min(0.9, 0.55 + tf_diff), (
+                f"NoSQL boolean: true={t_len}b vs false={f_len}b "
+                f"({tf_diff:.0%} diff), baseline={b_len}b"
+            )
+        return 0.0, ""
 
     def find_sql_errors(self, text: str) -> list[str]:
         """Return matched SQL error strings."""

@@ -66,6 +66,30 @@ BOOLEAN_PAIRS = [
     ("')) UNION SELECT NULL-- -", "')) UNION SELECT NULL WHERE 1=2-- -"),
 ]
 
+# NoSQL injection — boolean true/false pairs. A "true" payload should return
+# data (match), the "false" should return none. Covers MongoDB/MarsDB (Juice
+# Shop uses MarsDB for order tracking), which sqlmap does not test.
+NOSQL_PAIRS = [
+    ("' || '1'=='1", "' || '1'=='2"),
+    ("'||'1'=='1", "'||'1'=='2"),
+    ("' || 'a'=='a", "' || 'a'=='b"),
+    ("1' || '1'=='1", "1' || '1'=='2"),
+]
+
+# NoSQL error signatures (returned when a NoSQL query is malformed)
+NOSQL_ERROR_PATTERNS = [
+    r"MongoError",
+    r"MongoServerError",
+    r"CastError",
+    r"BSONError",
+    r"BSONTypeError",
+    r"\$where",
+    r"MarsDB",
+    r"unexpected token.*in JSON",
+    r"E11000 duplicate key",
+    r"failed to parse",
+]
+
 # Regex patterns for quick pre-LLM triage
 SQL_ERROR_PATTERNS = [
     r"SQL syntax.*MySQL",

@@ -421,7 +421,12 @@ class Scanner:
             # this param is just dynamic (returns different content for any value).
             pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
             if pre_score <= star_score and pre_score < 0.6:
-                return None  # dynamic page, not SQLi-specific
+                # Before giving up on SQL, try NoSQL (MongoDB/MarsDB) — sqlmap
+                # doesn't cover it and this endpoint may be NoSQL-backed.
+                nosql_finding = self._test_nosql(
+                    url, method, data, content_type, extra_headers, point, baseline, report
+                )
+                return nosql_finding  # None if not NoSQL-injectable either
 
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
@@ -647,10 +652,59 @@ class Scanner:
                         point, true_ex, baseline, evidence, score,
                         inj_type=InjectionType.BOOLEAN_BLIND,
                     )
+
+        # NoSQL injection pair testing (fallback when SQL found nothing).
+        nosql_finding = self._test_nosql(
+            url, method, data, content_type, extra_headers, point, baseline, report
+        )
+        if nosql_finding is not None:
+            return nosql_finding
+
         # If continue_on_found, return the highest-confidence interim finding
         if interim_findings:
             return max(interim_findings, key=lambda f: f.confidence)
 
+        return None
+
+    def _test_nosql(
+        self, url, method, data, content_type, extra_headers, point, baseline, report
+    ) -> Optional[Finding]:
+        """
+        NoSQL (MongoDB/MarsDB) injection test — sqlmap doesn't cover NoSQL.
+        Sends boolean true/false pairs (' || '1'=='1' vs '2') and looks for a
+        response differential or an explicit NoSQL driver error.
+        """
+        from llmsql.payloads import NOSQL_PAIRS
+        if self.fast or not (200 <= baseline.status_code < 300):
+            return None
+        orig = point.original_value or ""
+        for true_pl, false_pl in NOSQL_PAIRS[:3]:
+            true_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + true_pl,
+            )
+            false_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + false_pl,
+            )
+            report.add_request()
+            report.add_request()
+            nerr = (self.detector.find_nosql_errors(true_ex.response_body)
+                    or self.detector.find_nosql_errors(false_ex.response_body))
+            if nerr:
+                return self._build_finding(
+                    point, true_ex, baseline,
+                    f"NoSQL error: {nerr[0][:80]}", 0.85,
+                    inj_type=InjectionType.NOSQL,
+                )
+            score, evidence = self.detector.nosql_boolean_score(
+                baseline, true_ex, false_ex
+            )
+            if score >= 0.8:
+                return self._build_finding(
+                    point, true_ex, baseline, evidence, score,
+                    inj_type=InjectionType.NOSQL,
+                )
         return None
 
     def _build_finding(
@@ -665,8 +719,9 @@ class Scanner:
     ) -> Finding:
         # PATH injection: changing a path segment almost always changes the HTTP
         # response (different route, 404, etc.) — that alone is NOT SQLi.
-        # Require actual SQL error text in the body for any path-segment finding.
-        if point.location.value == "path":
+        # Require actual SQL error text for path-segment findings, UNLESS this is
+        # a NoSQL finding (confirmed separately via boolean differential/error).
+        if point.location.value == "path" and inj_type != InjectionType.NOSQL:
             if not self.detector.find_sql_errors(injected.response_body):
                 return None
 

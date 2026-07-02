@@ -19,6 +19,7 @@ class InjectionType(str, Enum):
     TIME_BLIND = "time_blind"
     UNION_BASED = "union_based"
     STACKED = "stacked"
+    NOSQL = "nosql"
     UNKNOWN = "unknown"
 
 
