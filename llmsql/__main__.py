@@ -841,6 +841,9 @@ def _auto_discover(args, targets: list[str], console) -> None:
         depth=getattr(args, "crawl_depth", 3),
         verbose=args.verbose,
     )
+    # Record the host so a later --crawl doesn't crawl the same host again.
+    from urllib.parse import urlparse as _up_site
+    args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
 
     # ---- Merge: known-app seeds + katana crawl (+ root as last resort) ----
     known_urls = [u for _, u, _, _ in known_app_seeds]
@@ -1019,19 +1022,34 @@ def main(argv: list[str] | None = None) -> int:
         # (Authorization is in the http_probe skip list).
         headers[args.auth_header] = f"Bearer {auth_token}"
 
-    # Explicit katana crawl (--crawl): discover URLs on each seed, authenticated
-    # with whatever session (cookie/token) we just established. Runs regardless
-    # of --auto.
+    # Explicit katana crawl (--crawl): crawl each unique HOST ONCE from its root
+    # (not once per already-discovered endpoint), authenticated with whatever
+    # session we just established. Hosts already crawled by --auto are skipped.
     if args.crawl:
+        from urllib.parse import urlparse as _up_crawl
         crawl_headers = dict(headers)
         crawl_headers.setdefault("User-Agent",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+        already_crawled = getattr(args, "_crawled_hosts", set())
+        origins: list[str] = []
+        seen_hosts: set[str] = set()
+        for t in targets:
+            pr = _up_crawl(t)
+            if pr.netloc and pr.netloc not in seen_hosts:
+                seen_hosts.add(pr.netloc)
+                if pr.netloc not in already_crawled:
+                    origins.append(f"{pr.scheme}://{pr.netloc}/")
+        skipped = len(seen_hosts) - len(origins)
+        if skipped:
+            console.print(
+                f"[dim]--crawl: {skipped} host(s) already crawled by --auto, skipping[/dim]"
+            )
         seen_c = set(targets)
         added: list[str] = []
-        for seed in list(targets)[:10]:
+        for origin in origins:
             for u in katana_crawl(
-                seed, console, depth=args.crawl_depth,
+                origin, console, depth=args.crawl_depth,
                 headers=crawl_headers, cookie=args.cookie, verbose=args.verbose,
             ):
                 if u not in seen_c:
