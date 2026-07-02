@@ -273,6 +273,21 @@ class HttpProbe:
                 url, method, data, content_type, extra_headers, inject_point, payload
             )
 
+        # Ensure the Content-Type header is actually set on the wire for any
+        # request with a body. `content_type` is a Python variable, NOT an HTTP
+        # header — without this, POST/PUT JSON bodies were sent with no
+        # Content-Type, so servers (e.g. Juice Shop) never parsed them as JSON
+        # and injection into body params silently did nothing.
+        if body is not None and method.upper() != "GET":
+            has_ct = any(k.lower() == "content-type" for k in headers)
+            if not has_ct:
+                if content_type:
+                    headers["Content-Type"] = content_type
+                elif body.strip()[:1] in ("{", "["):
+                    headers["Content-Type"] = "application/json"
+                else:
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+
         start = time.perf_counter()
         try:
             resp = self._client.request(
@@ -353,8 +368,7 @@ class HttpProbe:
             obj = copy.deepcopy(json.loads(data))
             self._set_json_path(obj, point.json_path, payload)
             body = json.dumps(obj)
-            if not content_type:
-                headers["Content-Type"] = "application/json"
+            # Content-Type header is set centrally in send() now.
 
         elif point.location == ParamLocation.HEADER:
             headers[point.name] = payload
