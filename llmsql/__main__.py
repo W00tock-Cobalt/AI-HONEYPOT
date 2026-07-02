@@ -1278,6 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
 
     all_reports = []
     total_findings = 0
+    interrupted = False
     try:
         def run_one(target: str):
             # Method/body/headers from OpenAPI or known-app spec if available,
@@ -1326,33 +1327,56 @@ def main(argv: list[str] | None = None) -> int:
             console.print(
                 f"[dim]Scanning {len(targets)} targets with {args.threads} threads...[/dim]\n"
             )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as ex:
-                futures = {ex.submit(run_one, t): t for t in targets}
-                done = 0
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
+            futures = {ex.submit(run_one, t): t for t in targets}
+            done = 0
+            try:
                 for fut in concurrent.futures.as_completed(futures):
                     done += 1
-                    report = fut.result()
+                    try:
+                        report = fut.result()
+                    except Exception as e:
+                        # One bad target must never suppress the final summary.
+                        console.print(f"[yellow]Target failed: {futures[fut]} — {e}[/yellow]")
+                        continue
                     all_reports.append(report)
                     total_findings += len(report.findings)
                     console.print(
                         f"\n[bold]── ({done}/{len(targets)}):[/bold] {report.target_url}"
                     )
                     print_report(report, console)
+            except KeyboardInterrupt:
+                interrupted = True
+                for f in futures:
+                    f.cancel()
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
         else:
-            for idx, target in enumerate(targets, 1):
-                if len(targets) > 1:
-                    console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
-                report = run_one(target)
-                all_reports.append(report)
-                total_findings += len(report.findings)
-                print_report(report, console)
+            try:
+                for idx, target in enumerate(targets, 1):
+                    if len(targets) > 1:
+                        console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
+                    try:
+                        report = run_one(target)
+                    except Exception as e:
+                        console.print(f"[yellow]Target failed: {target} — {e}[/yellow]")
+                        continue
+                    all_reports.append(report)
+                    total_findings += len(report.findings)
+                    print_report(report, console)
+            except KeyboardInterrupt:
+                interrupted = True
     finally:
         probe.close()
         agent.close()
 
+    if interrupted:
+        console.print(
+            "\n[yellow]Interrupted — showing the findings collected so far.[/yellow]"
+        )
     console.print(
         f"\n[bold green]━━━ Stage 1 complete[/bold green] — "
-        f"{len(targets)} URL(s) scanned, "
+        f"{len(all_reports)} URL(s) scanned, "
         f"[bold]{total_findings}[/bold] finding(s)"
     )
     # Reconcile DB type per host (one host = one backend). This corrects
@@ -1464,7 +1488,7 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[dim]LLMSQL report saved to {args.output}[/dim]")
 
     # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
-    if args.then_sqlmap:
+    if args.then_sqlmap and not interrupted:
         if total_findings == 0:
             console.print(
                 "[yellow]No confirmed SQLi found — nothing to hand to sqlmap.[/yellow]"
