@@ -747,6 +747,13 @@ class Scanner:
         db_hint: Optional[str] = None,
         inj_type: Optional[InjectionType] = None,
     ) -> Finding:
+        # A 404 (route-not-found) response is never a SQLi confirmation. Many
+        # apps echo the payload back in a "Cannot GET /<payload>" body, which
+        # can spuriously match a SQL-error regex (e.g. a reflected
+        # `sqlite_version()` next to a JSON "error" key). The query never ran.
+        if injected.status_code == 404:
+            return None
+
         # PATH injection: changing a path segment almost always changes the HTTP
         # response (different route, 404, etc.) — that alone is NOT SQLi.
         # Require actual SQL error text for path-segment findings, UNLESS this is

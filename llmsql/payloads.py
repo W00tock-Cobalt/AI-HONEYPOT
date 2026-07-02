@@ -101,7 +101,7 @@ SQL_ERROR_PATTERNS = [
     r"PostgreSQL.*ERROR",
     r"pg_query\(\)",
     r"PSQLException",
-    r"SQLite.*error",
+    r"SQLite[0-9]?[ ._:/-]{0,2}(error|exception)",
     r"sqlite3\.OperationalError",
     r"Microsoft SQL Native Client error",
     r"ODBC SQL Server Driver",

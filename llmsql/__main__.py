@@ -1254,36 +1254,67 @@ def main(argv: list[str] | None = None) -> int:
         from urllib.parse import urlparse as _up
 
         from llmsql.report import _indent
-        tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
-        tbl.add_column("URL", no_wrap=False, max_width=70)
-        tbl.add_column("Param", style="bold yellow")
-        tbl.add_column("Type", style="cyan")
-        tbl.add_column("DB", style="green")
-        tbl.add_column("Conf")
-        # Deduplicate: same base path + param = same sink
-        seen_sinks: set[tuple[str, str]] = set()
-        unique_findings: list[tuple] = []  # (report, finding)
+
+        # Collect unique findings and GROUP THEM BY HOST so the output is linear
+        # per site (not interleaved in scan-completion order). Within a host,
+        # highest-confidence findings come first.
+        seen_sinks: set[tuple[str, str, str]] = set()
+        rows: list[tuple] = []  # (host, report, finding)
         deduped = 0
         for r in all_reports:
+            host = _up(r.target_url).netloc
             for f in r.findings:
-                sink = (_up(r.target_url).path, f.param)
+                sink = (host, _up(r.target_url).path, f.param)
                 if sink in seen_sinks:
                     deduped += 1
                     continue
                 seen_sinks.add(sink)
-                unique_findings.append((r, f))
-                tbl.add_row(
-                    r.target_url,
-                    f.param,
-                    f.injection_type.value,
-                    f.db_type or "?",
-                    f"{f.confidence:.0%}",
-                )
+                rows.append((host, r, f))
+        rows.sort(key=lambda t: (t[0], -t[2].confidence, t[2].param))
+        unique_findings = [(r, f) for _, r, f in rows]
+
+        tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
+        tbl.add_column("Host", style="magenta", no_wrap=False, max_width=32)
+        tbl.add_column("Endpoint", no_wrap=False, max_width=42)
+        tbl.add_column("Param", style="bold yellow")
+        tbl.add_column("Type", style="cyan")
+        tbl.add_column("DB", style="green")
+        tbl.add_column("Conf")
+        prev_host = None
+        for host, r, f in rows:
+            tbl.add_row(
+                host if host != prev_host else "",
+                _up(r.target_url).path,
+                f.param,
+                f.injection_type.value,
+                f.db_type or "?",
+                f"{f.confidence:.0%}",
+            )
+            prev_host = host
         console.print(tbl)
         if deduped:
             console.print(
                 f"[dim]({deduped} duplicate finding(s) collapsed — same endpoint+param)[/dim]"
             )
+
+        # Per-host breakdown: "found X SQLi for this host".
+        from collections import OrderedDict
+        per_host: "OrderedDict[str, list]" = OrderedDict()
+        for host, r, f in rows:
+            per_host.setdefault(host, []).append(f)
+        console.print("\n[bold]── Per-host SQLi summary[/bold]")
+        for host, flist in per_host.items():
+            dbs = sorted({f.db_type for f in flist if f.db_type and f.db_type != "?"})
+            db_tag = f" [green]{'/'.join(dbs)}[/green]" if dbs else ""
+            params = ", ".join(sorted({f.param for f in flist}))
+            console.print(
+                f"  [magenta]{host}[/magenta] — [bold]{len(flist)}[/bold] "
+                f"SQLi finding(s){db_tag}  [dim]({params})[/dim]"
+            )
+        console.print(
+            f"  [dim]────────[/dim]\n"
+            f"  [bold]Total: {len(rows)} finding(s) across {len(per_host)} host(s)[/bold]"
+        )
 
         # Detailed evidence per finding: PoC command + before/after responses so
         # each hit is immediately reproducible and reviewable.
