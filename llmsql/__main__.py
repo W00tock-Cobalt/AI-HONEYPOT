@@ -1249,8 +1249,11 @@ def main(argv: list[str] | None = None) -> int:
     if total_findings:
         unify_db_types(all_reports, console)
     if total_findings:
+        from rich.panel import Panel
         from rich.table import Table
         from urllib.parse import urlparse as _up
+
+        from llmsql.report import _indent
         tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
         tbl.add_column("URL", no_wrap=False, max_width=70)
         tbl.add_column("Param", style="bold yellow")
@@ -1259,6 +1262,7 @@ def main(argv: list[str] | None = None) -> int:
         tbl.add_column("Conf")
         # Deduplicate: same base path + param = same sink
         seen_sinks: set[tuple[str, str]] = set()
+        unique_findings: list[tuple] = []  # (report, finding)
         deduped = 0
         for r in all_reports:
             for f in r.findings:
@@ -1267,6 +1271,7 @@ def main(argv: list[str] | None = None) -> int:
                     deduped += 1
                     continue
                 seen_sinks.add(sink)
+                unique_findings.append((r, f))
                 tbl.add_row(
                     r.target_url,
                     f.param,
@@ -1279,6 +1284,35 @@ def main(argv: list[str] | None = None) -> int:
             console.print(
                 f"[dim]({deduped} duplicate finding(s) collapsed — same endpoint+param)[/dim]"
             )
+
+        # Detailed evidence per finding: PoC command + before/after responses so
+        # each hit is immediately reproducible and reviewable.
+        console.print("\n[bold]── Proof of Concept & evidence[/bold]")
+        for i, (r, f) in enumerate(unique_findings, 1):
+            body = (
+                f"[bold]URL:[/bold]        {f.payload_url or r.target_url}\n"
+                f"[bold]Parameter:[/bold]  {f.param} ({f.location.value})\n"
+                f"[bold]Type:[/bold]       {f.injection_type.value}   "
+                f"[bold]DB:[/bold] {f.db_type or '?'}   "
+                f"[bold]Confidence:[/bold] {f.confidence:.0%}\n"
+                f"[bold]Payload:[/bold]    {f.payload}\n"
+                f"[bold]Evidence:[/bold]   {f.evidence}"
+            )
+            if f.poc_curl:
+                body += f"\n\n[bold]PoC:[/bold]\n  [cyan]{f.poc_curl}[/cyan]"
+            if f.response_before or f.response_after:
+                body += (
+                    "\n\n[bold]Response BEFORE[/bold] [dim](baseline)[/dim]:\n"
+                    f"[dim]{_indent(f.response_before)}[/dim]"
+                    "\n\n[bold]Response AFTER[/bold] [dim](payload injected)[/dim]:\n"
+                    f"[yellow]{_indent(f.response_after)}[/yellow]"
+                )
+            sev_color = "red" if f.confidence >= 0.8 else "yellow"
+            console.print(Panel(
+                body,
+                title=f"[{sev_color}]PoC #{i} — {f.param} @ {_up(r.target_url).path}[/{sev_color}]",
+                border_style=sev_color,
+            ))
 
     if args.output:
         if len(all_reports) == 1:

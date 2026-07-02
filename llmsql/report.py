@@ -12,6 +12,15 @@ from rich.table import Table
 from llmsql.models import ScanReport, Severity
 
 
+def _indent(text: str, prefix: str = "    ", limit: int = 600) -> str:
+    """Indent a multi-line snippet and cap its length for display."""
+    text = (text or "").strip()
+    if len(text) > limit:
+        text = text[:limit] + " …"
+    lines = text.splitlines() or ["(empty)"]
+    return "\n".join(prefix + ln for ln in lines)
+
+
 def print_report(report: ScanReport, console: Console | None = None) -> None:
     """Print a human-readable scan report to the console."""
     con = console or Console()
@@ -49,6 +58,15 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
             # Append PoC curl command if available
             if f.poc_curl:
                 details += f"\n\n[bold]PoC:[/bold]\n  [cyan]{f.poc_curl}[/cyan]"
+
+            # Before/after evidence — show exactly what the payload changed.
+            if f.response_before or f.response_after:
+                details += (
+                    "\n\n[bold]Response BEFORE[/bold] [dim](baseline)[/dim]:\n"
+                    f"[dim]{_indent(f.response_before)}[/dim]"
+                    "\n\n[bold]Response AFTER[/bold] [dim](payload injected)[/dim]:\n"
+                    f"[yellow]{_indent(f.response_after)}[/yellow]"
+                )
 
             con.print(Panel(
                 details,

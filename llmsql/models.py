@@ -85,6 +85,11 @@ class Finding:
     reasoning: str = ""
     poc_curl: str = ""      # Ready-to-run curl PoC command
     poc_request: str = ""   # Raw HTTP request for the confirming exchange
+    # Before/after evidence: the clean baseline vs. the injected response so a
+    # reviewer can see exactly what the payload changed.
+    response_before: str = ""   # "HTTP <code>\n<snippet>" for the baseline
+    response_after: str = ""    # "HTTP <code>\n<snippet>" for the injected req
+    payload_url: str = ""       # The exact URL/target the payload hit
 
 
 @dataclass

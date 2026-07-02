@@ -759,6 +759,11 @@ class Scanner:
         itype = inj_type or self.detector.infer_injection_type(baseline, injected, evidence)
         severity = Severity.HIGH if confidence >= 0.8 else Severity.MEDIUM
         poc_curl, poc_req = _build_poc(injected)
+
+        def _snippet(ex: HttpExchange) -> str:
+            body = (ex.response_body or "").strip().replace("\r", "")
+            return f"HTTP {ex.status_code}\n{body[:600]}"
+
         return Finding(
             param=point.name,
             location=point.location,
@@ -770,6 +775,9 @@ class Scanner:
             db_type=db,
             poc_curl=poc_curl,
             poc_request=poc_req,
+            response_before=_snippet(baseline),
+            response_after=_snippet(injected),
+            payload_url=injected.url or "",
         )
 
     @staticmethod
