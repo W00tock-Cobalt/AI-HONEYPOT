@@ -161,8 +161,22 @@ class Scanner:
             )
             return report
 
-        # Skip auth-gated / WAF-blocked baselines — can't test unauthenticated
-        if not self.include_dead and baseline.status_code in (401, 403):
+        # Skip auth-gated / WAF-blocked baselines — can't test unauthenticated.
+        # EXCEPTION: a POST/PUT with credential-like body params (a login attempt)
+        # naturally returns 401 to wrong creds — that's the auth-bypass target,
+        # not an endpoint we lack access to. Keep testing those.
+        has_auth_field = False
+        if data:
+            _lower_data = data.lower()
+            has_auth_field = any(
+                k in _lower_data for k in
+                ('"email"', '"username"', '"user"', '"password"', '"login"',
+                 "email=", "username=", "user=", "password=", "login=")
+            )
+        is_login_attempt = method.upper() in ("POST", "PUT", "PATCH") and has_auth_field
+
+        if (not self.include_dead and baseline.status_code in (401, 403)
+                and not is_login_attempt):
             report.add_error(
                 f"Skipped: baseline HTTP {baseline.status_code} "
                 f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "

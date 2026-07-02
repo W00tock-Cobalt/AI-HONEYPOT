@@ -257,16 +257,24 @@ def probe_alive(
     headers: dict[str, str] | None = None,
     verify_ssl: bool = True,
     proxy: str | None = None,
+    keep_urls: set[str] | None = None,
 ) -> tuple[list[str], dict[str, int]]:
     """
     httpx-style liveness check. Returns (alive_urls, status_map).
-    A URL is 'alive' if it responds at all with a non-dead status.
+
+    A URL is 'alive' unless it returns a truly-dead status. Note that 405
+    (Method Not Allowed) means the endpoint EXISTS but doesn't accept GET —
+    that's exactly a POST-only endpoint (e.g. a login route), so it is NOT
+    treated as dead. URLs in `keep_urls` (known POST/PUT targets whose GET
+    probe is meaningless) are never filtered out.
     """
     import concurrent.futures
 
     import httpx
 
-    dead_statuses = {0, 404, 405, 410, 501}
+    # 405 removed: it means "endpoint exists, wrong method" = alive (POST route).
+    dead_statuses = {0, 404, 410, 501}
+    keep_urls = keep_urls or set()
     status_map: dict[str, int] = {}
 
     client_kwargs = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
@@ -276,7 +284,6 @@ def probe_alive(
     def check(url: str) -> tuple[str, int]:
         try:
             with httpx.Client(**client_kwargs) as c:
-                # Prefer GET (HEAD is often unsupported / misleading on APIs)
                 resp = c.get(url, headers=headers or {})
                 return url, resp.status_code
         except (httpx.HTTPError, OSError):
@@ -286,7 +293,10 @@ def probe_alive(
         for url, status in ex.map(check, urls):
             status_map[url] = status
 
-    alive = [u for u in urls if status_map.get(u, 0) not in dead_statuses]
+    alive = [
+        u for u in urls
+        if u in keep_urls or status_map.get(u, 0) not in dead_statuses
+    ]
     return alive, status_map
 
 
@@ -869,12 +879,20 @@ def main(argv: list[str] | None = None) -> int:
     do_probe = (args.probe_alive or crawl_mode) and not args.no_probe and len(targets) > 1
     if do_probe:
         console.print(f"[*] Probing {len(targets)} URLs for liveness (httpx-style)...")
+        # Never liveness-filter known POST/PUT/PATCH endpoints — a GET probe
+        # against them is meaningless (returns 404/405) and would wrongly drop
+        # e.g. the login SQLi endpoint before it's ever scanned.
+        keep_urls = {
+            url for url, extra in spec_extras.items()
+            if extra and extra[0] and str(extra[0]).upper() != "GET"
+        }
         alive, status_map = probe_alive(
             targets,
             threads=args.probe_threads,
             timeout=min(args.timeout, 8.0),
             headers=probe_headers,
             proxy=args.proxy,
+            keep_urls=keep_urls,
         )
         dead = len(targets) - len(alive)
         console.print(
