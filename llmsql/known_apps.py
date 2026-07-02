@@ -42,6 +42,9 @@ KNOWN_APPS: dict[str, KnownApp] = {
             # Auth-bypass SQLi in login (' OR 1=1-- style)
             ("POST", "/rest/user/login",
              '{"email":"test@test.com","password":"test"}', "application/json"),
+            # NoSQL (MarsDB) injection in the order-tracking :id path segment —
+            # a class sqlmap doesn't cover. Seeded so the path segment is tested.
+            ("GET", "/rest/track-order/1", None, None),
             # Other commonly-tested REST endpoints
             ("GET", "/rest/products/reviews?id=1", None, None),
             ("GET", "/rest/user/whoami", None, None),
