@@ -702,6 +702,11 @@ class Scanner:
             and not is_spa_like
             and point.location.value in ("query", "body", "json")
         )
+        if run_bool_blind and self._natural_variance(
+            url, method, data, content_type, extra_headers, point, baseline, report
+        ) > 0.15:
+            # Non-deterministic endpoint — boolean differential would be noise.
+            run_bool_blind = False
         if run_bool_blind:
             from llmsql.payloads import BOOLEAN_PAIRS
             for true_pl, false_pl in BOOLEAN_PAIRS[:4]:
@@ -738,6 +743,42 @@ class Scanner:
 
         return None
 
+    def _natural_variance(
+        self, url, method, data, content_type, extra_headers, point, baseline, report
+    ) -> float:
+        """How much does this endpoint's response vary on its OWN, with no
+        injection? Sends a second identical benign request and compares it to
+        the baseline (by length AND sampled content). A high value means the
+        endpoint is non-deterministic — captcha images, random tokens, rotating
+        timestamps — so any true/false 'differential' is noise, not injection.
+        """
+        orig = point.original_value or ""
+        probe = self.probe.send(
+            url, method, data, content_type, extra_headers,
+            inject_point=point, payload=orig,
+        )
+        report.add_request()
+        a = baseline.response_body or ""
+        b = probe.response_body or ""
+        m = max(len(a), len(b))
+        if m == 0:
+            return 0.0
+        len_ratio = abs(len(a) - len(b)) / m
+        # Content component: sampled char mismatch over the overlap catches
+        # random bodies that happen to be the same length (e.g. captcha SVGs).
+        n = min(len(a), len(b))
+        char_ratio = 0.0
+        if n:
+            step = max(1, n // 500)
+            checked = 0
+            mism = 0
+            for i in range(0, n, step):
+                checked += 1
+                if a[i] != b[i]:
+                    mism += 1
+            char_ratio = mism / checked if checked else 0.0
+        return max(len_ratio, char_ratio)
+
     def _test_nosql(
         self, url, method, data, content_type, extra_headers, point, baseline, report
     ) -> Optional[Finding]:
@@ -748,6 +789,12 @@ class Scanner:
         """
         from llmsql.payloads import NOSQL_PAIRS
         if self.fast or not (200 <= baseline.status_code < 300):
+            return None
+        # Skip non-deterministic endpoints (captcha/random/timestamps) — their
+        # true/false diff is noise, not a NoSQL boolean signal.
+        if self._natural_variance(
+            url, method, data, content_type, extra_headers, point, baseline, report
+        ) > 0.15:
             return None
         orig = point.original_value or ""
         for true_pl, false_pl in NOSQL_PAIRS[:3]:
