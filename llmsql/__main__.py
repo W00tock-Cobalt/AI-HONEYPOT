@@ -94,7 +94,9 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                         "fall back to katana crawl if no spec found. "
                         "Use with -u <site> for zero-config scanning.")
     p.add_argument("--data", help="POST data (form or JSON string)")
-    p.add_argument("--method", default="GET", help="HTTP method (default: GET)")
+    p.add_argument("--method", default="GET",
+                   help="HTTP method(s), comma-separated to try several "
+                        "(e.g. 'GET,POST'). Default: GET")
     p.add_argument("-H", "--header", action="append", default=[], dest="headers",
                    help="Extra header (Name: Value or Name=Value)")
     p.add_argument("--cookie", help="Cookie string (name=value; name2=value2)")
@@ -1017,27 +1019,61 @@ def main(argv: list[str] | None = None) -> int:
     if guess_params:
         console.print(f"[dim]Parameter mining: {len(guess_params)} names per URL[/dim]")
 
+    # Methods to try per target. --method may be comma-separated (e.g. GET,POST).
+    cli_methods = [m.strip().upper() for m in args.method.split(",") if m.strip()] or ["GET"]
+
+    # A synthetic JSON body for POST/PUT when the user gave no --data and the
+    # endpoint has no known spec body — gives body-param injection something
+    # to work with (common credential/search/id field names).
+    _SYNTH_BODY = (
+        '{"id":"1","email":"test@test.com","username":"test","user":"test",'
+        '"password":"test","q":"test","search":"test","name":"test"}'
+    )
+
     all_reports = []
     total_findings = 0
     try:
         def run_one(target: str):
-            # Use method/body/headers from OpenAPI spec if available, else CLI args
+            # Method/body/headers from OpenAPI or known-app spec if available,
+            # otherwise the CLI method list (which may be several methods).
             spec_data = spec_extras.get(target, (None, None, None, None))
             spec_method, spec_body, spec_ct, spec_headers = spec_data
-            # Merge: CLI headers take precedence; spec inject_headers are added
             merged_headers = dict(headers)
             if spec_headers:
                 for k, v in spec_headers.items():
                     if k not in merged_headers:
                         merged_headers[k] = v
-            return scanner.scan(
-                url=target,
-                method=spec_method or args.method,
-                data=spec_body or args.data,
-                content_type=spec_ct or content_type,
-                extra_headers=merged_headers if merged_headers else headers,
-                params=args.params,
-            )
+
+            # If the spec pins a method for this URL, use only that.
+            # Otherwise try every method the user requested.
+            methods = [spec_method] if spec_method else cli_methods
+
+            reports = []
+            for m in methods:
+                if spec_method:
+                    body, ct = spec_body, spec_ct
+                elif m == "GET":
+                    body, ct = None, None
+                else:
+                    # POST/PUT with no supplied data → synthesize a JSON body
+                    body = args.data or _SYNTH_BODY
+                    ct = content_type or "application/json"
+                reports.append(scanner.scan(
+                    url=target,
+                    method=m,
+                    data=body,
+                    content_type=ct,
+                    extra_headers=merged_headers if merged_headers else headers,
+                    params=args.params,
+                ))
+
+            # Merge multi-method reports into one for this target
+            merged = reports[0]
+            for r in reports[1:]:
+                merged.findings.extend(r.findings)
+                merged.total_requests += r.total_requests
+                merged.errors.extend(r.errors)
+            return merged
 
         if args.threads > 1 and len(targets) > 1:
             import concurrent.futures

@@ -153,6 +153,21 @@ class Scanner:
             report.duration_seconds = time.perf_counter() - start
             return report
 
+        # Target unavailable (gateway/overload errors) — the server itself is
+        # down, so runtime detection is impossible. Say so clearly rather than
+        # reporting a misleading "0 findings".
+        if baseline.status_code in (502, 503, 504):
+            report.add_error(
+                f"Target UNAVAILABLE (HTTP {baseline.status_code}) — server is "
+                f"down/overloaded/rate-limited. Cannot test at runtime; retry later."
+            )
+            self.on_progress(
+                f"[!] Target UNAVAILABLE (HTTP {baseline.status_code}) — "
+                f"server down/overloaded, cannot scan"
+            )
+            report.duration_seconds = time.perf_counter() - start
+            return report
+
         # Skip dead endpoints — no point fuzzing a route that doesn't exist
         if not self.include_dead and baseline.status_code in (0, 404, 405, 501):
             report.add_error(
