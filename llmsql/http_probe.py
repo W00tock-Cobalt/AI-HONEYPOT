@@ -33,6 +33,13 @@ _ACTION_PARAM_MAP: dict[str, list[str]] = {
 # vectors first, so a smaller slice still covers the common cases.
 _MAX_GUESS_PARAMS_GENERIC = 25
 
+# Cap on guessed params for a URL that ALREADY carries real params (from a
+# spec/crawl). We used to mine the entire wordlist here, which turned a single
+# parameterized REST endpoint into ~180 precheck requests (93 params x ~2) and
+# dominated scan time. Organic discovery already surfaces the app-specific
+# param names, so a focused slice of the most common SQLi vectors is enough.
+_MAX_GUESS_PARAMS_PARAMD = 30
+
 
 class HttpProbe:
     """Send HTTP requests with payload injection at specific points."""
@@ -144,9 +151,10 @@ class HttpProbe:
                 # common SQLi param names are listed first in COMMON_PARAMS.
                 candidate_params = list(guess_params)[:_MAX_GUESS_PARAMS_GENERIC]
             else:
-                # URL already has real params (from a spec/crawl) — worth the
-                # full mining pass since we know this endpoint takes input.
-                candidate_params = list(guess_params)
+                # URL already has real params (from a spec/crawl). Worth mining,
+                # but cap it — organic discovery covers the app-specific names,
+                # so a focused slice keeps the request count sane.
+                candidate_params = list(guess_params)[:_MAX_GUESS_PARAMS_PARAMD]
 
             seen_params = set(existing)
             for name in priority + candidate_params:
