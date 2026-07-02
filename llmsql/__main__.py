@@ -1244,6 +1244,10 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(targets)} URL(s) scanned, "
         f"[bold]{total_findings}[/bold] finding(s)"
     )
+    # Reconcile DB type per host (one host = one backend). This corrects
+    # outlier/unknown guesses and is what sqlmap's --dbms is derived from.
+    if total_findings:
+        unify_db_types(all_reports, console)
     if total_findings:
         from rich.table import Table
         from urllib.parse import urlparse as _up
@@ -1486,6 +1490,56 @@ def run_sqlmap_on_findings(
             "\n[dim]sqlmap results saved under ~/.local/share/sqlmap/output/<host>/[/dim]"
         )
     return 0
+
+
+def unify_db_types(all_reports, console=None) -> dict[str, str]:
+    """Reconcile DB type across findings for each host.
+
+    A single target host is almost always backed by ONE database engine, so
+    per-finding DB guesses that disagree (e.g. one endpoint's error text
+    happens to look SQLite-ish while the rest are clearly PostgreSQL) are noise.
+    We take a confidence-weighted vote per host, pick the dominant engine, and
+    rewrite every finding on that host to it. This also backfills findings whose
+    DB was '?'/unknown — which is what then feeds sqlmap's --dbms.
+
+    Returns {host: db_type} for the hosts that got a consensus.
+    """
+    from collections import defaultdict
+    from urllib.parse import urlparse
+
+    votes: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in all_reports:
+        host = urlparse(r.target_url).netloc
+        for f in r.findings:
+            db = (f.db_type or "").strip().lower()
+            if db and db not in ("?", "unknown"):
+                votes[host][db] += max(f.confidence, 0.1)
+
+    consensus: dict[str, str] = {}
+    for host, dbmap in votes.items():
+        if dbmap:
+            consensus[host] = max(dbmap, key=lambda k: dbmap[k])
+
+    changed = 0
+    for r in all_reports:
+        host = urlparse(r.target_url).netloc
+        cdb = consensus.get(host)
+        if not cdb:
+            continue
+        for f in r.findings:
+            if (f.db_type or "").strip().lower() != cdb:
+                f.db_type = cdb
+                changed += 1
+
+    if console and consensus:
+        for host, db in consensus.items():
+            others = sorted(k for k in votes[host] if k != db)
+            note = f" (was mixed: {', '.join([db] + others)})" if others else ""
+            console.print(
+                f"[dim]DB consensus for {host}: [bold]{db}[/bold]{note} — "
+                f"unified across findings and passed to sqlmap as --dbms[/dim]"
+            )
+    return consensus
 
 
 def _save_multi(reports, path: str) -> None:

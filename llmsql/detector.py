@@ -244,13 +244,15 @@ class SqlDetector:
             or "operator does not exist" in lower
         ):
             return "postgresql"
-        # SQLite phrasing
+        # SQLite phrasing — only genuinely SQLite-specific tokens. The old
+        # `syntax error ... near "` heuristic was removed: PostgreSQL ("syntax
+        # error at or near") and MySQL ("...syntax; ... near '...'") both use
+        # that phrasing, so it produced sqlite false positives on PG/MySQL apps.
         if (
             "unrecognized token" in lower
             or "no such table" in lower
             or "no such column" in lower
-            or "incomplete input" in lower
-            or 'syntax error' in lower and 'near "' in lower
+            or "sqlite3" in lower
         ):
             return "sqlite"
         # MySQL phrasing
