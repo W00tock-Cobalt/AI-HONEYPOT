@@ -640,56 +640,78 @@ def _auto_discover(args, targets: list[str], console) -> None:
     if not args.verbose:
         console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
 
-    # ---- Step 2: crawl to discover URLs ----------------------------------
+    # ---- Step 1.5: fingerprint well-known vulnerable training apps -------
+    # Apps like OWASP Juice Shop deliberately ship with NO OpenAPI spec, and
+    # their real endpoints are triggered by client-side JS (search boxes,
+    # login forms) that a static crawler often misses. Recognize them and
+    # seed their known-vulnerable endpoints directly instead of relying
+    # solely on the crawl.
+    known_app_seeds: list[tuple] = []  # (method, url, body, content_type)
+    try:
+        from llmsql.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
+        app_id = fingerprint(site)
+        if app_id:
+            app = KNOWN_APPS[app_id]
+            known_app_seeds = get_seed_urls(site, app_id)
+            console.print(
+                f"[green]✓ Recognized target as {app.name}[/green] — "
+                f"seeding {len(known_app_seeds)} known-vulnerable endpoint(s)"
+            )
+            for method, url, _, _ in known_app_seeds:
+                console.print(f"    [cyan]->[/cyan] {method} {url}")
+    except Exception as e:
+        console.print(f"[dim]App fingerprinting skipped: {e}[/dim]")
+
+    # ---- Step 2: crawl to discover additional URLs ------------------------
+    crawled: list[str] = []
     import shutil
     if not shutil.which("katana"):
         console.print(
-            "[yellow]katana is not installed — cannot crawl for URLs.[/yellow]\n"
+            "[yellow]katana is not installed — cannot crawl for additional URLs.[/yellow]\n"
             "[dim]Install it (https://github.com/projectdiscovery/katana) for --auto "
-            "to discover URLs automatically, or pass -l/--stdin with URLs yourself.\n"
-            "Falling back to scanning the site root with mined parameter names.[/dim]"
+            "to discover URLs automatically, or pass -l/--stdin with URLs yourself.[/dim]"
         )
-        args.guess_params = True
-        return
+    else:
+        console.print("[*] Crawling with katana to discover additional URLs...")
+        import subprocess as _sp
+        try:
+            result = _sp.run(
+                ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
+                capture_output=True, text=True, timeout=120,
+            )
+            raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+            crawled = sorted({u for u in raw if not _is_static(u)})
+            filtered = len(raw) - len(crawled)
+            if crawled:
+                console.print(
+                    f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
+                    f"[dim]({filtered} static assets filtered out)[/dim]"
+                )
+                show_n = crawled if args.verbose else crawled[:15]
+                for u in show_n:
+                    console.print(f"    [cyan]->[/cyan] {u}")
+                if len(show_n) < len(crawled):
+                    console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
+            else:
+                console.print(
+                    f"[yellow]katana ran but found no usable URLs[/yellow] "
+                    f"[dim]({len(raw)} raw hits, all static/filtered)[/dim]"
+                )
+        except Exception as e:
+            console.print(f"[yellow]katana failed to run: {e}[/yellow]")
 
-    console.print("[*] No spec found — crawling with katana to discover URLs...")
-    import subprocess as _sp
-    try:
-        result = _sp.run(
-            ["katana", "-u", site, "-jc", "-silent", "-d", "3"],
-            capture_output=True, text=True, timeout=120,
-        )
-    except Exception as e:
-        console.print(f"[yellow]katana failed to run: {e} — scanning root only[/yellow]")
-        args._auto_targets = targets
-        args.guess_params = True
-        return
+    # ---- Merge: known-app seeds + katana crawl (+ root as last resort) ----
+    known_urls = [u for _, u, _, _ in known_app_seeds]
+    combined = sorted(set(known_urls) | set(crawled))
+    if not combined:
+        console.print("[yellow]Nothing discovered — scanning root only[/yellow]")
+        combined = targets
 
-    raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-    crawled = sorted({u for u in raw if not _is_static(u)})
-    filtered = len(raw) - len(crawled)
-
-    if not crawled:
-        console.print(
-            f"[yellow]katana ran but found no usable URLs[/yellow] "
-            f"[dim]({len(raw)} raw hits, all static/filtered)[/dim] — scanning root only"
-        )
-        args._auto_targets = targets
-        args.guess_params = True
-        return
-
-    console.print(
-        f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
-        f"[dim]({filtered} static assets filtered out)[/dim]"
-    )
-    # Always show what was actually found — this is what gets scanned next.
-    show_n = crawled if args.verbose else crawled[:15]
-    for u in show_n:
-        console.print(f"    [cyan]->[/cyan] {u}")
-    if len(show_n) < len(crawled):
-        console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
-
-    args._auto_targets = crawled
+    args._auto_targets = combined
+    args._known_app_extras = {
+        url: (method, body, ct, None)
+        for method, url, body, ct in known_app_seeds
+    }
     args.guess_params = True  # crawled URLs rarely expose real params — mine them
 
 
@@ -722,6 +744,12 @@ def main(argv: list[str] | None = None) -> int:
     # OpenAPI/Swagger import — discover endpoints with their real param names
     # spec_extras maps url -> (method, body, content_type, inject_headers)
     spec_extras: dict[str, tuple[str, Optional[str], Optional[str], Optional[dict]]] = {}
+
+    # Known-app fingerprinting (from --auto) seeds well-known vulnerable
+    # endpoints with their method/body — merge those in the same way.
+    if hasattr(args, "_known_app_extras"):
+        spec_extras.update(args._known_app_extras)
+
     if args.openapi:
         from llmsql.openapi import load_openapi
         console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
