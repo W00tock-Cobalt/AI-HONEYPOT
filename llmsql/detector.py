@@ -136,24 +136,40 @@ class SqlDetector:
         evidence_parts = []
         score = 0.0
 
+        # Inert parameter: if the injected response is identical to the baseline
+        # (same status AND same body), the parameter had no effect whatsoever —
+        # it is NOT injectable. This is extremely common when param-mining /
+        # organic discovery adds extra params (callback, redirect, ...) to an
+        # endpoint that ignores them; without this guard every such param on an
+        # already-erroring endpoint got falsely flagged via the reflection check.
+        # EXCEPTION: time-based blind injection returns an identical body but a
+        # delayed response — never short-circuit when a sleep is expected or the
+        # response is anomalously slow, or we'd miss time-based SQLi.
+        _delay = injected.response_time_ms - baseline.response_time_ms
+        _timing_suspect = injected.expected_sleep_ms is not None or _delay > 4500
+        if (injected.status_code == baseline.status_code
+                and injected.response_body == baseline.response_body
+                and not _timing_suspect):
+            return 0.0, ""
+
         baseline_errors = self.find_sql_errors(baseline.response_body)
         baseline_broken = bool(baseline_errors)
 
         # SQL errors in injected response.
         # If the baseline is already erroring (e.g. OpenAPI placeholder `test`
-        # used as a raw SQL param), only flag when the injected error is
-        # *different* from the baseline error — same error = param was already
-        # broken before injection, not a new SQLi trigger.
+        # used as a raw SQL param), only a *new* error (different text) is a
+        # genuine SQLi signal. `new_errors` is the genuine-signal set used
+        # everywhere below so pre-existing baseline errors never trigger a find.
         errors = self.find_sql_errors(injected.response_body)
+        new_errors = (
+            [e for e in errors if e not in baseline_errors] if baseline_broken else errors
+        )
         if errors:
             if not baseline_broken:
                 # Clean baseline → any SQL error is a finding
                 score = max(score, 0.85)
                 evidence_parts.append(f"SQL error: {errors[0][:120]}")
             else:
-                # Baseline already has SQL errors; only flag if the injected
-                # error text is materially different (new error appeared)
-                new_errors = [e for e in errors if e not in baseline_errors]
                 if new_errors:
                     score = max(score, 0.85)
                     evidence_parts.append(f"SQL error (new): {new_errors[0][:120]}")
@@ -168,7 +184,7 @@ class SqlDetector:
         # With SQL errors it strongly confirms (0.6); without, weak signal (0.45).
         if baseline.status_code != injected.status_code:
             if injected.status_code >= 500:
-                score = max(score, 0.6 if errors else 0.45)
+                score = max(score, 0.6 if new_errors else 0.45)
                 evidence_parts.append(
                     f"Status {baseline.status_code} -> {injected.status_code}"
                 )
@@ -230,11 +246,13 @@ class SqlDetector:
             score = max(score, 0.6)
             evidence_parts.append(f"Unexpected delay +{delay:.0f}ms")
 
-        # Payload reflected with error context
-        if injected.payload and injected.payload in injected.response_body:
-            if errors:
-                score = max(score, 0.9)
-                evidence_parts.append("Payload reflected with SQL error")
+        # Payload reflected with error context — must be a NEW error, not the
+        # baseline's pre-existing one, and the payload must be more than a lone
+        # metacharacter (a bare " trivially appears inside `at or near "1"`).
+        if (injected.payload and len(injected.payload.strip()) >= 2
+                and injected.payload in injected.response_body and new_errors):
+            score = max(score, 0.9)
+            evidence_parts.append("Payload reflected with SQL error")
 
         return score, "; ".join(evidence_parts) if evidence_parts else ""
 

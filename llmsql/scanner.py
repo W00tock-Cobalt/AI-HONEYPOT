@@ -368,6 +368,23 @@ class Scanner:
                     inj_type=InjectionType.BOOLEAN_BLIND,
                 )
 
+        # When the baseline ALREADY errors (e.g. a raw-SQL endpoint like
+        # /api/testimonials/count?query=1 that concatenates the value straight
+        # into SQL), the normal precheck below is skipped. Do a one-shot inert
+        # check so mined/organic params the endpoint simply ignores are dropped
+        # after a single request — this both saves the full payload suite and
+        # kills the "identical-to-baseline" reflection false positives.
+        if self._precheck and self.detector.baseline_already_erroring(baseline):
+            orig = point.original_value or ""
+            inert_probe = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + "'",
+            )
+            report.add_request()
+            if (inert_probe.status_code == baseline.status_code
+                    and inert_probe.response_body == baseline.response_body):
+                return None  # param has no effect — identical to baseline
+
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
             # Inject relative to the ORIGINAL value, not by replacing it. Real
             # SQLi context is preserved by appending: for q=apple the probe
