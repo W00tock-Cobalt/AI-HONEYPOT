@@ -506,12 +506,23 @@ class Scanner:
             # this param is just dynamic (returns different content for any value).
             pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
             if pre_score <= star_score and pre_score < 0.6:
-                # Before giving up on SQL, try NoSQL (MongoDB/MarsDB) — sqlmap
-                # doesn't cover it and this endpoint may be NoSQL-backed.
-                nosql_finding = self._test_nosql(
+                # Ambiguous: the quote and the wildcard perturb the page about
+                # equally, which looks like a merely-dynamic param — but it can
+                # also be a BLIND injection where any wrong value returns an
+                # empty page. Use the sqlmap-style boolean ratio test to tell
+                # them apart (TRUE ~= original AND FALSE != original), then fall
+                # back to NoSQL. Both no-op cheaply on genuinely dynamic pages.
+                if (200 <= baseline.status_code < 300
+                        and point.location.value in ("query", "body", "json")):
+                    bfind = self._boolean_ratio_detect(
+                        url, method, data, content_type, extra_headers,
+                        point, baseline, report,
+                    )
+                    if bfind is not None:
+                        return bfind
+                return self._test_nosql(
                     url, method, data, content_type, extra_headers, point, baseline, report
-                )
-                return nosql_finding  # None if not NoSQL-injectable either
+                )  # None if not NoSQL-injectable either
 
         if self._seed_payloads is not None:
             payloads = list(self._seed_payloads)
@@ -715,45 +726,15 @@ class Scanner:
             and point.location.value in ("query", "body", "json")
             and 200 <= baseline.status_code < 300
         )
-        if run_bool_blind and self._natural_variance(
-            url, method, data, content_type, extra_headers, point, baseline, report
-        ) > 0.15:
-            # Non-deterministic endpoint — boolean differential would be noise.
-            run_bool_blind = False
         if run_bool_blind:
-            from llmsql.payloads import BOOLEAN_AMPLIFY_PAIRS, BOOLEAN_PAIRS
-            orig = point.original_value or ""
-            # Postfix pairs: (true/OR-grows, false/AND-shrinks). Amplification
-            # pairs come first — they're the strongest error-free signal.
-            pairs = BOOLEAN_AMPLIFY_PAIRS[:3] + BOOLEAN_PAIRS[:3]
-            for true_pl, false_pl in pairs:
-                true_ex = self.probe.send(
-                    url, method, data, content_type, extra_headers,
-                    inject_point=point, payload=orig + true_pl,
-                )
-                false_ex = self.probe.send(
-                    url, method, data, content_type, extra_headers,
-                    inject_point=point, payload=orig + false_pl,
-                )
-                report.add_request()
-                report.add_request()
-                # Take the stronger of: OR/AND amplification (Nuclei-style) or
-                # the classic true≈baseline / true≠false differential.
-                amp_score, amp_ev = self.detector.boolean_amplification_score(
-                    baseline, true_ex, false_ex
-                )
-                blind_score, blind_ev = self.detector.boolean_blind_score(
-                    baseline, true_ex, false_ex
-                )
-                if amp_score >= blind_score:
-                    score, evidence = amp_score, amp_ev
-                else:
-                    score, evidence = blind_score, blind_ev
-                if score >= 0.85:
-                    return self._build_finding(
-                        point, true_ex, baseline, evidence, score,
-                        inj_type=InjectionType.BOOLEAN_BLIND,
-                    )
+            # sqlmap-style: content-similarity ratios with dynamic-content
+            # removal (see _boolean_ratio_detect / compare.py). This replaces
+            # the old length-only comparison + reject-on-noise approach.
+            bfind = self._boolean_ratio_detect(
+                url, method, data, content_type, extra_headers, point, baseline, report
+            )
+            if bfind is not None:
+                return bfind
 
         # NoSQL injection pair testing (fallback when SQL found nothing).
         nosql_finding = self._test_nosql(
@@ -766,6 +747,80 @@ class Scanner:
         if interim_findings:
             return max(interim_findings, key=lambda f: f.confidence)
 
+        return None
+
+    def _boolean_ratio_detect(
+        self, url, method, data, content_type, extra_headers, point, baseline, report,
+    ) -> Optional[Finding]:
+        """sqlmap-style boolean-blind detection via content-similarity ratios.
+
+        1. Send the benign value twice, diff the two responses to find dynamic
+           regions (timestamps/tokens) and build a cleaned page template.
+        2. If the page is still unstable after stripping, it's too dynamic — bail.
+        3. For each AND-based pair (TRUE keeps the original result, FALSE empties
+           it), postfix it to the value, strip dynamic content, and compare the
+           similarity ratio to the template: a genuine boolean injection shows
+           TRUE ~= original while FALSE clearly diverges (the classic sqlmap
+           signal), OR the OR-amplification grow/shrink asymmetry.
+        """
+        from llmsql.compare import (
+            DIFF_TOLERANCE, HEAVILY_DYNAMIC_BOUND, UPPER_RATIO_BOUND,
+            find_dynamic_markers, ratio, remove_dynamic,
+        )
+        from llmsql.payloads import BOOLEAN_AND_PAIRS, BOOLEAN_AMPLIFY_PAIRS
+        orig = point.original_value or ""
+
+        # 1+2. Dynamic-content markers from two identical benign requests.
+        b2 = self.probe.send(
+            url, method, data, content_type, extra_headers,
+            inject_point=point, payload=orig,
+        )
+        report.add_request()
+        markers = find_dynamic_markers(baseline.response_body, b2.response_body)
+        template = remove_dynamic(baseline.response_body, markers)
+        self_ratio = ratio(template, remove_dynamic(b2.response_body, markers))
+        if self_ratio < HEAVILY_DYNAMIC_BOUND:
+            return None  # heavily dynamic even after stripping — unreliable
+
+        # 3. AND-based ratio test + OR amplification, sharing the same requests.
+        pairs = BOOLEAN_AND_PAIRS[:4]
+        amp_pairs = BOOLEAN_AMPLIFY_PAIRS[:2]
+        for i, (true_pl, false_pl) in enumerate(pairs):
+            true_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + true_pl,
+            )
+            false_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + false_pl,
+            )
+            report.add_request()
+            report.add_request()
+            # A 500 means we broke syntax → error-based territory, not boolean.
+            if true_ex.status_code >= 500 or false_ex.status_code >= 500:
+                continue
+            if true_ex.status_code != baseline.status_code:
+                continue
+            tr = ratio(template, remove_dynamic(true_ex.response_body, markers))
+            fr = ratio(template, remove_dynamic(false_ex.response_body, markers))
+            # TRUE resembles the original page; FALSE clearly diverges from it.
+            if tr >= UPPER_RATIO_BOUND and fr < UPPER_RATIO_BOUND and (tr - fr) > DIFF_TOLERANCE:
+                ev = (f"Boolean blind (content ratio): TRUE~original={tr:.2f}, "
+                      f"FALSE={fr:.2f} (Δ{tr - fr:.2f}); dynamic content stripped")
+                return self._build_finding(
+                    point, true_ex, baseline, ev, min(0.95, 0.8 + (tr - fr)),
+                    inj_type=InjectionType.BOOLEAN_BLIND,
+                )
+            # OR-amplification (TRUE returns many more rows than FALSE).
+            if i < len(amp_pairs):
+                amp, amp_ev = self.detector.boolean_amplification_score(
+                    baseline, true_ex, false_ex
+                )
+                if amp >= 0.85:
+                    return self._build_finding(
+                        point, true_ex, baseline, amp_ev, amp,
+                        inj_type=InjectionType.BOOLEAN_BLIND,
+                    )
         return None
 
     def _boolean_amplify_probe(

@@ -79,6 +79,20 @@ BOOLEAN_AMPLIFY_PAIRS = [
     ("' OR '1'='1'-- -", "' AND '1'='2'-- -"),
 ]
 
+# Classic AND-based boolean pairs for the sqlmap-style RATIO test: the TRUE
+# form keeps the query result identical to the original (page ~ unchanged),
+# the FALSE form makes it return nothing (page diverges). Detection compares
+# content-similarity ratios (TRUE≈original, FALSE≠original) rather than length,
+# after stripping dynamic content — so it works on pages with timestamps/tokens
+# and on blind injections that never grow/shrink the body dramatically.
+BOOLEAN_AND_PAIRS = [
+    (" AND 1=1-- -", " AND 1=2-- -"),
+    ("' AND '1'='1", "' AND '1'='2"),
+    ("' AND '1'='1'-- -", "' AND '1'='2'-- -"),
+    ("') AND ('1'='1", "') AND ('1'='2"),
+    ('" AND "1"="1', '" AND "1"="2'),
+]
+
 # NoSQL injection — boolean true/false pairs. A "true" payload should return
 # data (match), the "false" should return none. Covers MongoDB/MarsDB (Juice
 # Shop uses MarsDB for order tracking), which sqlmap does not test.
