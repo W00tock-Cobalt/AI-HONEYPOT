@@ -1446,9 +1446,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"  [magenta]{host}[/magenta] — [bold]{len(flist)}[/bold] "
                 f"SQLi finding(s){db_tag}  [dim]({params})[/dim]"
             )
+        from collections import Counter as _Counter
+        _types = _Counter(f.injection_type.value for _, _r, f in rows)
+        _type_break = ", ".join(f"{t}: {n}" for t, n in _types.most_common())
         console.print(
             f"  [dim]────────[/dim]\n"
             f"  [bold]Total: {len(rows)} finding(s) across {len(per_host)} host(s)[/bold]"
+            f"  [dim]({_type_break})[/dim]"
         )
 
         # Detailed evidence per finding: PoC command + before/after responses so
@@ -1542,6 +1546,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.sqlmap_timeout,
             spec_extras=spec_extras,
         )
+
+    # Final rollup — the last, unambiguous "how many did we find" statement.
+    print_rollup(all_reports, console)
 
     return 1 if total_findings else 0
 
@@ -1740,6 +1747,54 @@ def unify_db_types(all_reports, console=None) -> dict[str, str]:
                 f"unified across findings and passed to sqlmap as --dbms[/dim]"
             )
     return consensus
+
+
+def print_rollup(all_reports, console) -> None:
+    """Print the final rollup: total SQLi, breakdown by injection type, and by
+    host. This is intentionally the LAST thing shown so 'how many did we find'
+    is unambiguous (e.g. 'Found 10 SQL injection point(s)')."""
+    from collections import Counter, OrderedDict
+    from urllib.parse import urlparse as _up
+
+    from rich.panel import Panel
+
+    # Dedup to unique sinks (host, path, param) so the count matches the table.
+    seen: set[tuple] = set()
+    findings: list[tuple] = []  # (host, finding)
+    for r in all_reports:
+        host = _up(r.target_url).netloc
+        for f in r.findings:
+            sink = (host, _up(r.target_url).path, f.param)
+            if sink in seen:
+                continue
+            seen.add(sink)
+            findings.append((host, f))
+
+    total = len(findings)
+    if total == 0:
+        console.print(Panel.fit(
+            "[bold]No SQL injection points confirmed.[/bold]",
+            title="LLMSQL Result", border_style="green",
+        ))
+        return
+
+    by_type = Counter(f.injection_type.value for _, f in findings)
+    hosts = OrderedDict()
+    for host, f in findings:
+        hosts.setdefault(host, 0)
+        hosts[host] += 1
+
+    type_line = "  ".join(f"[cyan]{t}[/cyan]:{n}" for t, n in by_type.most_common())
+    host_lines = "\n".join(
+        f"  • [magenta]{h}[/magenta]: [bold]{n}[/bold] SQLi" for h, n in hosts.items()
+    )
+    console.print(Panel.fit(
+        f"[bold red]Found {total} SQL injection point(s)[/bold red] "
+        f"across [bold]{len(hosts)}[/bold] host(s)\n"
+        f"[bold]By type:[/bold] {type_line}\n"
+        f"[bold]By host:[/bold]\n{host_lines}",
+        title="LLMSQL Result — Rollup", border_style="red",
+    ))
 
 
 def _save_multi(reports, path: str) -> None:

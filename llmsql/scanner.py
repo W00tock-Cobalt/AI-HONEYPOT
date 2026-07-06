@@ -736,6 +736,16 @@ class Scanner:
             if bfind is not None:
                 return bfind
 
+        # UNION-based detection (reflected marker) — run on params that reacted
+        # to injection (best_score >= 0.3) so it's bounded, not on every param.
+        if (not self.fast and best_score >= 0.3
+                and point.location.value in ("query", "body", "json")):
+            ufind = self._test_union(
+                url, method, data, content_type, extra_headers, point, baseline, report
+            )
+            if ufind is not None:
+                return ufind
+
         # NoSQL injection pair testing (fallback when SQL found nothing).
         nosql_finding = self._test_nosql(
             url, method, data, content_type, extra_headers, point, baseline, report
@@ -889,6 +899,45 @@ class Scanner:
                     mism += 1
             char_ratio = mism / checked if checked else 0.0
         return max(len_ratio, char_ratio)
+
+    def _test_union(
+        self, url, method, data, content_type, extra_headers, point, baseline, report,
+    ) -> Optional[Finding]:
+        """UNION-based detection via a reflected marker.
+
+        Appends ``UNION SELECT '<marker>',...`` with a distinctive marker in
+        every column, trying a few boundary contexts and column counts. If the
+        marker shows up in the response, the query executed our UNION and echoed
+        our data — an unambiguous UNION SQLi (and it tells us the column count).
+        Low false-positive by construction: a random marker only appears if the
+        injection actually worked.
+        """
+        if self.fast:
+            return None
+        marker = "qLmSqLu9182x"
+        if marker in (baseline.response_body or ""):
+            return None
+        orig = point.original_value or ""
+        # Common query contexts: string-quoted, numeric, double-quoted.
+        boundaries = ["'", "", '"']
+        max_cols = 5
+        for prefix in boundaries:
+            for n in range(1, max_cols + 1):
+                cols = ",".join(["'%s'" % marker] * n)
+                payload = "%s%s UNION SELECT %s-- -" % (orig, prefix, cols)
+                ex = self.probe.send(
+                    url, method, data, content_type, extra_headers,
+                    inject_point=point, payload=payload,
+                )
+                report.add_request()
+                if marker in (ex.response_body or ""):
+                    ev = ("UNION-based SQLi: injected marker reflected "
+                          "(%d column(s), boundary %r)" % (n, prefix or "numeric"))
+                    return self._build_finding(
+                        point, ex, baseline, ev, 0.95,
+                        inj_type=InjectionType.UNION_BASED,
+                    )
+        return None
 
     def _test_nosql(
         self, url, method, data, content_type, extra_headers, point, baseline, report
