@@ -1100,6 +1100,13 @@ class Scanner:
         if injected.status_code == 404:
             return None
 
+        # Infrastructure/upstream failure (gateway 502/503/504, connection
+        # refused, Envoy/nginx upstream reset) is NOT SQLi — the request didn't
+        # reach a working backend. A payload that merely knocks the upstream
+        # over (or a transient mesh error) must never be confirmed.
+        if self.detector.is_infra_error(injected):
+            return None
+
         # PATH injection: changing a path segment almost always changes the HTTP
         # response (different route, 404, etc.) — that alone is NOT SQLi.
         # Require actual SQL error text for path-segment findings, UNLESS this is

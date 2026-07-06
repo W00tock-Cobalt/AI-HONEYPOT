@@ -63,13 +63,25 @@ class SqlDetector:
 
     _CONN_REFUSED = re.compile(
         r"ECONNREFUSED|connection refused|connect ECONNREFUSED|"
-        r"ETIMEDOUT|ENOTFOUND|socket hang up",
+        r"ETIMEDOUT|ENOTFOUND|socket hang up|"
+        # Proxy/mesh (Envoy/Istio/nginx) upstream failures — infra, not SQLi.
+        r"upstream connect error|reset reason|delayed connect error|"
+        r"no healthy upstream|upstream request timeout|"
+        r"502 bad gateway|503 service|service unavailable|gateway time-?out",
         re.IGNORECASE,
     )
 
     def is_db_offline(self, exchange: HttpExchange) -> bool:
-        """True when the response indicates the DB/backend is unreachable."""
-        return bool(self._CONN_REFUSED.search(exchange.response_body))
+        """True when the response indicates the DB/backend/upstream is unreachable."""
+        return bool(self._CONN_REFUSED.search(exchange.response_body or ""))
+
+    def is_infra_error(self, exchange: HttpExchange) -> bool:
+        """True for gateway/upstream failures that are NOT application-level and
+        therefore never a SQL-injection signal (502/503/504, connection reset,
+        upstream connect error, ...). The request never reached a working app."""
+        if exchange.status_code in (502, 503, 504):
+            return True
+        return self.is_db_offline(exchange)
 
     _PASSWORD_INPUT = re.compile(r'type=["\']?password', re.IGNORECASE)
 
@@ -227,7 +239,12 @@ class SqlDetector:
         # Status change: 200→500 is always interesting.
         # With SQL errors it strongly confirms (0.6); without, weak signal (0.45).
         if baseline.status_code != injected.status_code:
-            if injected.status_code >= 500:
+            # Gateway/upstream errors (502/503/504) and connection failures are
+            # infrastructure problems, NOT SQL injection — the request never
+            # reached a working app/DB. Never score them.
+            if self.is_infra_error(injected):
+                pass
+            elif injected.status_code >= 500:
                 score = max(score, 0.6 if new_errors else 0.45)
                 evidence_parts.append(
                     f"Status {baseline.status_code} -> {injected.status_code}"
