@@ -164,6 +164,7 @@ class HttpProbe:
                         name=name,
                         location=ParamLocation.QUERY,
                         original_value="1",
+                        mined=True,  # speculative wordlist guess
                     ))
 
         if test_path:

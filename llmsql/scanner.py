@@ -428,12 +428,15 @@ class Scanner:
                 # rows, AND '1'='2 returns none) with no error or status change.
                 # One OR/AND amplification pair catches that Nuclei-style case
                 # before we give up on the param.
-                if (200 <= baseline.status_code < 300
+                # A param that looks inert to '/'*' probes can still be a BLIND
+                # injection (boolean/time) with no error and no content change.
+                # Run the blind battery before giving up — BUT only for REAL
+                # params (URL/organic/spec), not the dozens of speculative
+                # wordlist guesses, or a single endpoint balloons into thousands
+                # of requests. Mined guesses that look dead are simply dropped.
+                if (not point.mined
+                        and 200 <= baseline.status_code < 300
                         and point.location.value in ("query", "body", "json")):
-                    # A param that looks inert to '/'*' probes can still be a
-                    # BLIND injection (boolean or time-based) with no error and
-                    # no content change. Run the blind battery before giving up
-                    # — both are cheap on genuinely inert params (fast requests).
                     bfind = self._boolean_ratio_detect(
                         url, method, data, content_type, extra_headers,
                         point, baseline, report,
@@ -522,7 +525,8 @@ class Scanner:
                 # empty page. Use the sqlmap-style boolean ratio test to tell
                 # them apart (TRUE ~= original AND FALSE != original), then fall
                 # back to NoSQL. Both no-op cheaply on genuinely dynamic pages.
-                if (200 <= baseline.status_code < 300
+                if (not point.mined
+                        and 200 <= baseline.status_code < 300
                         and point.location.value in ("query", "body", "json")):
                     bfind = self._boolean_ratio_detect(
                         url, method, data, content_type, extra_headers,
@@ -765,8 +769,10 @@ class Scanner:
                 return ufind
 
         # Time-based blind (fallback): catches blind injections with no error
-        # and no content change. Cheap on non-injectable params.
-        if not self.fast and point.location.value in ("query", "body", "json"):
+        # and no content change. Skip speculative mined guesses unless they
+        # actually reacted (best_score) to keep request volume bounded.
+        if (not self.fast and point.location.value in ("query", "body", "json")
+                and (not point.mined or best_score >= 0.3)):
             tfind = self._test_time_based(
                 url, method, data, content_type, extra_headers, point, baseline, report
             )
@@ -801,11 +807,16 @@ class Scanner:
            signal), OR the OR-amplification grow/shrink asymmetry.
         """
         from llmsql.compare import (
-            DIFF_TOLERANCE, HEAVILY_DYNAMIC_BOUND, UPPER_RATIO_BOUND,
-            find_dynamic_markers, ratio, remove_dynamic,
+            DIFF_TOLERANCE, HEAVILY_DYNAMIC_BOUND, MIN_STABLE_PAGE,
+            UPPER_RATIO_BOUND, find_dynamic_markers, ratio, remove_dynamic,
         )
         from llmsql.payloads import BOOLEAN_AND_PAIRS, BOOLEAN_AMPLIFY_PAIRS
         orig = point.original_value or ""
+
+        # Tiny responses make ratio comparison meaningless (a 1-byte "1" flips
+        # between ratio 0.0 and 1.0 on any change) — skip the ratio test.
+        if len(baseline.response_body or "") < MIN_STABLE_PAGE:
+            return None
 
         # 1+2. Dynamic-content markers from two identical benign requests.
         b2 = self.probe.send(
@@ -815,6 +826,8 @@ class Scanner:
         report.add_request()
         markers = find_dynamic_markers(baseline.response_body, b2.response_body)
         template = remove_dynamic(baseline.response_body, markers)
+        if len(template) < MIN_STABLE_PAGE:
+            return None
         self_ratio = ratio(template, remove_dynamic(b2.response_body, markers))
         if self_ratio < HEAVILY_DYNAMIC_BOUND:
             return None  # heavily dynamic even after stripping — unreliable

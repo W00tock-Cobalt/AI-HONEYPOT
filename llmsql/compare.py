@@ -34,6 +34,10 @@ DYNAMICITY_MARK_LENGTH = 32
 # Below this ratio between two IDENTICAL requests, the page is "heavily dynamic"
 # and even after stripping we can't trust a content comparison.
 HEAVILY_DYNAMIC_BOUND = 0.90
+# Content-ratio comparison is unreliable on very short bodies (e.g. a 1-byte
+# "1"): a single differing char swings the ratio between 0.0 and 1.0, producing
+# false positives. Require at least this many chars before trusting the ratio.
+MIN_STABLE_PAGE = 24
 
 
 def ratio(a: str | None, b: str | None) -> float:

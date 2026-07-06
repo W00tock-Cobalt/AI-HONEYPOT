@@ -40,6 +40,10 @@ class InjectionPoint:
     original_value: str
     json_path: Optional[str] = None   # e.g. "user.name" for nested JSON bodies
     path_index: Optional[int] = None  # URL path segment index for PATH injection
+    # True when this point came from generic wordlist mining (guess_params),
+    # as opposed to a real URL/organic/spec param. Used to avoid running the
+    # expensive blind battery on dozens of speculative guessed params.
+    mined: bool = False
 
 
 @dataclass
