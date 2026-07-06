@@ -109,6 +109,14 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                         "--cookie/--login session is set)")
     p.add_argument("--crawl-depth", type=int, default=3,
                    help="katana crawl depth for --auto/--crawl (default: 3)")
+    p.add_argument("--brute", action="store_true",
+                   help="Brute-force common web/API paths to discover endpoints "
+                        "organically (soft-404 aware). On by default in --auto.")
+    p.add_argument("--no-brute", action="store_true",
+                   help="Disable the default path brute-forcing in --auto mode")
+    p.add_argument("--brute-wordlist", metavar="FILE",
+                   help="Custom path wordlist for --brute (e.g. a SecLists file); "
+                        "merged with the built-in list")
     p.add_argument("--data", help="POST data (form or JSON string)")
     p.add_argument("--method", default="GET",
                    help="HTTP method(s), comma-separated to try several "
@@ -219,6 +227,16 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--then-sqlmap", action="store_true",
                    help="Scan with LLMSQL first, then run sqlmap ONLY on the confirmed "
                         "injectable URLs (fast + deep exploitation of real hits)")
+
+    # nuclei handoff — multi-class DAST breadth on discovered URLs
+    p.add_argument("--nuclei", action="store_true",
+                   help="After scanning, run nuclei DAST templates on the "
+                        "discovered URLs for multi-class coverage (sqli/xss/ssti/...)")
+    p.add_argument("--nuclei-tags", default="sqli,dast",
+                   help="nuclei -tags to run (default: sqli,dast). e.g. "
+                        "'sqli,xss,ssti,lfi,redirect'")
+    p.add_argument("--nuclei-args", default="",
+                   help="Extra args appended to the nuclei command")
     p.add_argument("--ask", action="store_true",
                    help="After Stage 1, show all findings and ask before launching sqlmap")
     p.add_argument("--sqlmap-timeout", type=int, default=0,
@@ -851,9 +869,43 @@ def _auto_discover(args, targets: list[str], console) -> None:
     from urllib.parse import urlparse as _up_site
     args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
 
-    # ---- Merge: known-app seeds + katana crawl (+ root as last resort) ----
+    # ---- Step 3: organic path brute-forcing (content discovery) ----------
+    # Discover injectable endpoints (/api/products/search, /api/.../count, ...)
+    # by probing a wordlist — no per-app hardcoding needed. Soft-404 aware so
+    # SPAs don't flood us with false hits. On by default in --auto.
+    bruted: list[str] = []
+    if not getattr(args, "no_brute", False):
+        from llmsql.content_discovery import discover_paths
+        extra_words = None
+        wl = getattr(args, "brute_wordlist", None)
+        if wl:
+            try:
+                with open(wl) as f:
+                    extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            except OSError as e:
+                console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+        try:
+            bruted = discover_paths(
+                site,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                extra_words=extra_words,
+                on_status=lambda m: console.print(m),
+            )
+        except Exception as e:
+            console.print(f"[yellow]Content discovery failed: {e}[/yellow]")
+        if bruted:
+            console.print(
+                f"[green]✓ Brute-force found {len(bruted)} live path(s)[/green]"
+            )
+            show_b = bruted if args.verbose else bruted[:15]
+            for u in show_b:
+                console.print(f"    [cyan]->[/cyan] {u}")
+            if len(show_b) < len(bruted):
+                console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
+
+    # ---- Merge: known-app seeds + katana crawl + brute (+ root as last resort) ----
     known_urls = [u for _, u, _, _ in known_app_seeds]
-    combined = sorted(set(known_urls) | set(crawled))
+    combined = sorted(set(known_urls) | set(crawled) | set(bruted))
     if not combined:
         console.print("[yellow]Nothing discovered — scanning root only[/yellow]")
         combined = targets
@@ -1074,6 +1126,42 @@ def main(argv: list[str] | None = None) -> int:
         if added:
             console.print(f"[green]✓ Crawl added {len(added)} new target(s)[/green]")
             targets = targets + added
+
+    # Explicit path brute-forcing (--brute without --auto): discover endpoints
+    # organically on each unique host.
+    if args.brute and not auto_on:
+        from urllib.parse import urlparse as _up_b
+
+        from llmsql.content_discovery import discover_paths
+        extra_words = None
+        if args.brute_wordlist:
+            try:
+                with open(args.brute_wordlist) as f:
+                    extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            except OSError as e:
+                console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+        b_headers = dict(headers)
+        b_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        seen_hosts_b: set[str] = set()
+        seen_b = set(targets)
+        added_b: list[str] = []
+        for t in list(targets):
+            host = _up_b(t).netloc
+            if host in seen_hosts_b:
+                continue
+            seen_hosts_b.add(host)
+            root = f"{_up_b(t).scheme}://{host}/"
+            for u in discover_paths(
+                root, headers=b_headers, proxy=args.proxy,
+                extra_words=extra_words, on_status=lambda m: console.print(m),
+            ):
+                if u not in seen_b:
+                    seen_b.add(u)
+                    added_b.append(u)
+        if added_b:
+            console.print(f"[green]✓ Brute-force added {len(added_b)} target(s)[/green]")
+            targets = targets + added_b
 
     # Organic target expansion: crawl the seed page(s) one level to add the
     # forms/links they point at as scan targets. Skipped for large crawl lists
@@ -1547,6 +1635,19 @@ def main(argv: list[str] | None = None) -> int:
             spec_extras=spec_extras,
         )
 
+    # nuclei DAST breadth on everything we discovered/scanned.
+    if args.nuclei and not interrupted:
+        nuclei_targets = [r.target_url for r in all_reports] or targets
+        run_nuclei(
+            nuclei_targets,
+            tags=args.nuclei_tags,
+            extra_args=args.nuclei_args,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            timeout=args.sqlmap_timeout,
+        )
+
     # Final rollup — the last, unambiguous "how many did we find" statement.
     print_rollup(all_reports, console)
 
@@ -1795,6 +1896,52 @@ def print_rollup(all_reports, console) -> None:
         f"[bold]By host:[/bold]\n{host_lines}",
         title="LLMSQL Result — Rollup", border_style="red",
     ))
+
+
+def run_nuclei(
+    targets: list[str],
+    tags: str,
+    extra_args: str,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+    out_file: str = "llmsql-nuclei-urls.txt",
+    timeout: int = 0,
+) -> int:
+    """Run nuclei DAST templates over the discovered URLs for multi-class
+    coverage (SQLi/XSS/SSTI/LFI/...). Complements LLMSQL's deep SQLi/NoSQLi:
+    LLMSQL does discovery + auth + deep SQLi, nuclei does breadth. Degrades to
+    printing the command if nuclei isn't installed."""
+    import shutil
+
+    urls = [t for t in targets if t]
+    if not urls:
+        console.print("[yellow]No URLs to hand to nuclei.[/yellow]")
+        return 2
+    with open(out_file, "w") as f:
+        f.write("\n".join(urls) + "\n")
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" -H 'Cookie: {cookie}'"
+
+    cmd = f"nuclei -l {out_file} -dast -tags {tags}{header_args} {extra_args}".strip()
+    console.print(
+        f"\n[bold cyan]━━━ nuclei DAST[/bold cyan] "
+        f"[dim](tags: {tags}, {len(urls)} URL(s))[/dim]"
+    )
+    console.print(f"[dim]{cmd}[/dim]\n")
+
+    if not shutil.which("nuclei"):
+        console.print(
+            "[yellow]nuclei not on PATH — command printed above to run manually.[/yellow]\n"
+            "[dim]Install: https://github.com/projectdiscovery/nuclei[/dim]"
+        )
+        return 1
+    return launch_sqlmap(cmd, timeout, console)  # reuse the safe subprocess runner
 
 
 def _save_multi(reports, path: str) -> None:
