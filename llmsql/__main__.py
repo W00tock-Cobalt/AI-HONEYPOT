@@ -1673,6 +1673,8 @@ def main(argv: list[str] | None = None) -> int:
                             import re as _re2
                             cmd = _re2.sub(r" {2,}", " ", cmd)
                             console.print(f"  [dim]{cmd}[/dim]")
+                    # Still show the final rollup before returning.
+                    print_rollup(all_reports, console)
                     return 1 if total_findings else 0
             console.print(
                 f"[bold cyan]━━━ Stage 2 starting[/bold cyan] — "
