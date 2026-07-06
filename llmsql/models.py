@@ -20,6 +20,7 @@ class InjectionType(str, Enum):
     UNION_BASED = "union_based"
     STACKED = "stacked"
     NOSQL = "nosql"
+    XPATH = "xpath"
     UNKNOWN = "unknown"
 
 

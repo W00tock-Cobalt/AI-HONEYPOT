@@ -68,7 +68,10 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
         """,
     )
 
-    # Target (sqlmap-style)
+    # Target (sqlmap-style). A bare positional URL also works:
+    #   python -m llmsql https://target/
+    p.add_argument("target", nargs="?", default=None,
+                   help="Target URL (positional; equivalent to -u)")
     p.add_argument("-u", "--url", help="Target URL")
     p.add_argument("-l", "--list", dest="url_list",
                    help="File with target URLs, one per line (e.g. katana output)")
@@ -265,7 +268,8 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     # Output
     p.add_argument("-o", "--output", help="Save JSON report to file")
     p.add_argument("--batch", action="store_true", help="Non-interactive mode")
-    p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="Verbose output (repeatable: -v, -vv, -vvv)")
     p.add_argument("--show-response", action="store_true",
                    help="Print a snippet of each injected response (debug detection)")
     p.add_argument("--version", action="version", version=f"llmsql {__version__}")
@@ -278,8 +282,11 @@ def level_to_attempts(level: int) -> int:
 
 
 def collect_targets(args) -> list[str]:
-    """Gather target URLs from -u, -l file, and/or stdin."""
+    """Gather target URLs from -u, a bare positional URL, -l file, and/or stdin."""
     targets: list[str] = []
+    # A bare positional URL is treated like -u (standard CLI ergonomics).
+    if getattr(args, "target", None) and not args.url:
+        args.url = args.target.strip()
     if args.url:
         targets.append(args.url.strip())
 
@@ -1322,13 +1329,16 @@ def main(argv: list[str] | None = None) -> int:
 
     tamper_chain = []
     if args.tamper:
-        from llmsql.tamper import TAMPERS
-        for name in args.tamper.split(","):
-            name = name.strip()
-            if name and name in TAMPERS:
-                tamper_chain.append(name)
-            elif name:
-                console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
+        from llmsql.tamper import AUTO_TAMPER_CHAIN, TAMPERS
+        if args.tamper.strip().lower() == "auto":
+            tamper_chain = list(AUTO_TAMPER_CHAIN)
+        else:
+            for name in args.tamper.split(","):
+                name = name.strip()
+                if name and name in TAMPERS:
+                    tamper_chain.append(name)
+                elif name:
+                    console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
 
     # Auto-scale concurrency: 1 for a single target, up to 8 when discovery
     # expanded the run into many targets — unless the user set -t explicitly.

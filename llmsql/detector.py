@@ -317,6 +317,39 @@ class SqlDetector:
 
         return score, "; ".join(evidence_parts) if evidence_parts else ""
 
+    # A SQL statement echoed back inside an error (common with ORMs like
+    # TypeORM/Sequelize/Knex/Doctrine that include the failing query).
+    _LEAKED_QUERY_RE = re.compile(
+        r"\b(select|insert|update|delete|with)\b[^\n\r]{4,500}",
+        re.IGNORECASE,
+    )
+    _XPATH_ERR_RE = re.compile(
+        r"XPath|XPATH|xmlXPath|Error in XPath expression|xpath syntax|"
+        r"XPATH syntax error",
+        re.IGNORECASE,
+    )
+
+    def extract_leaked_query(self, text: str) -> Optional[str]:
+        """Pull a SQL statement echoed inside an error message (ORM query leak).
+        Returns the query up to the error separator, or None."""
+        if not text:
+            return None
+        m = self._LEAKED_QUERY_RE.search(text)
+        if not m:
+            return None
+        q = m.group(0)
+        # Trim at the DB error tail (" - invalid input...", " - syntax error").
+        q = re.split(
+            r"\s[-–]\s(?:invalid|syntax|error|unterminated|near|check the manual)",
+            q, maxsplit=1, flags=re.IGNORECASE,
+        )[0]
+        q = q.strip().strip('"').strip()
+        return q[:300] if len(q) >= 12 else None
+
+    def is_xpath_error(self, text: str) -> bool:
+        """True when the error is an XPath/XML error (XPath injection, not SQL)."""
+        return bool(self._XPATH_ERR_RE.search(text or ""))
+
     def guess_db_from_errors(self, text: str) -> Optional[str]:
         """Guess database type from error messages."""
         lower = text.lower()

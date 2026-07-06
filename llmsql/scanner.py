@@ -1409,8 +1409,27 @@ class Scanner:
             if not self.detector.find_sql_errors(injected.response_body):
                 return None
 
-        db = db_hint or self.detector.guess_db_from_errors(injected.response_body)
-        itype = inj_type or self.detector.infer_injection_type(baseline, injected, evidence)
+        body = injected.response_body or ""
+        # XPath injection: the error is an XML/XPath error, NOT SQL — classify
+        # it correctly and don't pin a bogus SQL DB type on it. Override even an
+        # explicit ERROR_BASED label (the precheck can't tell SQL from XPath),
+        # but leave genuinely-different types (boolean/nosql/time) alone.
+        if (self.detector.is_xpath_error(body)
+                and inj_type in (None, InjectionType.ERROR_BASED)):
+            db = None
+            itype = InjectionType.XPATH
+            if "xpath" not in evidence.lower():
+                evidence = (evidence + "; XPath injection (XML query, not SQL)").strip("; ")
+        else:
+            db = db_hint or self.detector.guess_db_from_errors(body)
+            itype = inj_type or self.detector.infer_injection_type(baseline, injected, evidence)
+
+        # Surface a leaked query (ORM error echo) in the evidence — makes the
+        # finding self-documenting and pentest-report ready.
+        leaked = self.detector.extract_leaked_query(body)
+        if leaked and leaked.lower() not in evidence.lower():
+            evidence = (evidence + f"; Leaked query: {leaked}").strip("; ")
+
         severity = Severity.HIGH if confidence >= 0.8 else Severity.MEDIUM
         poc_curl, poc_req = _build_poc(injected)
 
