@@ -250,24 +250,51 @@ def _form_target(form: _Form, base_url: str) -> str | None:
     return urlunparse(parsed._replace(query=new_q))
 
 
+def _post_form_targets(parser: "_FormParser", base_url: str) -> list[tuple[str, str, str]]:
+    """Build POST scan targets from ``<form method=post>`` elements.
+
+    Returns ``(url, body, content_type)`` tuples where ``body`` pre-fills every
+    field with a test value. This is fully organic: it discovers login/cart/
+    order/supplier POST forms (and CGI ``?action=`` forms, whose action URL
+    already carries the action) on any HTML app, no per-app knowledge needed.
+    """
+    from urllib.parse import urlencode
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for form in parser.forms:
+        if form.method != "POST" or not form.fields:
+            continue
+        absu = _same_host_abs(form.action or base_url, base_url)
+        if not absu:
+            continue
+        body = urlencode({f: "1" for f in form.fields})
+        key = absu + "|" + body
+        if key not in seen:
+            seen.add(key)
+            out.append((absu, body, "application/x-www-form-urlencoded"))
+    return out
+
+
 def discover(
     base_url: str,
     body: str,
     content_type: str = "",
     max_params: int = 40,
-) -> tuple[list[str], list[str]]:
-    """Discover candidate parameters and scannable target URLs from a response.
+) -> tuple[list[str], list[str], list[tuple[str, str, str]]]:
+    """Discover candidate parameters and scannable targets from a response.
 
-    Returns ``(param_names, target_urls)`` where:
+    Returns ``(param_names, target_urls, post_forms)`` where:
       - ``param_names`` are page-derived candidate parameter names to test on
         the CURRENT url (form fields first, then query-string keys, then JSON
         keys), deduped and capped at ``max_params``.
-      - ``target_urls`` are additional same-host URLs worth scanning that the
-        page pointed at: GET-form actions pre-filled with their fields, and any
-        anchor/script URL that already carries a query string.
+      - ``target_urls`` are additional same-host GET URLs worth scanning that
+        the page pointed at: GET-form actions pre-filled with their fields, and
+        any anchor/script URL that already carries a query string.
+      - ``post_forms`` are ``(url, body, content_type)`` for discovered POST
+        forms, so the caller can scan their body params.
     """
     if not body:
-        return [], []
+        return [], [], []
 
     ct = (content_type or "").lower()
     ordered: list[str] = []
@@ -281,6 +308,7 @@ def discover(
 
     target_urls: list[str] = []
     seen_urls: set[str] = set()
+    post_forms: list[tuple[str, str, str]] = []
 
     def add_url(u: str | None) -> None:
         if u and u not in seen_urls:
@@ -296,6 +324,8 @@ def discover(
         # GET forms → scannable "action?field=1" targets
         for form in parser.forms:
             add_url(_form_target(form, base_url))
+        # POST forms → POST scan targets with their fields (organic).
+        post_forms = _post_form_targets(parser, base_url)
         # Anchor/script URLs carrying a query string → scannable targets
         for raw in parser.link_urls:
             absu = _same_host_abs(raw, base_url)
@@ -309,4 +339,4 @@ def discover(
     for u in target_urls:
         extend(list(parse_qs(urlparse(u).query, keep_blank_values=True).keys()))
 
-    return ordered[:max_params], target_urls
+    return ordered[:max_params], target_urls, post_forms

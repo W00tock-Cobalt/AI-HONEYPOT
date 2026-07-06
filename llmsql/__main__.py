@@ -672,14 +672,17 @@ def organic_expand_targets(
     timeout: float = 10.0,
     max_seeds: int = 20,
     max_new: int = 120,
+    post_extras: dict | None = None,
 ) -> list[str]:
     """One-pass organic expansion: fetch each seed page and add scan targets it
-    points at (GET-form actions pre-filled with fields, and query-carrying
-    links). This lets ``-u https://site`` reach the vulnerable /search endpoint
-    a form points to — without a static endpoint list or an external crawler.
+    points at — GET-form actions pre-filled with fields, query-carrying links,
+    and (organically) POST forms with their fields. This lets ``-u https://site``
+    reach the login/cart/search/order endpoints a form points to — including CGI
+    ``?action=`` forms — without any per-app endpoint list.
 
-    Bounded on purpose: only the first ``max_seeds`` targets are fetched and at
-    most ``max_new`` URLs are added, so it never turns into a full crawl.
+    POST forms are registered in ``post_extras`` (url -> (method, body, ct, None))
+    so the scanner tests their body params. Bounded: only the first ``max_seeds``
+    targets are fetched and at most ``max_new`` URLs are added.
     """
     import httpx
 
@@ -687,6 +690,7 @@ def organic_expand_targets(
 
     existing = set(targets)
     discovered: list[str] = []
+    post_extras = post_extras if post_extras is not None else {}
     kwargs: dict = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
     if proxy:
         kwargs["proxy"] = proxy
@@ -700,7 +704,7 @@ def organic_expand_targets(
                 continue
             ct = resp.headers.get("content-type", "")
             try:
-                _names, urls = discover(seed, resp.text, ct)
+                _names, urls, post_forms = discover(seed, resp.text, ct)
             except Exception:
                 continue
             for u in urls:
@@ -708,14 +712,23 @@ def organic_expand_targets(
                     continue
                 existing.add(u)
                 discovered.append(u)
+            # POST forms → POST scan targets with their fields (organic).
+            for furl, fbody, fct in post_forms:
+                if furl in existing or len(discovered) >= max_new:
+                    continue
+                existing.add(furl)
+                discovered.append(furl)
+                post_extras[furl] = ("POST", fbody, fct, None)
 
     if discovered:
+        n_post = sum(1 for u in discovered if u in post_extras)
         console.print(
             f"[green]✓ Organic crawl found {len(discovered)} extra target(s)[/green] "
-            f"[dim](forms/links on the seed page(s))[/dim]"
+            f"[dim](forms/links on the seed page(s); {n_post} POST form(s))[/dim]"
         )
         for u in discovered[:15]:
-            console.print(f"    [cyan]->[/cyan] {u}")
+            tag = " [dim]POST[/dim]" if u in post_extras else ""
+            console.print(f"    [cyan]->[/cyan] {u}{tag}")
         if len(discovered) > 15:
             console.print(f"    [dim]... and {len(discovered) - 15} more[/dim]")
     return targets + discovered
@@ -1174,7 +1187,28 @@ def main(argv: list[str] | None = None) -> int:
         targets = organic_expand_targets(
             targets, expand_headers, console,
             proxy=args.proxy, timeout=min(args.timeout, 10.0),
+            post_extras=spec_extras,
         )
+
+    # Organic cookie capture: if the target sets a session cookie (CartID,
+    # SSOid, PHPSESSID, ...) and the user didn't supply one, grab it and add it
+    # as an injection point. Because the precheck APPENDS to the cookie's real
+    # value, a structured cookie like "ts:1:11.5:1000" is tested as
+    # "ts:1:11.5:1000'", hitting the exact vulnerable field — fully organic,
+    # no per-app knowledge. Catches cookie-based SQLi (e.g. unquoted IN()).
+    if args.organic and not cookies and targets:
+        try:
+            _cstr, _jar = grab_cookie(
+                targets[0], headers=headers, proxy=args.proxy
+            )
+        except Exception:
+            _jar = {}
+        if _jar:
+            cookies.update(_jar)
+            console.print(
+                f"[dim]Organic cookie capture: {', '.join(_jar)} "
+                f"(will be tested for injection)[/dim]"
+            )
 
     # Parameter mining wordlist — ON by default (disable with --no-guess-params).
     guess_params = None

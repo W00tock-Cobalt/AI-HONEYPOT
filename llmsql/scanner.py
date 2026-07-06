@@ -228,7 +228,7 @@ class Scanner:
                 ct = baseline.response_headers.get("content-type", "") \
                     if baseline.response_headers else ""
                 from llmsql.param_discovery import discover
-                names, _param_urls = discover(url, baseline.response_body, ct)
+                names, _param_urls, _post_forms = discover(url, baseline.response_body, ct)
                 if names:
                     discovered_params = names
                     report.add_log(
