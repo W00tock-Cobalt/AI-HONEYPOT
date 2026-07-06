@@ -118,6 +118,15 @@ class Scanner:
         self.on_progress(f"[*] Target: {url}")
         self.on_progress(f"[*] Method: {method}")
 
+        # JSON body field discovery: for a JSON-body write (POST/PUT/PATCH),
+        # GET the same resource and merge its real field names into the body so
+        # injection hits actual fields, not just our synthesized guesses. Many
+        # REST APIs expose the same shape on GET (list/read) and POST (create).
+        if (self.organic and data and method.upper() in ("POST", "PUT", "PATCH")
+                and (content_type or "").lower().find("json") >= 0
+                and data.strip().startswith("{")):
+            data = self._enrich_json_body(url, data, extra_headers, report)
+
         # Baseline request FIRST — the clean response is what we mine for
         # organically-discovered parameters (forms/links/JS/JSON keys), so we
         # need it before deciding which points to test.
@@ -991,6 +1000,44 @@ class Scanner:
                     mism += 1
             char_ratio = mism / checked if checked else 0.0
         return max(len_ratio, char_ratio)
+
+    def _enrich_json_body(self, url, data, extra_headers, report) -> str:
+        """Merge a resource's real JSON field names into a POST/PUT body.
+
+        GETs the same URL; if it returns a JSON object (or a list of objects),
+        its leaf keys are added to the write body so body-param injection tests
+        actual fields. Best-effort — returns the original body on any failure.
+        """
+        import json as _json
+        try:
+            sample = self.probe.send(url, "GET", None, None, extra_headers)
+            report.add_request()
+        except Exception:
+            return data
+        ct = ""
+        if sample.response_headers:
+            ct = sample.response_headers.get("content-type", "")
+        try:
+            from llmsql.param_discovery import discover
+            names, _urls, _forms = discover(url, sample.response_body, ct)
+        except Exception:
+            names = []
+        if not names:
+            return data
+        try:
+            obj = _json.loads(data)
+            if not isinstance(obj, dict):
+                return data
+        except (ValueError, TypeError):
+            return data
+        added = 0
+        for k in names:
+            if k not in obj and added < 15:
+                obj[k] = "1"
+                added += 1
+        if added:
+            report.add_log(f"JSON body enriched with {added} discovered field(s)")
+        return _json.dumps(obj)
 
     def _enrich_error(
         self, finding, url, method, data, content_type, extra_headers, point, report,
