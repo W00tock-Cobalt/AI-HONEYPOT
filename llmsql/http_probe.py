@@ -40,6 +40,20 @@ _MAX_GUESS_PARAMS_GENERIC = 25
 # param names, so a focused slice of the most common SQLi vectors is enough.
 _MAX_GUESS_PARAMS_PARAMD = 30
 
+# Common HTTP headers that back-ends frequently trust and interpolate into SQL
+# (logging, geo/IP lookups, analytics, feature flags). Tested organically as
+# injection points so header-based SQLi (e.g. an app that looks up a product by
+# a custom header, or logs X-Forwarded-For into a query) is caught without a
+# spec. Values are plausible defaults so the request stays well-formed.
+_COMMON_INJECTABLE_HEADERS: list[tuple[str, str]] = [
+    ("X-Forwarded-For", "127.0.0.1"),
+    ("X-Forwarded-Host", "localhost"),
+    ("Referer", "https://www.google.com/"),
+    ("X-Real-IP", "127.0.0.1"),
+    ("Client-IP", "127.0.0.1"),
+    ("X-Api-Version", "1"),
+]
+
 
 class HttpProbe:
     """Send HTTP requests with payload injection at specific points."""
@@ -78,6 +92,7 @@ class HttpProbe:
         path_all_segments: bool = False,
         guess_params: Optional[list[str]] = None,
         discovered_params: Optional[list[str]] = None,
+        test_headers: bool = False,
     ) -> list[InjectionPoint]:
         """Discover injectable parameters from URL path, query, body, headers.
 
@@ -198,6 +213,19 @@ class HttpProbe:
                         name=name,
                         location=ParamLocation.HEADER,
                         original_value=value,
+                    ))
+
+        # Common trusted headers (organic) — apps often interpolate these into
+        # SQL (IP/geo lookups, logging, feature flags). Skip any the caller
+        # already supplied to avoid duplicates.
+        if test_headers:
+            supplied = {n.lower() for n in (extra_headers or {})}
+            for hname, hval in _COMMON_INJECTABLE_HEADERS:
+                if hname.lower() not in supplied:
+                    points.append(InjectionPoint(
+                        name=hname,
+                        location=ParamLocation.HEADER,
+                        original_value=hval,
                     ))
 
         for name, value in self.cookies.items():

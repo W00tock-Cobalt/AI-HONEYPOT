@@ -250,6 +250,7 @@ class Scanner:
             path_all_segments=self.path_all_segments,
             guess_params=self.guess_params,
             discovered_params=discovered_params,
+            test_headers=self.organic,
         )
         if params:
             allowed = set(params)
@@ -956,42 +957,47 @@ class Scanner:
         """
         if self.fast:
             return None
+        from llmsql.payloads import TIME_BASED_POLYGLOTS, TIME_BASED_TEMPLATES
         sleep_s = max(1, int(round(self._sleep_ms / 1000)))
         thresh = self._sleep_ms * 0.7
         orig = point.original_value or ""
-        # (payload template, control template) — control replaces the delay
-        # with an instant one so a slow server/network can't cause a false hit.
-        templates = [
-            ("' OR SLEEP({s})-- -", "' OR SLEEP(0)-- -"),
-            (" OR SLEEP({s})-- -", " OR SLEEP(0)-- -"),
-            ("' AND SLEEP({s})-- -", "' AND SLEEP(0)-- -"),
-            ("'||pg_sleep({s})-- -", "'||pg_sleep(0)-- -"),
-            ("';SELECT pg_sleep({s})-- -", "';SELECT pg_sleep(0)-- -"),
-            ("';WAITFOR DELAY '0:0:{s}'-- -", "';WAITFOR DELAY '0:0:0'-- -"),
-        ]
-        for tpl, ctrl_tpl in templates:
+
+        # Try context-breaking POLYGLOTS first (one request covers numeric +
+        # single-quote + double-quote), then per-context payloads as fallback.
+        # `replace=True` sends the payload AS the whole value (polyglots break
+        # out of context themselves); `replace=False` appends to the original.
+        attempts = (
+            [(tpl, True) for tpl in TIME_BASED_POLYGLOTS]
+            + [(tpl, False) for tpl in TIME_BASED_TEMPLATES]
+        )
+        for tpl, replace in attempts:
             payload = tpl.format(s=sleep_s)
+            ctrl = tpl.format(s=0)
+            send_payload = payload if replace else orig + payload
+            send_ctrl = ctrl if replace else orig + ctrl
             ex = self.probe.send(
                 url, method, data, content_type, extra_headers,
-                inject_point=point, payload=orig + payload,
+                inject_point=point, payload=send_payload,
             )
             ex.expected_sleep_ms = self._sleep_ms
             report.add_request()
             delay = ex.response_time_ms - baseline.response_time_ms
             if delay < thresh:
                 continue
-            # Confirm: sleep(0) control must be fast.
+            # Confirm: the sleep(0) control must be fast (rules out a slow
+            # server / network blip).
             ctrl_ex = self.probe.send(
                 url, method, data, content_type, extra_headers,
-                inject_point=point, payload=orig + ctrl_tpl,
+                inject_point=point, payload=send_ctrl,
             )
             report.add_request()
             ctrl_delay = ctrl_ex.response_time_ms - baseline.response_time_ms
             if ctrl_delay < thresh * 0.6:
+                kind = "polyglot" if replace else "per-context"
                 return self._build_finding(
                     point, ex, baseline,
-                    f"Time-based blind: {payload!r} delayed response +{delay:.0f}ms "
-                    f"(~{sleep_s}s); control sleep(0) returned fast (+{ctrl_delay:.0f}ms)",
+                    f"Time-based blind ({kind}): {payload!r} delayed +{delay:.0f}ms "
+                    f"(~{sleep_s}s); control (0s) returned fast (+{ctrl_delay:.0f}ms)",
                     0.9, inj_type=InjectionType.TIME_BLIND,
                 )
         return None

