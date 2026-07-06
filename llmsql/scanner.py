@@ -1001,6 +1001,15 @@ class Scanner:
             char_ratio = mism / checked if checked else 0.0
         return max(len_ratio, char_ratio)
 
+    def _apply_tamper(self, payload: str) -> str:
+        """Apply the explicit --tamper chain to a payload (WAF evasion). No-op
+        when no chain is configured. Used by the dedicated technique methods so
+        time-based/blind detection also evades filters, not just the main suite."""
+        if self.tamper and isinstance(payload, str):
+            from llmsql.tamper import apply_tamper
+            return apply_tamper(payload, self.tamper)
+        return payload
+
     def _enrich_json_body(self, url, data, extra_headers, report) -> str:
         """Merge a resource's real JSON field names into a POST/PUT body.
 
@@ -1126,6 +1135,10 @@ class Scanner:
             ctrl = tpl.format(s=0)
             send_payload = payload if replace else orig + payload
             send_ctrl = ctrl if replace else orig + ctrl
+            # WAF evasion: tamper payload AND control identically so the timing
+            # comparison stays valid (both transformed the same way).
+            send_payload = self._apply_tamper(send_payload)
+            send_ctrl = self._apply_tamper(send_ctrl)
             ex = self.probe.send(
                 url, method, data, content_type, extra_headers,
                 inject_point=point, payload=send_payload,
