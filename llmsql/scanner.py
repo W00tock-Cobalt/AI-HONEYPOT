@@ -866,8 +866,18 @@ class Scanner:
             fr = ratio(template, remove_dynamic(false_ex.response_body, markers))
             # TRUE resembles the original page; FALSE clearly diverges from it.
             if tr >= UPPER_RATIO_BOUND and fr < UPPER_RATIO_BOUND and (tr - fr) > DIFF_TOLERANCE:
+                # CONFIRM: re-run the pair once and require the same direction.
+                # A transient/flaky response (shared hosts, load balancers) can
+                # produce a one-off differential; a real boolean injection is
+                # reproducible. This kills the transient false positives.
+                if not self._confirm_bool_ratio(
+                    url, method, data, content_type, extra_headers, point,
+                    template, markers, true_pl, false_pl, report,
+                ):
+                    continue
                 ev = (f"Boolean blind (content ratio): TRUE~original={tr:.2f}, "
-                      f"FALSE={fr:.2f} (Δ{tr - fr:.2f}); dynamic content stripped")
+                      f"FALSE={fr:.2f} (Δ{tr - fr:.2f}); dynamic content stripped; "
+                      f"reproduced on re-test")
                 return self._build_finding(
                     point, true_ex, baseline, ev, min(0.95, 0.8 + (tr - fr)),
                     inj_type=InjectionType.BOOLEAN_BLIND,
@@ -878,11 +888,42 @@ class Scanner:
                     baseline, true_ex, false_ex
                 )
                 if amp >= 0.85:
+                    # Confirm amplification is reproducible too.
+                    or2 = self.probe.send(url, method, data, content_type,
+                                          extra_headers, inject_point=point,
+                                          payload=orig + true_pl)
+                    and2 = self.probe.send(url, method, data, content_type,
+                                           extra_headers, inject_point=point,
+                                           payload=orig + false_pl)
+                    report.add_request(); report.add_request()
+                    amp2, _ = self.detector.boolean_amplification_score(baseline, or2, and2)
+                    if amp2 < 0.85:
+                        continue
                     return self._build_finding(
-                        point, true_ex, baseline, amp_ev, amp,
+                        point, true_ex, baseline, amp_ev + "; reproduced on re-test", amp,
                         inj_type=InjectionType.BOOLEAN_BLIND,
                     )
         return None
+
+    def _confirm_bool_ratio(
+        self, url, method, data, content_type, extra_headers, point,
+        template, markers, true_pl, false_pl, report,
+    ) -> bool:
+        """Re-run a candidate boolean-ratio pair once; return True only if the
+        TRUE~original / FALSE-diverges signal reproduces (kills transient FPs)."""
+        from llmsql.compare import (
+            DIFF_TOLERANCE, UPPER_RATIO_BOUND, ratio, remove_dynamic,
+        )
+        orig = point.original_value or ""
+        t2 = self.probe.send(url, method, data, content_type, extra_headers,
+                             inject_point=point, payload=orig + true_pl)
+        f2 = self.probe.send(url, method, data, content_type, extra_headers,
+                             inject_point=point, payload=orig + false_pl)
+        report.add_request()
+        report.add_request()
+        tr2 = ratio(template, remove_dynamic(t2.response_body, markers))
+        fr2 = ratio(template, remove_dynamic(f2.response_body, markers))
+        return tr2 >= UPPER_RATIO_BOUND and fr2 < UPPER_RATIO_BOUND and (tr2 - fr2) > DIFF_TOLERANCE
 
     def _boolean_amplify_probe(
         self, url, method, data, content_type, extra_headers, point, baseline, report,
