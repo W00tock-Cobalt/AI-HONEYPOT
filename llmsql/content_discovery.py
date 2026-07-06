@@ -104,8 +104,8 @@ def discover_paths(
     headers: dict[str, str] | None = None,
     verify_ssl: bool = True,
     proxy: str | None = None,
-    timeout: float = 8.0,
-    max_workers: int = 30,
+    timeout: float = 6.0,
+    max_workers: int = 40,
     extra_words: list[str] | None = None,
     on_status=None,
 ) -> list[str]:
@@ -133,29 +133,45 @@ def discover_paths(
         pass
 
     candidates = _candidate_paths(extra_words)
-    log(f"[*] Content discovery: probing {len(candidates)} paths "
+    total = len(candidates)
+    log(f"[*] Content discovery: probing {total} paths "
         f"(soft-404 filtered)...")
+
+    # One shared client (httpx.Client is thread-safe for requests) — avoids
+    # building a fresh connection pool per probe.
+    shared = httpx.Client(**client_kwargs)
 
     def check(path: str):
         url = urljoin(root, path)
         try:
-            with httpx.Client(**client_kwargs) as c:
-                r = c.get(url, headers=headers or {})
+            r = shared.get(url, headers=headers or {})
         except (httpx.HTTPError, OSError):
             return None
         if r.status_code in (404, 0):
             return None
-        # Soft-404: same fingerprint as the random-path template → not real.
         if _fp(r) in soft404:
             return None
-        # 401/403 still indicate the route EXISTS (auth-gated) — keep it.
         return (url, r.status_code)
 
     live: list[tuple[str, int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for res in ex.map(check, candidates):
-            if res is not None:
-                live.append(res)
+    done = 0
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(check, p) for p in candidates]
+            for fut in concurrent.futures.as_completed(futures):
+                done += 1
+                # Heartbeat so a slow/rate-limited target doesn't LOOK hung.
+                if done % 150 == 0 or done == total:
+                    log(f"    [content discovery] {done}/{total} probed, "
+                        f"{len(live)} live so far")
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = None
+                if res is not None:
+                    live.append(res)
+    finally:
+        shared.close()
 
     live.sort(key=lambda t: t[0])
     return [u for u, _ in live]
