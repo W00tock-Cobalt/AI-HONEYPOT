@@ -16,28 +16,130 @@ import httpx
 # Endpoints where a Swagger/OpenAPI JSON spec is commonly served.
 # Covers NestJS, Spring, Django REST, FastAPI, ASP.NET, and generic conventions.
 COMMON_SPEC_PATHS = [
+    # NestJS / generic JSON specs
     "/swagger-json",
     "/swagger.json",
     "/swagger/v1/swagger.json",
+    "/swagger/doc.json",
     "/openapi.json",
+    "/openapi",
+    "/openapi/v1",
+    "/openapi/v3",
+    "/openapi3.json",
+    # Spring / springdoc / Quarkus
     "/v3/api-docs",
+    "/v3/api-docs.json",
+    "/v3/api-docs/swagger-config",
     "/v2/api-docs",
+    "/v1/api-docs",
     "/api-docs",
     "/api-docs.json",
-    "/api/swagger.json",
-    "/api/openapi.json",
-    "/api/v1/openapi.json",
-    "/api/docs/swagger.json",
-    "/docs/swagger.json",
-    "/openapi.yaml",
-    "/swagger.yaml",
+    "/q/openapi",              # Quarkus
+    "/q/openapi.json",
+    "/actuator/openapi",       # Spring actuator
+    # FastAPI / Django REST / drf-spectacular
     "/api/schema",
     "/api/schema.json",
+    "/api/schema/",
+    "/schema",
+    "/schema.json",
+    # NestJS BrokenCrystals-style and generic /api roots
+    "/api/spec",
+    "/api/spec.json",
+    "/api-json",
+    "/api.json",
+    "/api/openapi.json",
+    "/api/openapi",
+    "/api/swagger.json",
+    "/api/swagger",
+    "/api/v1/openapi.json",
+    "/api/v1/swagger.json",
+    "/api/v2/openapi.json",
+    "/api/v2/swagger.json",
+    "/api/v3/api-docs",
+    "/api/docs.json",
+    "/api/docs/swagger.json",
+    "/api/docs-json",
+    "/docs-json",
+    "/docs/swagger.json",
+    "/docs/openapi.json",
     "/rest/openapi.json",
     "/rest/swagger.json",
+    "/spec",
+    "/spec.json",
     "/spec/swagger.json",
     "/.well-known/openapi.json",
+    # YAML variants
+    "/openapi.yaml",
+    "/openapi.yml",
+    "/swagger.yaml",
+    "/api/openapi.yaml",
+    # WordPress REST
+    "/wp-json",
+    "/wp-json/wp/v2",
+    # Swagger UI / Redoc HTML pages — these usually just REFERENCE the real
+    # spec URL, which we extract and follow (see _extract_spec_urls).
+    "/swagger",
+    "/swagger/",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/swagger-ui/index.html",
+    "/swagger/index.html",
+    "/api/docs",
+    "/api/docs/",
+    "/docs",
+    "/docs/",
+    "/redoc",
+    "/graphiql",
 ]
+
+
+import re as _re
+
+# Spec URLs referenced from a Swagger-UI / Redoc HTML or its init JS. Matches
+# swagger-ui-init.js `"url": "/v3/api-docs"`, Redoc `spec-url="/openapi.json"`,
+# and inline `url: '/swagger.json'` configs.
+_SPEC_URL_RE = _re.compile(
+    r"""(?:["']?url["']?\s*[:=]\s*|spec-url\s*=\s*)["']([^"']+)["']""",
+    _re.IGNORECASE,
+)
+
+
+_UI_ASSET_EXT = (".css", ".js", ".png", ".ico", ".gif", ".svg", ".woff",
+                 ".woff2", ".ttf", ".map", ".html", ".htm")
+
+
+def _extract_spec_urls(html: str, base: str) -> list[str]:
+    """Pull candidate spec URLs referenced by a Swagger-UI/Redoc HTML page.
+
+    A ``url:``/``spec-url`` value inside a Swagger-UI/Redoc config IS the spec,
+    so we follow it even when the path has no obvious 'swagger/openapi' keyword
+    (e.g. a custom ``/internal/api-doc``). We only drop UI static assets and
+    cross-host references (avoids following the bundled petstore demo URL).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    base_host = urlparse(base).netloc
+    for m in _SPEC_URL_RE.finditer(html or ""):
+        ref = m.group(1).strip()
+        if not ref or ref in ("#", "/"):
+            continue
+        low = ref.lower()
+        if any(low.split("?")[0].endswith(ext) for ext in _UI_ASSET_EXT):
+            continue
+        # Resolve; skip cross-host refs (e.g. the default petstore demo spec).
+        if ref.startswith(("http://", "https://")):
+            if urlparse(ref).netloc != base_host:
+                continue
+            absu = ref
+        elif ref.startswith("/"):
+            absu = urljoin(base, ref)
+        else:
+            absu = urljoin(base, "/" + ref)
+        if absu not in seen:
+            seen.add(absu)
+            out.append(absu)
+    return out
 
 
 def _placeholder(param: dict[str, Any]) -> str:
@@ -269,7 +371,17 @@ def load_openapi(
             root = f"{parsed.scheme}://{parsed.netloc}"
             candidates = [root + p for p in COMMON_SPEC_PATHS]
 
-        for cand in candidates:
+        # Index-based so we can APPEND spec URLs discovered inside Swagger-UI /
+        # Redoc HTML pages and follow them. Bounded to avoid runaway probing.
+        seen_cands: set[str] = set()
+        idx = 0
+        MAX_PROBES = 80
+        while idx < len(candidates) and idx < MAX_PROBES:
+            cand = candidates[idx]
+            idx += 1
+            if cand in seen_cands:
+                continue
+            seen_cands.add(cand)
             try:
                 resp = client.get(cand, headers=headers or {})
             except httpx.HTTPError as e:
@@ -299,12 +411,38 @@ def load_openapi(
                     pass
 
             if data is None:
-                last_probe_log.append(
-                    SpecProbeResult(cand, resp.status_code, "200 but not parseable JSON or YAML")
-                )
+                # Not a spec — but if it's a Swagger-UI / Redoc HTML page, it
+                # usually references the real spec URL. Extract and follow it.
+                followed = 0
+                if "<" in text[:200] or "swagger" in text.lower() or "redoc" in text.lower():
+                    for ref in _extract_spec_urls(resp.text, cand):
+                        if ref not in seen_cands and ref not in candidates:
+                            candidates.append(ref)
+                            followed += 1
+                last_probe_log.append(SpecProbeResult(
+                    cand, resp.status_code,
+                    f"200 HTML — followed {followed} referenced spec URL(s)" if followed
+                    else "200 but not parseable JSON or YAML",
+                ))
                 continue
 
             if "paths" not in data:
+                # Some configs (springdoc swagger-config) point at the real doc.
+                if isinstance(data, dict):
+                    for key in ("url", "configUrl"):
+                        ref = data.get(key)
+                        if isinstance(ref, str):
+                            absu = urljoin(cand, ref)
+                            if absu not in seen_cands and absu not in candidates:
+                                candidates.append(absu)
+                    urls_field = data.get("urls")
+                    if isinstance(urls_field, list):
+                        for u in urls_field:
+                            ref = (u or {}).get("url") if isinstance(u, dict) else None
+                            if isinstance(ref, str):
+                                absu = urljoin(cand, ref)
+                                if absu not in seen_cands and absu not in candidates:
+                                    candidates.append(absu)
                 last_probe_log.append(
                     SpecProbeResult(cand, resp.status_code, "valid JSON but no 'paths' key")
                 )
