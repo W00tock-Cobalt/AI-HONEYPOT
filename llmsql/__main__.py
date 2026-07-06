@@ -94,6 +94,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Disable organic parameter discovery (mining param names "
                         "from the target's own forms/links/JS/JSON responses). "
                         "On by default so the scanner adapts to any app.")
+    p.add_argument("--second-order", action="store_true",
+                   help="Test for SECOND-ORDER SQLi: submit a unique marker+quote "
+                        "via write endpoints (POST/PUT), then re-read and flag if "
+                        "the stored value surfaces in a SQL error later. NOTE: "
+                        "writes marker data to the target, so it is opt-in.")
     p.add_argument("--openapi",
                    help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
                         "to discover endpoints WITH their real parameter names")
@@ -1377,6 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
         continue_on_found=args.continue_on_found,
         seed_payloads=display_payloads,
         organic=args.organic,
+        second_order=args.second_order,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),

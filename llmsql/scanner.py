@@ -76,6 +76,7 @@ class Scanner:
         continue_on_found: bool = False,
         seed_payloads: Optional[list[str]] = None,
         organic: bool = True,
+        second_order: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -93,6 +94,7 @@ class Scanner:
         self.show_response = show_response
         self.continue_on_found = continue_on_found
         self.organic = organic  # mine params from the response itself
+        self.second_order = second_order
         self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
         self._sleep_ms = 3000  # calibrated by CLI --sleep
         # Precheck is always on unless explicitly disabled.
@@ -330,12 +332,93 @@ class Scanner:
                         f"    PoC: {finding.poc_curl}"
                     )
 
+        # Second-order SQLi (opt-in): store a marked payload via a write
+        # endpoint, then re-read and see if it surfaces in a SQL error later.
+        if self.second_order and method.upper() in ("POST", "PUT", "PATCH") and data:
+            so = self._test_second_order(
+                url, method, data, content_type, extra_headers, points, report
+            )
+            if so is not None:
+                report.findings.append(so)
+                self.on_progress(
+                    f"[!] VULNERABLE (second-order): {url}\n"
+                    f"    Param: {so.param} | stored value resurfaced in a SQL error"
+                )
+
         report.duration_seconds = time.perf_counter() - start
         self.on_progress(
             f"\n[*] Scan complete: {report.total_requests} requests, "
             f"{len(report.findings)} finding(s) in {report.duration_seconds:.1f}s"
         )
         return report
+
+    def _test_second_order(
+        self, url, method, data, content_type, extra_headers, points, report,
+    ) -> Optional[Finding]:
+        """Second-order SQLi: submit a unique marker+quote into each writable
+        field, then re-read the endpoint (and its base path) and flag if the
+        stored value resurfaces inside a SQL error — proving the persisted value
+        is later concatenated into a query. Marker-based, so false positives are
+        near-zero (the exact random marker must appear next to a SQL error)."""
+        import random as _r
+        import string as _s
+        from urllib.parse import urlparse, urlunparse
+        marker = "s2o" + "".join(_r.choice(_s.ascii_lowercase + _s.digits) for _ in range(8))
+        payload = marker + "'"
+        writable = [p for p in points if p.location.value in ("body", "json")]
+        if not writable:
+            return None
+        # Store the marked payload in each writable field (separate requests so
+        # we know which field carried it if it resurfaces).
+        stored_fields: list[str] = []
+        for point in writable[:8]:
+            self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=payload,
+            )
+            report.add_request()
+            stored_fields.append(point.name)
+
+        # Re-read: the write URL itself (GET) and its base path (no query).
+        parsed = urlparse(url)
+        read_urls = [url]
+        base = urlunparse(parsed._replace(query=""))
+        if base != url:
+            read_urls.append(base)
+        for read_url in read_urls:
+            try:
+                r = self.probe.send(read_url, "GET", None, None, extra_headers)
+            except Exception:
+                continue
+            report.add_request()
+            body = r.response_body or ""
+            if marker not in body:
+                continue
+            errs = self.detector.find_sql_errors(body)
+            if not errs:
+                continue
+            # Require the marker to sit NEAR the SQL error (same 200-char window)
+            # so we don't flag an unrelated error elsewhere on the page.
+            mi = body.find(marker)
+            window = body[max(0, mi - 200): mi + 200]
+            if any(e in window for e in errs) or self.detector.find_sql_errors(window):
+                point0 = writable[0]
+                ev = (f"Second-order SQLi: stored marker {marker!r} resurfaced in a "
+                      f"SQL error on {read_url} — persisted value is used in a later query")
+                poc_curl, poc_req = _build_poc(r)
+                return Finding(
+                    param=(stored_fields[0] if stored_fields else point0.name),
+                    location=point0.location,
+                    injection_type=InjectionType.ERROR_BASED,
+                    severity=Severity.HIGH,
+                    payload=payload,
+                    evidence=ev,
+                    confidence=0.9,
+                    db_type=self.detector.guess_db_from_errors(body),
+                    poc_curl=poc_curl,
+                    poc_request=poc_req,
+                )
+        return None
 
     def _test_parameter(
         self,
