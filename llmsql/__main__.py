@@ -1268,11 +1268,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         display_payloads = seed_payloads
 
-    # max_attempts must cover the whole payload list so nothing is skipped
+    # Per-parameter payload budget. Testing the ENTIRE suite (~100+ payloads) on
+    # every reacting param explodes a single endpoint into 1000s of requests
+    # (e.g. a non-SQL /api/file whose params react to junk). Cap by --level;
+    # the dedicated boolean-ratio/UNION/time-based/NoSQL tests cover techniques
+    # that the capped seed list might not reach. --max-attempts overrides.
     if _raw_max_attempts:
         max_attempts = _raw_max_attempts
     else:
-        max_attempts = len(display_payloads)
+        level_caps = {1: 20, 2: 40, 3: len(display_payloads)}
+        max_attempts = min(len(display_payloads), level_caps.get(args.level, 20))
 
     console.print(f"[dim]Payloads: {payload_src} | max {max_attempts}/param[/dim]")
 

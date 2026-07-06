@@ -758,9 +758,10 @@ class Scanner:
             if bfind is not None:
                 return bfind
 
-        # UNION-based detection (reflected marker) — run on params that reacted
-        # to injection (best_score >= 0.3) so it's bounded, not on every param.
-        if (not self.fast and best_score >= 0.3
+        # UNION-based detection (reflected marker) — the most expensive fallback,
+        # so only on params with a clear reaction (best_score >= 0.5) to keep the
+        # per-endpoint request count bounded.
+        if (not self.fast and best_score >= 0.5
                 and point.location.value in ("query", "body", "json")):
             ufind = self._test_union(
                 url, method, data, content_type, extra_headers, point, baseline, report
@@ -1013,8 +1014,9 @@ class Scanner:
         if marker in (baseline.response_body or ""):
             return None
         orig = point.original_value or ""
-        # Common query contexts: string-quoted, numeric, double-quoted.
-        boundaries = ["'", "", '"']
+        # Common query contexts: string-quoted, numeric. (Bounded to keep the
+        # per-param request cost low — 2 boundaries x 5 cols = 10 requests max.)
+        boundaries = ["'", ""]
         max_cols = 5
         for prefix in boundaries:
             for n in range(1, max_cols + 1):
