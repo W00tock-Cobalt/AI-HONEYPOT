@@ -124,6 +124,50 @@ class SqlDetector:
 
         return 0.0, ""
 
+    def boolean_amplification_score(
+        self,
+        baseline: HttpExchange,
+        or_exchange: HttpExchange,
+        and_exchange: HttpExchange,
+    ) -> tuple[float, str]:
+        """Nuclei-style boolean SQLi via OR/AND result amplification.
+
+        An OR-true payload appended to the value (``... OR 1=1``) makes the
+        WHERE clause always true, so a listing/search endpoint returns MORE rows
+        (response grows vs. baseline). An AND-false payload (``... AND 1=2``)
+        makes it always false, returning fewer/none (response shrinks). The
+        asymmetry OR >> baseline >> AND is the signal — and, crucially, it works
+        on endpoints that never emit a SQL error (which error-based detection
+        misses). Caller must have already confirmed the endpoint is
+        deterministic (see Scanner._natural_variance) to avoid dynamic-page FPs.
+        """
+        # Both variants should behave like the (successful) baseline status;
+        # a 500 means we broke syntax (error-based territory), not boolean.
+        if not (200 <= baseline.status_code < 300):
+            return 0.0, ""
+        if or_exchange.status_code != baseline.status_code:
+            return 0.0, ""
+        if and_exchange.status_code not in (baseline.status_code,):
+            return 0.0, ""
+        b = len(baseline.response_body)
+        o = len(or_exchange.response_body)
+        a = len(and_exchange.response_body)
+        if b == 0 or o == 0:
+            return 0.0, ""
+        grow = (o - b) / b        # how much the OR-true response grew
+        shrink = (b - a) / b      # how much the AND-false response shrank
+        # OR must return materially MORE than baseline, AND must return
+        # materially LESS, and OR must clearly exceed AND. Requiring BOTH
+        # directions is what separates real boolean SQLi from a page that
+        # merely reacts to any input.
+        if grow > 0.25 and a < b and o > a * 1.3 and (shrink > 0.10 or a < o * 0.6):
+            conf = min(0.9, 0.6 + grow / 5)
+            return conf, (
+                f"Boolean OR/AND amplification: baseline={b}b, "
+                f"OR-true={o}b (+{grow:.0%}), AND-false={a}b (-{shrink:.0%})"
+            )
+        return 0.0, ""
+
     def quick_score(
         self,
         baseline: HttpExchange,

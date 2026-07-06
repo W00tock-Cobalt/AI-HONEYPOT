@@ -423,6 +423,19 @@ class Scanner:
                 and len(quote_probe.response_body) == len(baseline.response_body)
             )
             if star_identical and quote_identical:
+                # The param looks inert to '/'*' probes — but an error-suppressed
+                # endpoint can still be BOOLEAN-injectable (OR '1'='1 returns all
+                # rows, AND '1'='2 returns none) with no error or status change.
+                # One OR/AND amplification pair catches that Nuclei-style case
+                # before we give up on the param.
+                if (200 <= baseline.status_code < 300
+                        and point.location.value in ("query", "body", "json")):
+                    amp = self._boolean_amplify_probe(
+                        url, method, data, content_type, extra_headers,
+                        point, baseline, report, max_pairs=1,
+                    )
+                    if amp is not None:
+                        return amp
                 return None  # dead param — ignores its value entirely
 
             if quote_errors:
@@ -686,21 +699,21 @@ class Scanner:
                     point, best_exchange, baseline, best_evidence, best_score
                 )
 
-        # Boolean-blind pair testing.
-        # Guard against SPA false positives: Angular/React apps return different
-        # body lengths for ANY param change (routing). Only run when:
-        # - A prior payload already scored >= 0.35 (param reacts to SQL chars)
-        # - Not --fast mode
-        # - Not a SPA-like URL
-        # - Only query/body params (path segments are too noisy)
+        # Boolean-based detection (OR/AND amplification + true/false pairs).
+        # Payloads are POSTFIXED to the original value (Nuclei-style) so the
+        # injection lands in the real query context. We run this on any 2xx
+        # query/body/json param — not just ones that already reacted to error
+        # probes — because boolean-injectable listing/search endpoints often
+        # never emit an error. The natural-variance guard below is what keeps
+        # this from false-positiving on dynamic/SPA pages.
         is_spa_like = any(seg in url for seg in (
             "/@ng/", "/Edge/", "/Trident/", "/%5C/", "/index.html", "/2fa/",
         ))
         run_bool_blind = (
-            best_score >= 0.35
-            and not self.fast
+            not self.fast
             and not is_spa_like
             and point.location.value in ("query", "body", "json")
+            and 200 <= baseline.status_code < 300
         )
         if run_bool_blind and self._natural_variance(
             url, method, data, content_type, extra_headers, point, baseline, report
@@ -708,22 +721,34 @@ class Scanner:
             # Non-deterministic endpoint — boolean differential would be noise.
             run_bool_blind = False
         if run_bool_blind:
-            from llmsql.payloads import BOOLEAN_PAIRS
-            for true_pl, false_pl in BOOLEAN_PAIRS[:4]:
+            from llmsql.payloads import BOOLEAN_AMPLIFY_PAIRS, BOOLEAN_PAIRS
+            orig = point.original_value or ""
+            # Postfix pairs: (true/OR-grows, false/AND-shrinks). Amplification
+            # pairs come first — they're the strongest error-free signal.
+            pairs = BOOLEAN_AMPLIFY_PAIRS[:3] + BOOLEAN_PAIRS[:3]
+            for true_pl, false_pl in pairs:
                 true_ex = self.probe.send(
                     url, method, data, content_type, extra_headers,
-                    inject_point=point, payload=true_pl,
+                    inject_point=point, payload=orig + true_pl,
                 )
                 false_ex = self.probe.send(
                     url, method, data, content_type, extra_headers,
-                    inject_point=point, payload=false_pl,
+                    inject_point=point, payload=orig + false_pl,
                 )
                 report.add_request()
                 report.add_request()
-                score, evidence = self.detector.boolean_blind_score(
+                # Take the stronger of: OR/AND amplification (Nuclei-style) or
+                # the classic true≈baseline / true≠false differential.
+                amp_score, amp_ev = self.detector.boolean_amplification_score(
                     baseline, true_ex, false_ex
                 )
-                # Require large diff (>40%) to avoid SPA routing false positives
+                blind_score, blind_ev = self.detector.boolean_blind_score(
+                    baseline, true_ex, false_ex
+                )
+                if amp_score >= blind_score:
+                    score, evidence = amp_score, amp_ev
+                else:
+                    score, evidence = blind_score, blind_ev
                 if score >= 0.85:
                     return self._build_finding(
                         point, true_ex, baseline, evidence, score,
@@ -741,6 +766,37 @@ class Scanner:
         if interim_findings:
             return max(interim_findings, key=lambda f: f.confidence)
 
+        return None
+
+    def _boolean_amplify_probe(
+        self, url, method, data, content_type, extra_headers, point, baseline, report,
+        max_pairs: int = 2,
+    ) -> Optional[Finding]:
+        """Run OR/AND result-amplification pairs (Nuclei-style, postfixed to the
+        value) and return a boolean-blind Finding if the OR-true response grows
+        while the AND-false response shrinks. Returns None otherwise.
+        """
+        from llmsql.payloads import BOOLEAN_AMPLIFY_PAIRS
+        orig = point.original_value or ""
+        for or_pl, and_pl in BOOLEAN_AMPLIFY_PAIRS[:max_pairs]:
+            or_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + or_pl,
+            )
+            and_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=orig + and_pl,
+            )
+            report.add_request()
+            report.add_request()
+            score, evidence = self.detector.boolean_amplification_score(
+                baseline, or_ex, and_ex
+            )
+            if score >= 0.85:
+                return self._build_finding(
+                    point, or_ex, baseline, evidence, score,
+                    inj_type=InjectionType.BOOLEAN_BLIND,
+                )
         return None
 
     def _natural_variance(
