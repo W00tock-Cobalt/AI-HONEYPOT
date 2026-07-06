@@ -63,6 +63,24 @@ KNOWN_APPS: dict[str, KnownApp] = {
             ("GET", "/rest/wallet/balance", None, None),
         ],
     ),
+    "brokencrystals": KnownApp(
+        app_id="brokencrystals",
+        name="BrokenCrystals",
+        endpoints=[
+            # Raw-SQL: query executed directly (PG_SLEEP works) — PostgreSQL.
+            ("GET", "/api/testimonials/count?query=1", None, None),
+            # name= interpolated straight into SQL ("' OR 1=1 --" dumps all).
+            # This is the one a spec-only scan tends to miss.
+            ("GET", "/api/products/search?name=test", None, None),
+            # x-product-name HEADER injection (spec usually captures this too).
+            ("GET", "/api/products/views", None, None),
+            # XPATH injection on the partners search.
+            ("GET", "/api/partners/searchPartners?keyword=test", None, None),
+            # Business-constraint / date range + id enumeration surfaces.
+            ("GET", "/api/products/latest?limit=3", None, None),
+            ("GET", "/api/users/id/1", None, None),
+        ],
+    ),
     "badstore": KnownApp(
         app_id="badstore",
         name="BadStore.net",
@@ -109,6 +127,21 @@ def fingerprint(site: str, timeout: float = 10.0, headers: Optional[dict] = None
         except httpx.HTTPError:
             pass
 
+        # BrokenCrystals: its OpenAPI spec (/api/spec or /swagger-json) mentions
+        # unique routes; the app also brands itself on the homepage.
+        for spec_path in ("/api/spec", "/swagger-json"):
+            try:
+                r = client.get(f"{site}{spec_path}", headers=headers or {})
+                body = r.text.lower()
+                if r.status_code == 200 and (
+                    "brokencrystals" in body
+                    or "testimonials/count" in body
+                    or "x-product-name" in body
+                ):
+                    return "brokencrystals"
+            except httpx.HTTPError:
+                pass
+
         # Homepage text fingerprints for apps without a unique API marker
         try:
             r = client.get(site, headers=headers or {})
@@ -121,6 +154,8 @@ def fingerprint(site: str, timeout: float = 10.0, headers: Optional[dict] = None
                 return "webgoat"
             if "juice shop" in body or "juice-sh.op" in body:
                 return "juice-shop"
+            if "broken crystals" in body or "brokencrystals" in body:
+                return "brokencrystals"
         except httpx.HTTPError:
             pass
 
