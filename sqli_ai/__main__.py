@@ -850,135 +850,147 @@ def _auto_discover(args, targets: list[str], console) -> None:
     Smart target discovery for --auto mode. Fully transparent: every step
     prints exactly what it tried and what it found — no silent fallbacks.
 
+    Runs for EVERY seed target (not just the first), so a list of sites is
+    fully expanded: each seed is probed for an OpenAPI/Swagger spec, and any
+    seed without one is fingerprinted + crawled + brute-forced. Sites with a
+    spec are collected in args._spec_sites so main() imports them all; the
+    original seeds are always kept.
+
+    Per seed:
     1. Probe common Swagger/OpenAPI spec paths on the site root.
-       Prints every path tried and its HTTP status/outcome (verbose: all,
-       non-verbose: summary + non-200 count).
-    2. If a spec is found: set args.openapi so the spec importer runs.
-    3. If not: crawl the site to discover URLs. This step is ONLY labeled
-       "katana" if katana actually runs — the discovered URLs are always
-       printed (not just a count) so you can see exactly what will be scanned.
+    2. If a spec is found: remember the site for spec import.
+    3. If not: fingerprint known apps, crawl (katana), and brute-force paths;
+       accumulate the discovered URLs.
     """
-    site = targets[0]
-    console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
-
-    # ---- Step 1: probe for an OpenAPI/Swagger spec ----------------------
     from sqli_ai.openapi import COMMON_SPEC_PATHS, load_openapi, last_probe_log
-    console.print(f"[*] Probing {len(COMMON_SPEC_PATHS)} common Swagger/OpenAPI paths...")
-    try:
-        spec_hits = load_openapi(
-            site,
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
-        )
-    except Exception as e:
-        spec_hits = []
-        console.print(f"[yellow]  OpenAPI probe raised an error: {e}[/yellow]")
 
-    if args.verbose:
-        for r in last_probe_log:
-            tag = "[green]200[/green]" if r.status == 200 else f"[dim]{r.status or 'ERR'}[/dim]"
-            console.print(f"    {tag}  {r.path}  [dim]— {r.reason}[/dim]")
+    all_discovered: set[str] = set(targets)  # never drop the original seeds
+    spec_sites: list[str] = []
+    known_extras: dict = {}
 
-    if spec_hits:
-        found_path = next((r.path for r in last_probe_log if r.reason == "valid OpenAPI spec found"), "?")
+    for site in list(targets):
+        console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
+
+        # ---- Step 1: probe for an OpenAPI/Swagger spec ------------------
         console.print(
-            f"[green]✓ Found OpenAPI/Swagger spec at {found_path}[/green] — "
-            f"{len(spec_hits)} endpoint(s) will be imported"
+            f"[*] Probing {len(COMMON_SPEC_PATHS)} common Swagger/OpenAPI paths..."
         )
-        args.openapi = site
-        return
-
-    non200 = sum(1 for r in last_probe_log if r.status != 200)
-    blocked = sum(1 for r in last_probe_log if r.status == 403)
-    console.print(
-        f"[yellow]✗ No OpenAPI/Swagger spec found[/yellow] "
-        f"({len(last_probe_log)} paths tried, {non200} non-200 responses"
-        + (f", {blocked} returned 403 — target may be blocking automated probes" if blocked else "")
-        + ")"
-    )
-    if not args.verbose:
-        console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
-
-    # ---- Step 1.5: fingerprint well-known vulnerable training apps -------
-    # Apps like OWASP Juice Shop deliberately ship with NO OpenAPI spec, and
-    # their real endpoints are triggered by client-side JS (search boxes,
-    # login forms) that a static crawler often misses. Recognize them and
-    # seed their known-vulnerable endpoints directly instead of relying
-    # solely on the crawl.
-    known_app_seeds: list[tuple] = []  # (method, url, body, content_type)
-    try:
-        from sqli_ai.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
-        app_id = fingerprint(site)
-        if app_id:
-            app = KNOWN_APPS[app_id]
-            known_app_seeds = get_seed_urls(site, app_id)
-            # Expose auth config so main() can auto-authenticate this app
-            if app.auth:
-                args._known_app_auth = (site, app.auth)
-            console.print(
-                f"[green]✓ Recognized target as {app.name}[/green] — "
-                f"seeding {len(known_app_seeds)} known-vulnerable endpoint(s)"
-            )
-            for method, url, _, _ in known_app_seeds:
-                console.print(f"    [cyan]->[/cyan] {method} {url}")
-    except Exception as e:
-        console.print(f"[dim]App fingerprinting skipped: {e}[/dim]")
-
-    # ---- Step 2: crawl to discover additional URLs ------------------------
-    crawled = katana_crawl(
-        site, console,
-        depth=getattr(args, "crawl_depth", 3),
-        verbose=args.verbose,
-    )
-    # Record the host so a later --crawl doesn't crawl the same host again.
-    from urllib.parse import urlparse as _up_site
-    args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
-
-    # ---- Step 3: organic path brute-forcing (content discovery) ----------
-    # Discover injectable endpoints (/api/products/search, /api/.../count, ...)
-    # by probing a wordlist — no per-app hardcoding needed. Soft-404 aware so
-    # SPAs don't flood us with false hits. On by default in --auto.
-    bruted: list[str] = []
-    if not getattr(args, "no_brute", False):
-        from sqli_ai.content_discovery import discover_paths
-        extra_words = None
-        wl = getattr(args, "brute_wordlist", None)
-        if wl:
-            try:
-                with open(wl) as f:
-                    extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
-            except OSError as e:
-                console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
         try:
-            bruted = discover_paths(
+            spec_hits = load_openapi(
                 site,
                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
-                extra_words=extra_words,
-                on_status=lambda m: console.print(m),
             )
         except Exception as e:
-            console.print(f"[yellow]Content discovery failed: {e}[/yellow]")
-        if bruted:
-            console.print(
-                f"[green]✓ Brute-force found {len(bruted)} live path(s)[/green]"
+            spec_hits = []
+            console.print(f"[yellow]  OpenAPI probe raised an error: {e}[/yellow]")
+
+        if args.verbose:
+            for r in last_probe_log:
+                tag = "[green]200[/green]" if r.status == 200 else f"[dim]{r.status or 'ERR'}[/dim]"
+                console.print(f"    {tag}  {r.path}  [dim]— {r.reason}[/dim]")
+
+        if spec_hits:
+            found_path = next(
+                (r.path for r in last_probe_log if r.reason == "valid OpenAPI spec found"),
+                "?",
             )
-            show_b = bruted if args.verbose else bruted[:15]
-            for u in show_b:
-                console.print(f"    [cyan]->[/cyan] {u}")
-            if len(show_b) < len(bruted):
-                console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
+            console.print(
+                f"[green]✓ Found OpenAPI/Swagger spec at {found_path}[/green] — "
+                f"{len(spec_hits)} endpoint(s) will be imported"
+            )
+            spec_sites.append(site)
+            continue  # endpoints imported in main(); no need to crawl this site
 
-    # ---- Merge: known-app seeds + katana crawl + brute (+ root as last resort) ----
-    known_urls = [u for _, u, _, _ in known_app_seeds]
-    combined = sorted(set(known_urls) | set(crawled) | set(bruted))
-    if not combined:
-        console.print("[yellow]Nothing discovered — scanning root only[/yellow]")
-        combined = targets
+        non200 = sum(1 for r in last_probe_log if r.status != 200)
+        blocked = sum(1 for r in last_probe_log if r.status == 403)
+        console.print(
+            f"[yellow]✗ No OpenAPI/Swagger spec found[/yellow] "
+            f"({len(last_probe_log)} paths tried, {non200} non-200 responses"
+            + (f", {blocked} returned 403 — target may be blocking automated probes" if blocked else "")
+            + ")"
+        )
+        if not args.verbose:
+            console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
 
-    args._auto_targets = combined
-    args._known_app_extras = {
-        url: (method, body, ct, None)
-        for method, url, body, ct in known_app_seeds
-    }
+        # ---- Step 1.5: fingerprint well-known vulnerable training apps ---
+        known_app_seeds: list[tuple] = []  # (method, url, body, content_type)
+        try:
+            from sqli_ai.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
+            app_id = fingerprint(site)
+            if app_id:
+                app = KNOWN_APPS[app_id]
+                known_app_seeds = get_seed_urls(site, app_id)
+                if app.auth:
+                    # Per-site auth config so each app can auto-authenticate.
+                    auths = getattr(args, "_known_app_auths", {})
+                    auths[site] = app.auth
+                    args._known_app_auths = auths
+                    # Back-compat single-site attribute (first one wins).
+                    if not hasattr(args, "_known_app_auth"):
+                        args._known_app_auth = (site, app.auth)
+                console.print(
+                    f"[green]✓ Recognized target as {app.name}[/green] — "
+                    f"seeding {len(known_app_seeds)} known-vulnerable endpoint(s)"
+                )
+                for method, url, _, _ in known_app_seeds:
+                    console.print(f"    [cyan]->[/cyan] {method} {url}")
+        except Exception as e:
+            console.print(f"[dim]App fingerprinting skipped: {e}[/dim]")
+
+        # ---- Step 2: crawl to discover additional URLs ------------------
+        crawled = katana_crawl(
+            site, console,
+            depth=getattr(args, "crawl_depth", 3),
+            verbose=args.verbose,
+        )
+        from urllib.parse import urlparse as _up_site
+        args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
+
+        # ---- Step 3: organic path brute-forcing (content discovery) -----
+        bruted: list[str] = []
+        if not getattr(args, "no_brute", False):
+            from sqli_ai.content_discovery import discover_paths
+            extra_words = None
+            wl = getattr(args, "brute_wordlist", None)
+            if wl:
+                try:
+                    with open(wl) as f:
+                        extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+                except OSError as e:
+                    console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+            try:
+                bruted = discover_paths(
+                    site,
+                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    extra_words=extra_words,
+                    on_status=lambda m: console.print(m),
+                )
+            except Exception as e:
+                console.print(f"[yellow]Content discovery failed: {e}[/yellow]")
+            if bruted:
+                console.print(
+                    f"[green]✓ Brute-force found {len(bruted)} live path(s)[/green]"
+                )
+                show_b = bruted if args.verbose else bruted[:15]
+                for u in show_b:
+                    console.print(f"    [cyan]->[/cyan] {u}")
+                if len(show_b) < len(bruted):
+                    console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
+
+        known_urls = [u for _, u, _, _ in known_app_seeds]
+        all_discovered |= set(known_urls) | set(crawled) | set(bruted)
+        known_extras.update({
+            url: (method, body, ct, None)
+            for method, url, body, ct in known_app_seeds
+        })
+
+    args._auto_targets = sorted(all_discovered)
+    args._known_app_extras = known_extras
+    args._spec_sites = spec_sites
+    # Back-compat: keep args.openapi pointing at the first spec site so any code
+    # path that only checks args.openapi still triggers an import.
+    if spec_sites and not args.openapi:
+        args.openapi = spec_sites[0]
     args.guess_params = True  # crawled URLs rarely expose real params — mine them
 
 
@@ -1027,32 +1039,44 @@ def main(argv: list[str] | None = None) -> int:
     if hasattr(args, "_known_app_extras"):
         spec_extras.update(args._known_app_extras)
 
+    # Spec sources: explicit --openapi plus every site auto-discovery found a
+    # spec on (args._spec_sites). Import them ALL so a list of API targets is
+    # fully expanded, not just the first.
+    spec_sources: list[str] = []
     if args.openapi:
+        spec_sources.append(args.openapi)
+    spec_sources.extend(getattr(args, "_spec_sites", []))
+    # De-dup while preserving order.
+    _seen_src: set[str] = set()
+    spec_sources = [s for s in spec_sources if not (s in _seen_src or _seen_src.add(s))]
+
+    if spec_sources:
         from sqli_ai.openapi import load_openapi
-        console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
-        try:
-            spec_targets = load_openapi(
-                args.openapi,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-                },
-            )
-            if spec_targets:
-                console.print(
-                    f"[green]✓[/green] {len(spec_targets)} endpoints from spec "
-                    f"[dim]({sum(1 for t in spec_targets if t.method != 'GET')} POST/PUT)[/dim]"
+        for src in spec_sources:
+            console.print(f"[*] Importing OpenAPI spec from {src} ...")
+            try:
+                spec_targets = load_openapi(
+                    src,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                    },
                 )
-                for st in spec_targets:
-                    targets.append(st.url)
-                    if st.method != "GET" or st.body or st.inject_headers:
-                        spec_extras[st.url] = (
-                            st.method, st.body, st.content_type, st.inject_headers
-                        )
-            else:
-                console.print("[yellow]No endpoints parsed from spec[/yellow]")
-        except Exception as e:
-            console.print(f"[yellow]OpenAPI import failed: {e}[/yellow]")
+                if spec_targets:
+                    console.print(
+                        f"[green]✓[/green] {len(spec_targets)} endpoints from spec "
+                        f"[dim]({sum(1 for t in spec_targets if t.method != 'GET')} POST/PUT)[/dim]"
+                    )
+                    for st in spec_targets:
+                        targets.append(st.url)
+                        if st.method != "GET" or st.body or st.inject_headers:
+                            spec_extras[st.url] = (
+                                st.method, st.body, st.content_type, st.inject_headers
+                            )
+                else:
+                    console.print("[yellow]No endpoints parsed from spec[/yellow]")
+            except Exception as e:
+                console.print(f"[yellow]OpenAPI import failed for {src}: {e}[/yellow]")
         # De-dup after merge
         seen_t: set[str] = set()
         targets = [t for t in targets if not (t in seen_t or seen_t.add(t))]
