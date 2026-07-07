@@ -285,6 +285,15 @@ class Scanner:
 
         report.injection_points = points
 
+        # Transparency: show EVERY field that will be probed with an injection
+        # character (query/body/path/header/cookie params). Each of these gets
+        # the precheck quote/'*' probe plus the technique battery.
+        _names = ", ".join(f"{p.name}({p.location.value})" for p in points[:15])
+        self.on_progress(
+            f"[*] Testing {len(points)} field(s) with injection probes: {_names}"
+            + (" ..." if len(points) > 15 else "")
+        )
+
         import concurrent.futures as _cf
 
         def _test_one(point):

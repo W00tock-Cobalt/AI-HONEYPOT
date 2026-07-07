@@ -1012,6 +1012,24 @@ def main(argv: list[str] | None = None) -> int:
 
     targets = collect_targets(args)
 
+    # sqlmap-style '*' marker: if the user put a '*' in a URL they are telling us
+    # EXACTLY where to inject. Respect that — don't let auto-discovery, organic
+    # expansion, brute-forcing or param mining replace/dilute the marked target.
+    # (This is why "sticking * everywhere" appeared not to work: auto-discovery
+    # was expanding the seed and the marked spot got lost in the crawl.)
+    marker_mode = any("*" in t for t in targets)
+    if marker_mode:
+        args.no_auto = True
+        args.auto = False
+        args.organic = False
+        args.no_brute = True
+        args.guess_params = False
+        args.no_guess_params = True
+        console.print(
+            "[dim]Injection marker '*' detected — testing exactly the marked "
+            "field(s); auto-discovery/organic/brute disabled.[/dim]"
+        )
+
     # Zero-config defaults: auto-discovery runs automatically for a single -u
     # site (bare scanning) so the user doesn't have to pass --auto every time.
     # It's skipped for list/stdin input (those already come from a crawler) and

@@ -272,7 +272,15 @@ class HttpProbe:
         return points
 
     def _marked_points(self, parsed) -> list[InjectionPoint]:
-        """Handle sqlmap-style '*' injection markers in the URL."""
+        """Handle sqlmap-style '*' injection markers in the URL.
+
+        A '*' means "inject exactly HERE" — so ONLY the path segment(s) or query
+        param(s) whose value actually contains '*' are tested, and the '*' is
+        stripped from the original value (payloads are appended at that spot).
+        The previous version stripped every '*' from the whole query first, which
+        made it impossible to tell which param was marked, so it wrongly tested
+        ALL params (and lost the surrounding context of the marked value).
+        """
         points: list[InjectionPoint] = []
         segments = parsed.path.split("/")
         for i, seg in enumerate(segments):
@@ -284,13 +292,16 @@ class HttpProbe:
                     path_index=i,
                 ))
         if "*" in (parsed.query or ""):
-            query = parse_qs(parsed.query.replace("*", ""), keep_blank_values=True)
+            # Parse WITHOUT stripping so we can see which value carries the '*'.
+            query = parse_qs(parsed.query, keep_blank_values=True)
             for name, values in query.items():
-                points.append(InjectionPoint(
-                    name=name,
-                    location=ParamLocation.QUERY,
-                    original_value=values[0] if values else "",
-                ))
+                value = values[0] if values else ""
+                if "*" in value:
+                    points.append(InjectionPoint(
+                        name=name,
+                        location=ParamLocation.QUERY,
+                        original_value=value.replace("*", ""),
+                    ))
         return points
 
     def _json_paths(self, obj: Any, prefix: str = "") -> list[InjectionPoint]:
