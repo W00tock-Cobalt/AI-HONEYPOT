@@ -81,7 +81,8 @@ python -m sqli_ai --openapi https://target/ \
 --crawl                Run katana on each seed to discover URLs (any run, not
                        just --auto; crawls authenticated with --cookie/--login)
 --crawl-depth N        katana crawl depth for --auto/--crawl (default 3)
---path                 Test URL path segments too
+--path                 Test URL path segments too (auto-enabled when a URL has
+                       an ID-like path segment, e.g. /api/user/1, and no query)
 --fast                 Error-based payloads only (quick triage)
 --payloads MODE        {sqlmap|embedded|error|boolean|union|time|stacked}
 --sleep N              Sleep seconds for time-based payloads (default 3)

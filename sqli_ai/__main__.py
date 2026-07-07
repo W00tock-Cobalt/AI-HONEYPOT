@@ -620,6 +620,40 @@ def has_injectable_params(url: str, test_path: bool = False) -> bool:
     return False
 
 
+def url_has_id_like_path(url: str) -> bool:
+    """True when a URL's path ends in an ID-like segment (numeric, UUID, or a
+    long alphanumeric token) and carries no query string.
+
+    REST endpoints such as ``/api/user/1`` or ``/products/42`` place the
+    injectable value in the path, not the query. Auto-enabling path testing for
+    these — without forcing users to remember ``--path`` — is what lets the
+    scanner catch path-based error SQLi (e.g. BrokenCrystals ``/api/user/{id}``)
+    out of the box. Kept deliberately narrow (ID-like only) so bare content
+    URLs like ``/about`` don't trigger noisy per-segment probing.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.query or "*" in url:
+        return False
+    segs = [s for s in parsed.path.split("/") if s]
+    if not segs:
+        return False
+
+    def _id_like(seg: str) -> bool:
+        if seg.isdigit():
+            return True
+        # UUID-ish or long alphanumeric identifier (has both letters and digits).
+        return (
+            len(seg) >= 8
+            and any(c.isdigit() for c in seg)
+            and any(c.isalpha() for c in seg)
+        )
+
+    # Any ID-like segment (not just the last) makes the URL worth path-testing,
+    # e.g. /user/1/orders as well as /api/user/1.
+    return any(_id_like(s) for s in segs)
+
+
 def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | None]:
     """
     Prepare LLM backend. Returns (use_llm, base_url, error_message).
@@ -1040,6 +1074,17 @@ def main(argv: list[str] | None = None) -> int:
     # (REST apps are mostly path-based), unless explicitly disabled.
     crawl_mode = bool(args.stdin or args.url_list) or len(targets) > 1
     test_path = args.test_path or (crawl_mode and not args.no_path)
+    # Single URL with an ID-like path segment and no query params (REST style,
+    # e.g. /api/user/1): auto-enable path testing so path-based error SQLi is
+    # caught without requiring the user to remember --path.
+    if not test_path and not args.no_path and any(
+        url_has_id_like_path(t) for t in targets
+    ):
+        test_path = True
+        console.print(
+            "[dim]Path testing auto-enabled (ID-like path segment, no query "
+            "params).[/dim]"
+        )
     if args.no_path:
         test_path = False
 

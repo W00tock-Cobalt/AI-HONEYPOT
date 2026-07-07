@@ -17,6 +17,12 @@ from sqli_ai.models import (
 )
 from sqli_ai.payloads import SEED_PAYLOADS
 
+# Locations where the blind batteries (boolean-ratio, UNION, time-based) run.
+# "path" is included so REST path-param injections (e.g. /api/user/{id}) get
+# the same blind coverage as query/body/json — error-based & NoSQL already run
+# there, but a path param can be boolean/time-blind with no error at all.
+_BLIND_LOCATIONS = ("query", "body", "json", "path")
+
 
 def _build_poc(exchange) -> tuple[str, str]:
     """Build a curl PoC + raw HTTP summary from the confirming exchange."""
@@ -534,7 +540,7 @@ class Scanner:
                 # of requests. Mined guesses that look dead are simply dropped.
                 if (not point.mined
                         and 200 <= baseline.status_code < 300
-                        and point.location.value in ("query", "body", "json")):
+                        and point.location.value in _BLIND_LOCATIONS):
                     bfind = self._boolean_ratio_detect(
                         url, method, data, content_type, extra_headers,
                         point, baseline, report,
@@ -630,7 +636,7 @@ class Scanner:
                 # back to NoSQL. Both no-op cheaply on genuinely dynamic pages.
                 if (not point.mined
                         and 200 <= baseline.status_code < 300
-                        and point.location.value in ("query", "body", "json")):
+                        and point.location.value in _BLIND_LOCATIONS):
                     bfind = self._boolean_ratio_detect(
                         url, method, data, content_type, extra_headers,
                         point, baseline, report,
@@ -853,7 +859,7 @@ class Scanner:
         run_bool_blind = (
             not self.fast
             and not is_spa_like
-            and point.location.value in ("query", "body", "json")
+            and point.location.value in _BLIND_LOCATIONS
             and 200 <= baseline.status_code < 300
         )
         if run_bool_blind:
@@ -870,7 +876,7 @@ class Scanner:
         # so only on params with a clear reaction (best_score >= 0.5) to keep the
         # per-endpoint request count bounded.
         if (not self.fast and best_score >= 0.5
-                and point.location.value in ("query", "body", "json")):
+                and point.location.value in _BLIND_LOCATIONS):
             ufind = self._test_union(
                 url, method, data, content_type, extra_headers, point, baseline, report
             )
@@ -880,7 +886,7 @@ class Scanner:
         # Time-based blind (fallback): catches blind injections with no error
         # and no content change. Skip speculative mined guesses unless they
         # actually reacted (best_score) to keep request volume bounded.
-        if (not self.fast and point.location.value in ("query", "body", "json")
+        if (not self.fast and point.location.value in _BLIND_LOCATIONS
                 and (not point.mined or best_score >= 0.3)):
             tfind = self._test_time_based(
                 url, method, data, content_type, extra_headers, point, baseline, report
@@ -1456,10 +1462,22 @@ class Scanner:
             return None
 
         # PATH injection: changing a path segment almost always changes the HTTP
-        # response (different route, 404, etc.) — that alone is NOT SQLi.
-        # Require actual SQL error text for path-segment findings, UNLESS this is
-        # a NoSQL finding (confirmed separately via boolean differential/error).
-        if point.location.value == "path" and inj_type != InjectionType.NOSQL:
+        # response (different route, 404, etc.) — that alone is NOT SQLi. So
+        # error-based / reflection path findings MUST carry actual SQL error
+        # text. The rigorously self-confirming techniques are exempt: they each
+        # have an internal control that a mere route change can't fake —
+        # time-blind (sleep vs sleep(0) control), boolean-blind (TRUE≈baseline &
+        # FALSE≠baseline, re-tested), UNION (random marker reflected), stacked
+        # (timing), and NoSQL (boolean differential / driver error). Requiring a
+        # SQL error for those would silently drop real blind path SQLi.
+        _PATH_SELF_CONFIRMING = {
+            InjectionType.TIME_BLIND,
+            InjectionType.BOOLEAN_BLIND,
+            InjectionType.UNION_BASED,
+            InjectionType.STACKED,
+            InjectionType.NOSQL,
+        }
+        if point.location.value == "path" and inj_type not in _PATH_SELF_CONFIRMING:
             if not self.detector.find_sql_errors(injected.response_body):
                 return None
 
