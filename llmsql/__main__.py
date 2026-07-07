@@ -1370,6 +1370,35 @@ def main(argv: list[str] | None = None) -> int:
         model=args.model if use_llm else DEFAULT_OLLAMA_MODEL,
     )
 
+    # Announce exactly which brain is driving the scan (asked-for transparency).
+    import os as _os
+    if use_llm:
+        if args.base_url:
+            backend = f"remote OpenAI-compatible @ {base_url}"
+        else:
+            backend = f"Ollama (local) @ {base_url}"
+        _to = _os.getenv("LLMSQL_LLM_TIMEOUT", "25")
+        console.print(
+            f"[bold]AI engine:[/bold] [green]{backend}[/green] "
+            f"model=[cyan]{agent.model}[/cyan] "
+            f"[dim](per-call timeout {_to}s; auto-falls back to heuristics if slow; "
+            f"disable with --no-llm)[/dim]"
+        )
+        if args.fast:
+            console.print("[dim]  --fast: LLM per-parameter suggestion/analysis is "
+                          "skipped; LLM used only where cheap.[/dim]")
+        if args.verbose:
+            console.print(
+                "[dim]  LLM roles: payload suggestion, response analysis, finding "
+                "confirmation. Detection itself is deterministic (heuristics).[/dim]"
+            )
+    else:
+        why = "--no-llm" if args.no_llm else "LLM unavailable"
+        console.print(
+            f"[bold]AI engine:[/bold] [yellow]OFF[/yellow] ({why}) — "
+            f"heuristic-only deterministic detection engine"
+        )
+
     verbose_progress = args.verbose or args.show_response
 
     def progress(msg: str):

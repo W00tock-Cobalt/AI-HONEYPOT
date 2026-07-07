@@ -82,13 +82,26 @@ class LlmAgent:
         else:
             self.api_key = os.getenv("OPENAI_API_KEY", "")
 
-        self._client = httpx.Client(timeout=120.0)
+        # Per-call timeout (env-overridable). A slow local model must fail fast
+        # so it can't stall the whole scan — the deterministic engine carries on.
+        try:
+            _to = float(os.getenv("LLMSQL_LLM_TIMEOUT", "25"))
+        except ValueError:
+            _to = 25.0
+        self._client = httpx.Client(timeout=httpx.Timeout(_to, connect=5.0))
+        # Circuit breaker: after this many consecutive timeouts/errors, stop
+        # calling the LLM for the rest of the run (fall back to heuristics).
+        self._fail_count = 0
+        self._max_fails = 2
+        self._disabled = False
 
     def close(self):
         self._client.close()
 
     def _chat(self, system: str, user: str) -> dict[str, Any]:
         """Call chat completions and parse JSON response."""
+        if self._disabled:
+            raise RuntimeError("LLM disabled (too slow/unreachable) — heuristics only")
         if not self.api_key and not self.is_ollama:
             raise RuntimeError(
                 "No LLM API key. Set OPENAI_API_KEY, use Ollama (default), or pass --api-key"
@@ -109,16 +122,28 @@ class LlmAgent:
         else:
             body["response_format"] = {"type": "json_object"}
 
-        resp = self._client.post(
-            f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=body,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
+        try:
+            resp = self._client.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (httpx.TimeoutException, httpx.HTTPError) as e:
+            # Trip the circuit breaker after repeated slowness/errors so one
+            # stuck model can't stall the whole scan.
+            self._fail_count += 1
+            if self._fail_count >= self._max_fails:
+                self._disabled = True
+            raise RuntimeError(
+                f"LLM call failed ({type(e).__name__})"
+                + (" — disabling LLM for this run" if self._disabled else "")
+            )
+        self._fail_count = 0  # success resets the breaker
         return self._parse_json(content)
 
     @staticmethod
