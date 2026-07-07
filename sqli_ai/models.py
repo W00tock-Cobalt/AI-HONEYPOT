@@ -95,6 +95,9 @@ class Finding:
     response_before: str = ""   # "HTTP <code>\n<snippet>" for the baseline
     response_after: str = ""    # "HTTP <code>\n<snippet>" for the injected req
     payload_url: str = ""       # The exact URL/target the payload hit
+    # AI post-confirmation analysis (impact/exploitation/remediation). Populated
+    # only when the LLM is enabled; never affects detection.
+    ai_analysis: str = ""
 
 
 @dataclass

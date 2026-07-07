@@ -294,6 +294,55 @@ Decide the next action."""
             db_hint=result.get("db_hint"),
         )
 
+    def analyze_finding(
+        self,
+        *,
+        url: str,
+        param: str,
+        location: str,
+        injection_type: str,
+        db_type: Optional[str],
+        payload: str,
+        evidence: str,
+        response_after: str,
+    ) -> dict[str, Any]:
+        """Post-confirmation AI analysis of a CONFIRMED finding.
+
+        Runs after the deterministic engine has already confirmed the vuln, so
+        it never affects detection (and thus scan consistency). It produces a
+        human-readable impact/exploitation writeup that makes the LLM genuinely
+        useful and visible on every finding, not just near-misses. Returns a
+        dict with: impact, exploitation, remediation, severity, confidence.
+        """
+        system = (
+            "You are a senior application security engineer writing the analysis "
+            "section of a penetration-test finding for a CONFIRMED SQL/NoSQL "
+            "injection. Be concise, technical and accurate. Respond ONLY as JSON."
+        )
+        user = (
+            f"A SQL injection was CONFIRMED by a deterministic scanner. Write the "
+            f"analysis.\n\n"
+            f"URL: {url}\n"
+            f"Parameter: {param} ({location})\n"
+            f"Injection type: {injection_type}\n"
+            f"Database: {db_type or 'unknown'}\n"
+            f"Confirming payload: {payload!r}\n"
+            f"Scanner evidence: {evidence}\n"
+            f"Response excerpt:\n{(response_after or '')[:1200]}\n\n"
+            'Respond ONLY as JSON with keys: '
+            '{"impact": "<what an attacker can do>", '
+            '"exploitation": "<concrete next step, e.g. sqlmap flags or a UNION/'
+            'error-extraction approach for this DBMS>", '
+            '"remediation": "<the fix>", '
+            '"severity": "critical|high|medium|low", '
+            '"confidence": 0.0-1.0}'
+        )
+        try:
+            result = self._chat(system, user)
+        except Exception as e:
+            return {"error": str(e)}
+        return result if isinstance(result, dict) else {}
+
     def confirm_finding(
         self,
         baseline: HttpExchange,

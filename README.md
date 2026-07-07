@@ -22,6 +22,23 @@ nuclei -u https://target/ -t ~/nuclei-templates/ \
   -tags sqli,xss,xxe,ssti,lfi,rce -severity critical,high
 ```
 
+## AI usage
+
+The LLM (Ollama by default, or any OpenAI-compatible backend via `--base-url`)
+is used in two places, and it's visible in the output:
+
+1. **Near-miss assist (during the scan):** when a parameter *reacts* to
+   injection but the deterministic engine can't confirm it, the LLM is asked for
+   a few targeted payloads for that exact context.
+2. **AI analysis (after confirmation):** every confirmed finding gets an AI
+   impact / exploitation / remediation writeup, shown in the PoC panel and saved
+   to the JSON report (`ai_analysis`). This runs *after* deterministic
+   confirmation, so it never changes detection results.
+
+Detection itself is deterministic (heuristics) for reliability. Disable the LLM
+with `--no-llm`; it also auto-falls back to heuristics if the model is slow or
+unreachable (per-call timeout + circuit breaker).
+
 ## Quick start
 
 ```bash

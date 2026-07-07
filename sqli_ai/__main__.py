@@ -1615,7 +1615,8 @@ def main(argv: list[str] | None = None) -> int:
                 interrupted = True
     finally:
         probe.close()
-        agent.close()
+        # NOTE: agent is intentionally NOT closed here — the AI analysis pass
+        # below still needs it. It's closed once that pass is done.
 
     if interrupted:
         console.print(
@@ -1654,6 +1655,50 @@ def main(argv: list[str] | None = None) -> int:
                 rows.append((host, r, f))
         rows.sort(key=lambda t: (t[0], -t[2].confidence, t[2].param))
         unique_findings = [(r, f) for _, r, f in rows]
+
+        # ---- AI analysis pass -------------------------------------------
+        # Runs the LLM on EVERY confirmed finding to produce an impact /
+        # exploitation / remediation writeup. This is where the AI does
+        # genuinely useful, visible work — and because it runs AFTER the
+        # deterministic engine has confirmed each vuln, it can never change
+        # detection results or scan consistency. Skipped in --fast / --no-llm
+        # and self-disables (circuit breaker) if the model is slow/unreachable.
+        if use_llm and not args.fast and unique_findings:
+            console.print(
+                f"\n[bold]AI analysis[/bold] — reviewing "
+                f"{len(unique_findings)} confirmed finding(s) with "
+                f"[cyan]{agent.model}[/cyan] ..."
+            )
+            for i, (_r, f) in enumerate(unique_findings, 1):
+                if getattr(agent, "_disabled", False):
+                    console.print(
+                        "[yellow]  AI analysis disabled (model slow/unreachable) "
+                        "— remaining findings use heuristic evidence only.[/yellow]"
+                    )
+                    break
+                console.print(
+                    f"[dim]  [{i}/{len(unique_findings)}] analyzing "
+                    f"{f.param} ({f.injection_type.value}) ...[/dim]"
+                )
+                res = agent.analyze_finding(
+                    url=f.payload_url or _r.target_url,
+                    param=f.param,
+                    location=f.location.value,
+                    injection_type=f.injection_type.value,
+                    db_type=f.db_type,
+                    payload=f.payload,
+                    evidence=f.evidence,
+                    response_after=f.response_after,
+                )
+                if res and not res.get("error"):
+                    parts = []
+                    if res.get("impact"):
+                        parts.append(f"Impact: {res['impact']}")
+                    if res.get("exploitation"):
+                        parts.append(f"Exploit: {res['exploitation']}")
+                    if res.get("remediation"):
+                        parts.append(f"Fix: {res['remediation']}")
+                    f.ai_analysis = "\n".join(parts)
 
         tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
         tbl.add_column("Host", style="magenta", no_wrap=False, max_width=32)
@@ -1724,12 +1769,18 @@ def main(argv: list[str] | None = None) -> int:
                     "\n\n[bold]Response AFTER[/bold] [dim](payload injected)[/dim]:\n"
                     f"[yellow]{_indent(f.response_after)}[/yellow]"
                 )
+            if f.ai_analysis:
+                body += f"\n\n[bold]AI analysis[/bold] [dim]({agent.model})[/dim]:\n[green]{_indent(f.ai_analysis)}[/green]"
             sev_color = "red" if f.confidence >= 0.8 else "yellow"
             console.print(Panel(
                 body,
                 title=f"[{sev_color}]PoC #{i} — {f.param} @ {_up(r.target_url).path}[/{sev_color}]",
                 border_style=sev_color,
             ))
+
+    # AI analysis pass is done — the agent is no longer needed. Close it now
+    # (it was deliberately kept open past the scan's finally block for the pass).
+    agent.close()
 
     if args.output:
         if len(all_reports) == 1:
