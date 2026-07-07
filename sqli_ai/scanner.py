@@ -3,10 +3,10 @@
 import time
 from typing import Callable, Optional
 
-from llmsql.agent import LlmAgent
-from llmsql.detector import SqlDetector
-from llmsql.http_probe import HttpProbe
-from llmsql.models import (
+from sqli_ai.agent import LlmAgent
+from sqli_ai.detector import SqlDetector
+from sqli_ai.http_probe import HttpProbe
+from sqli_ai.models import (
     Finding,
     HttpExchange,
     InjectionPoint,
@@ -15,7 +15,7 @@ from llmsql.models import (
     ScanReport,
     Severity,
 )
-from llmsql.payloads import SEED_PAYLOADS
+from sqli_ai.payloads import SEED_PAYLOADS
 
 
 def _build_poc(exchange) -> tuple[str, str]:
@@ -243,7 +243,7 @@ class Scanner:
             try:
                 ct = baseline.response_headers.get("content-type", "") \
                     if baseline.response_headers else ""
-                from llmsql.param_discovery import discover
+                from sqli_ai.param_discovery import discover
                 names, _param_urls, _post_forms = discover(url, baseline.response_body, ct)
                 if names:
                     discovered_params = names
@@ -672,7 +672,7 @@ class Scanner:
 
         # Apply explicit tamper chain up front, if requested
         if self.tamper:
-            from llmsql.tamper import apply_tamper
+            from sqli_ai.tamper import apply_tamper
             payloads = [apply_tamper(p, self.tamper) for p in payloads if isinstance(p, str)]
 
         seen = set()
@@ -734,7 +734,7 @@ class Scanner:
                 blocked += 1
                 if (self.auto_tamper and not tamper_triggered and blocked >= 2):
                     tamper_triggered = True
-                    from llmsql.tamper import AUTO_TAMPER_CHAIN, tamper_variants
+                    from sqli_ai.tamper import AUTO_TAMPER_CHAIN, tamper_variants
                     added = 0
                     for base in list(unique_payloads):
                         for variant in tamper_variants(base, AUTO_TAMPER_CHAIN):
@@ -963,11 +963,11 @@ class Scanner:
            TRUE ~= original while FALSE clearly diverges (the classic sqlmap
            signal), OR the OR-amplification grow/shrink asymmetry.
         """
-        from llmsql.compare import (
+        from sqli_ai.compare import (
             DIFF_TOLERANCE, HEAVILY_DYNAMIC_BOUND, MIN_STABLE_PAGE,
             UPPER_RATIO_BOUND, find_dynamic_markers, ratio, remove_dynamic,
         )
-        from llmsql.payloads import BOOLEAN_AND_PAIRS, BOOLEAN_AMPLIFY_PAIRS
+        from sqli_ai.payloads import BOOLEAN_AND_PAIRS, BOOLEAN_AMPLIFY_PAIRS
         orig = point.original_value or ""
 
         # Tiny responses make ratio comparison meaningless (a 1-byte "1" flips
@@ -1057,7 +1057,7 @@ class Scanner:
     ) -> bool:
         """Re-run a candidate boolean-ratio pair once; return True only if the
         TRUE~original / FALSE-diverges signal reproduces (kills transient FPs)."""
-        from llmsql.compare import (
+        from sqli_ai.compare import (
             DIFF_TOLERANCE, UPPER_RATIO_BOUND, ratio, remove_dynamic,
         )
         orig = point.original_value or ""
@@ -1079,7 +1079,7 @@ class Scanner:
         value) and return a boolean-blind Finding if the OR-true response grows
         while the AND-false response shrinks. Returns None otherwise.
         """
-        from llmsql.payloads import BOOLEAN_AMPLIFY_PAIRS
+        from sqli_ai.payloads import BOOLEAN_AMPLIFY_PAIRS
         orig = point.original_value or ""
         for or_pl, and_pl in BOOLEAN_AMPLIFY_PAIRS[:max_pairs]:
             or_ex = self.probe.send(
@@ -1143,7 +1143,7 @@ class Scanner:
         when no chain is configured. Used by the dedicated technique methods so
         time-based/blind detection also evades filters, not just the main suite."""
         if self.tamper and isinstance(payload, str):
-            from llmsql.tamper import apply_tamper
+            from sqli_ai.tamper import apply_tamper
             return apply_tamper(payload, self.tamper)
         return payload
 
@@ -1164,7 +1164,7 @@ class Scanner:
         if sample.response_headers:
             ct = sample.response_headers.get("content-type", "")
         try:
-            from llmsql.param_discovery import discover
+            from sqli_ai.param_discovery import discover
             names, _urls, _forms = discover(url, sample.response_body, ct)
         except Exception:
             names = []
@@ -1199,7 +1199,7 @@ class Scanner:
             return finding
         import re
 
-        from llmsql.payloads import ERROR_EXTRACT_TEMPLATES
+        from sqli_ai.payloads import ERROR_EXTRACT_TEMPLATES
         orig = point.original_value or ""
         for tpl, db in ERROR_EXTRACT_TEMPLATES:
             pl = orig + tpl.format(q="version()")
@@ -1250,7 +1250,7 @@ class Scanner:
         """
         if self.fast:
             return None
-        from llmsql.payloads import (
+        from sqli_ai.payloads import (
             STACKED_TIME_TEMPLATES, TIME_BASED_POLYGLOTS, TIME_BASED_TEMPLATES,
         )
         sleep_s = max(1, int(round(self._sleep_ms / 1000)))
@@ -1392,7 +1392,7 @@ class Scanner:
         Sends boolean true/false pairs (' || '1'=='1' vs '2') and looks for a
         response differential or an explicit NoSQL driver error.
         """
-        from llmsql.payloads import NOSQL_PAIRS
+        from sqli_ai.payloads import NOSQL_PAIRS
         if self.fast or not (200 <= baseline.status_code < 300):
             return None
         # Skip non-deterministic endpoints (captcha/random/timestamps) — their

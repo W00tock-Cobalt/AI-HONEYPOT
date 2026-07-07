@@ -1,6 +1,6 @@
 """Response comparison engine (sqlmap-style).
 
-llmsql historically compared responses by byte length, which is crude: two
+sqli_ai historically compared responses by byte length, which is crude: two
 pages can share a length yet differ completely, and any page with a timestamp
 or CSRF token looks "different" on every request. This module ports the two
 ideas that make sqlmap/Ghauri boolean detection reliable:

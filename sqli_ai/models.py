@@ -1,4 +1,4 @@
-"""Data models for LLMSQL scans."""
+"""Data models for SQLi-AI scans."""
 
 from dataclasses import dataclass, field
 from enum import Enum

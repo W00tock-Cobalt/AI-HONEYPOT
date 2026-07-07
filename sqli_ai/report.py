@@ -9,7 +9,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from llmsql.models import ScanReport, Severity
+from sqli_ai.models import ScanReport, Severity
 
 
 def _indent(text: str, prefix: str = "    ", limit: int = 600) -> str:
@@ -30,7 +30,7 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
         f"[bold]Requests:[/bold] {report.total_requests}  "
         f"[bold]Duration:[/bold] {report.duration_seconds:.1f}s  "
         f"[bold]LLM:[/bold] {report.llm_model}",
-        title="LLMSQL Scan Report",
+        title="SQLi-AI Scan Report",
         border_style="cyan",
     ))
 

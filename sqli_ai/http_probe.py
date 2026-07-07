@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx
 
-from llmsql.models import HttpExchange, InjectionPoint, ParamLocation
+from sqli_ai.models import HttpExchange, InjectionPoint, ParamLocation
 
 # CGI/web-app action → likely injectable params (for ?action=X style apps like BadStore).
 # When katana finds /page.cgi?action=search but no searchquery param in the URL,

@@ -3,8 +3,8 @@
 import re
 from typing import Optional
 
-from llmsql.models import HttpExchange, InjectionType
-from llmsql.payloads import NOSQL_ERROR_PATTERNS, SQL_ERROR_PATTERNS
+from sqli_ai.models import HttpExchange, InjectionType
+from sqli_ai.payloads import NOSQL_ERROR_PATTERNS, SQL_ERROR_PATTERNS
 
 
 class SqlDetector:

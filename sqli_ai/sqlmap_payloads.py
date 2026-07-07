@@ -136,7 +136,7 @@ PAYLOADS_STACKED = [
     "'; SELECT pg_sleep(1)--",
     "1; SELECT 1--",
     "1'; SELECT 1--",
-    "1'; DROP TABLE IF EXISTS llmsql_test--",
+    "1'; DROP TABLE IF EXISTS sqli_ai_test--",
     "'); SELECT 1--",
 ]
 

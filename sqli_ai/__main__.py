@@ -1,10 +1,10 @@
 """
-LLMSQL CLI — AI-powered SQL injection scanner.
+SQLi-AI CLI — AI-powered SQL injection scanner.
 
 Usage:
-  python -m llmsql -u "http://target/page?id=1"
-  python -m llmsql -u "http://target/api" --data '{"user":"admin"}' --header "Content-Type: application/json"
-  python -m llmsql -u "http://target/login" --data "user=admin&pass=test" --method POST
+  python -m sqli_ai -u "http://target/page?id=1"
+  python -m sqli_ai -u "http://target/api" --data '{"user":"admin"}' --header "Content-Type: application/json"
+  python -m sqli_ai -u "http://target/login" --data "user=admin&pass=test" --method POST
 """
 
 import argparse
@@ -13,16 +13,16 @@ from typing import Optional
 
 from rich.console import Console
 
-from llmsql import __version__
-from llmsql.agent import LlmAgent
-from llmsql.http_probe import HttpProbe
-from llmsql.ollama import (
+from sqli_ai import __version__
+from sqli_ai.agent import LlmAgent
+from sqli_ai.http_probe import HttpProbe
+from sqli_ai.ollama import (
     DEFAULT_OLLAMA_MODEL,
     ensure_ready,
     ollama_base_url,
 )
-from llmsql.report import print_report, save_json
-from llmsql.scanner import Scanner
+from sqli_ai.report import print_report, save_json
+from sqli_ai.scanner import Scanner
 
 
 def parse_headers(header_args: list[str]) -> dict[str, str]:
@@ -49,8 +49,8 @@ def parse_cookies(cookie_str: str) -> dict[str, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="llmsql",
-        description="LLMSQL — AI-powered SQL injection scanner (sqlmap alternative)",
+        prog="sqli-ai",
+        description="SQLi-AI — AI-powered SQL injection scanner (sqlmap alternative)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -69,14 +69,14 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     )
 
     # Target (sqlmap-style). A bare positional URL also works:
-    #   python -m llmsql https://target/
+    #   python -m sqli_ai https://target/
     p.add_argument("target", nargs="?", default=None,
                    help="Target URL (positional; equivalent to -u)")
     p.add_argument("-u", "--url", help="Target URL")
     p.add_argument("-l", "--list", dest="url_list",
                    help="File with target URLs, one per line (e.g. katana output)")
     p.add_argument("--stdin", action="store_true",
-                   help="Read target URLs from stdin (e.g. katana ... | llmsql --stdin)")
+                   help="Read target URLs from stdin (e.g. katana ... | sqli_ai --stdin)")
     p.add_argument("--only-with-params", action="store_true",
                    help="Skip URLs with no query params AND no path segments to test")
     p.add_argument("--path", dest="test_path", action="store_true",
@@ -158,7 +158,7 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Test only this parameter (repeatable)")
     p.add_argument("--proxy", help="HTTP proxy URL")
     p.add_argument("--timeout", type=float, default=15.0,
-                   help="HTTP request timeout in seconds for LLMSQL's own requests (default: 15)")
+                   help="HTTP request timeout in seconds for SQLi-AI's own requests (default: 15)")
 
     # Scan depth
     p.add_argument("--level", type=int, default=1, choices=[1, 2, 3],
@@ -216,14 +216,14 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--list-tamper", action="store_true",
                    help="List available tamper techniques and exit")
 
-    # sqlmap handoff — use LLMSQL for discovery, sqlmap for exploitation
+    # sqlmap handoff — use SQLi-AI for discovery, sqlmap for exploitation
     p.add_argument("--sqlmap", action="store_true",
                    help="Don't scan; discover injectable URLs and emit a sqlmap "
                         "target list + command (recon -> sqlmap handoff)")
     p.add_argument("--run-sqlmap", action="store_true",
                    help="Like --sqlmap, but also execute sqlmap if it is installed")
-    p.add_argument("--sqlmap-out", default="llmsql-sqlmap-urls.txt",
-                   help="File to write discovered sqlmap targets (default: llmsql-sqlmap-urls.txt)")
+    p.add_argument("--sqlmap-out", default="sqli_ai-sqlmap-urls.txt",
+                   help="File to write discovered sqlmap targets (default: sqli_ai-sqlmap-urls.txt)")
     p.add_argument("--sqlmap-profile", choices=["stealth", "normal", "aggressive", "exploit", "nuclear"],
                    default="normal",
                    help="sqlmap intensity preset (default: normal). "
@@ -233,7 +233,7 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--sqlmap-menu", action="store_true",
                    help="Interactively choose the sqlmap profile and edit flags before running")
     p.add_argument("--then-sqlmap", action="store_true",
-                   help="Scan with LLMSQL first, then run sqlmap ONLY on the confirmed "
+                   help="Scan with SQLi-AI first, then run sqlmap ONLY on the confirmed "
                         "injectable URLs (fast + deep exploitation of real hits)")
 
     # nuclei handoff — multi-class DAST breadth on discovered URLs
@@ -277,7 +277,7 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Verbose output (repeatable: -v, -vv, -vvv)")
     p.add_argument("--show-response", action="store_true",
                    help="Print a snippet of each injected response (debug detection)")
-    p.add_argument("--version", action="version", version=f"llmsql {__version__}")
+    p.add_argument("--version", action="version", version=f"sqli_ai {__version__}")
 
     return p
 
@@ -499,7 +499,7 @@ def grab_cookie(
                     # static --login-data can't know. User-supplied values win.
                     try:
                         page = c.get(login_url, headers=headers or {})
-                        from llmsql.param_discovery import hidden_form_fields
+                        from sqli_ai.param_discovery import hidden_form_fields
                         for k, v in hidden_form_fields(page.text).items():
                             data.setdefault(k, v)
                     except httpx.HTTPError:
@@ -703,7 +703,7 @@ def organic_expand_targets(
     """
     import httpx
 
-    from llmsql.param_discovery import discover
+    from sqli_ai.param_discovery import discover
 
     existing = set(targets)
     discovered: list[str] = []
@@ -828,7 +828,7 @@ def _auto_discover(args, targets: list[str], console) -> None:
     console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
 
     # ---- Step 1: probe for an OpenAPI/Swagger spec ----------------------
-    from llmsql.openapi import COMMON_SPEC_PATHS, load_openapi, last_probe_log
+    from sqli_ai.openapi import COMMON_SPEC_PATHS, load_openapi, last_probe_log
     console.print(f"[*] Probing {len(COMMON_SPEC_PATHS)} common Swagger/OpenAPI paths...")
     try:
         spec_hits = load_openapi(
@@ -872,7 +872,7 @@ def _auto_discover(args, targets: list[str], console) -> None:
     # solely on the crawl.
     known_app_seeds: list[tuple] = []  # (method, url, body, content_type)
     try:
-        from llmsql.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
+        from sqli_ai.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
         app_id = fingerprint(site)
         if app_id:
             app = KNOWN_APPS[app_id]
@@ -905,7 +905,7 @@ def _auto_discover(args, targets: list[str], console) -> None:
     # SPAs don't flood us with false hits. On by default in --auto.
     bruted: list[str] = []
     if not getattr(args, "no_brute", False):
-        from llmsql.content_discovery import discover_paths
+        from sqli_ai.content_discovery import discover_paths
         extra_words = None
         wl = getattr(args, "brute_wordlist", None)
         if wl:
@@ -953,14 +953,14 @@ def main(argv: list[str] | None = None) -> int:
     console = Console()
 
     if args.list_tamper:
-        from llmsql.tamper import available
+        from sqli_ai.tamper import available
         console.print("[bold]Available tamper techniques:[/bold]")
         for name in available():
             console.print(f"  {name}")
         return 0
 
     console.print(
-        f"[bold cyan]LLMSQL v{__version__}[/bold cyan] — "
+        f"[bold cyan]SQLi-AI v{__version__}[/bold cyan] — "
         f"AI-powered SQL injection scanner [dim](Ollama backend)[/dim]\n"
     )
 
@@ -994,7 +994,7 @@ def main(argv: list[str] | None = None) -> int:
         spec_extras.update(args._known_app_extras)
 
     if args.openapi:
-        from llmsql.openapi import load_openapi
+        from sqli_ai.openapi import load_openapi
         console.print(f"[*] Importing OpenAPI spec from {args.openapi} ...")
         try:
             spec_targets = load_openapi(
@@ -1032,7 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             "[dim]Tip: a bare host with no parameters has nothing to inject. "
             "Crawl first, e.g.:[/dim]\n"
             "  [dim]katana -u https://target -f qurl -silent | "
-            "python -m llmsql --stdin --only-with-params[/dim]"
+            "python -m sqli_ai --stdin --only-with-params[/dim]"
         )
         return 2
 
@@ -1087,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- Authenticated scanning: obtain a bearer/JWT token --------------
     # Priority: explicit --auth-token > --auth-url/--auth-data login >
     # known-app auto-auth (e.g. Juice Shop login-SQLi self-auth).
-    from llmsql.auth import obtain_token
+    from sqli_ai.auth import obtain_token
     auth_token: Optional[str] = None
     if args.auth_token:
         auth_token = args.auth_token
@@ -1162,7 +1162,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.brute and not auto_on:
         from urllib.parse import urlparse as _up_b
 
-        from llmsql.content_discovery import discover_paths
+        from sqli_ai.content_discovery import discover_paths
         extra_words = None
         if args.brute_wordlist:
             try:
@@ -1230,7 +1230,7 @@ def main(argv: list[str] | None = None) -> int:
     # Parameter mining wordlist — ON by default (disable with --no-guess-params).
     guess_params = None
     if (not args.no_guess_params) or args.param_wordlist or args.guess_params:
-        from llmsql.payloads import COMMON_PARAMS
+        from sqli_ai.payloads import COMMON_PARAMS
         if args.param_wordlist:
             try:
                 with open(args.param_wordlist) as f:
@@ -1283,7 +1283,7 @@ def main(argv: list[str] | None = None) -> int:
             console.print("[yellow]No live targets.[/yellow]")
             return 2
 
-    # sqlmap handoff: use LLMSQL only for discovery, then hand to sqlmap
+    # sqlmap handoff: use SQLi-AI only for discovery, then hand to sqlmap
     if args.sqlmap or args.run_sqlmap:
         return sqlmap_handoff(
             targets=targets,
@@ -1301,7 +1301,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # Load payload library
-    from llmsql.sqlmap_payloads import get_payloads, load_sqlmap_payloads
+    from sqli_ai.sqlmap_payloads import get_payloads, load_sqlmap_payloads
     if args.payloads in ("sqlmap", "embedded"):
         seed_payloads, payload_src = load_sqlmap_payloads(
             data_dir=getattr(args, "sqlmap_data", None),
@@ -1313,7 +1313,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --fast: only error-based payloads (fastest detection, no time-blind)
     if args.fast:
-        from llmsql.sqlmap_payloads import PAYLOADS_ERROR_BASED
+        from sqli_ai.sqlmap_payloads import PAYLOADS_ERROR_BASED
         display_payloads = PAYLOADS_ERROR_BASED
         payload_src = f"error-based only [{len(display_payloads)} payloads, fast mode]"
     else:
@@ -1334,7 +1334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tamper_chain = []
     if args.tamper:
-        from llmsql.tamper import AUTO_TAMPER_CHAIN, TAMPERS
+        from sqli_ai.tamper import AUTO_TAMPER_CHAIN, TAMPERS
         if args.tamper.strip().lower() == "auto":
             tamper_chain = list(AUTO_TAMPER_CHAIN)
         else:
@@ -1382,7 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
             backend = f"remote OpenAI-compatible @ {base_url}"
         else:
             backend = f"Ollama (local) @ {base_url}"
-        _to = _os.getenv("LLMSQL_LLM_TIMEOUT", "25")
+        _to = _os.getenv("SQLi-AI_LLM_TIMEOUT", "25")
         console.print(
             f"[bold]AI engine:[/bold] [green]{backend}[/green] "
             f"model=[cyan]{agent.model}[/cyan] "
@@ -1566,7 +1566,7 @@ def main(argv: list[str] | None = None) -> int:
         from rich.table import Table
         from urllib.parse import urlparse as _up
 
-        from llmsql.report import _indent
+        from sqli_ai.report import _indent
 
         # Collect unique findings and GROUP THEM BY HOST so the output is linear
         # per site (not interleaved in scan-completion order). Within a host,
@@ -1667,7 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
             save_json(all_reports[0], args.output)
         else:
             _save_multi(all_reports, args.output)
-        console.print(f"[dim]LLMSQL report saved to {args.output}[/dim]")
+        console.print(f"[dim]SQLi-AI report saved to {args.output}[/dim]")
 
     # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
     if args.then_sqlmap and not interrupted:
@@ -1688,7 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
                 if answer not in ("", "y", "yes"):
                     console.print("[dim]Skipped sqlmap — printing commands to run manually:[/dim]")
                     # Build and print the commands without executing
-                    from llmsql.models import ParamLocation
+                    from sqli_ai.models import ParamLocation
                     from urllib.parse import urlparse as _up2, parse_qs, urlencode, urlunparse
                     base_args = SQLMAP_PROFILES.get(args.sqlmap_profile, SQLMAP_PROFILES["normal"])
                     header_args = "".join(
@@ -1757,11 +1757,11 @@ def run_sqlmap_on_findings(
     timeout: int = 0,
     spec_extras: Optional[dict] = None,
 ) -> int:
-    """Run sqlmap against only the URLs LLMSQL confirmed as injectable."""
+    """Run sqlmap against only the URLs SQLi-AI confirmed as injectable."""
     import shutil
     from urllib.parse import urlparse, urlunparse
 
-    from llmsql.models import ParamLocation
+    from sqli_ai.models import ParamLocation
 
     # Deduplicate: one sqlmap job per unique *base URL*.
     # --guess-params can produce many findings for the same endpoint (one per
@@ -1967,7 +1967,7 @@ def print_rollup(all_reports, console) -> None:
     if total == 0:
         console.print(Panel.fit(
             "[bold]No SQL injection points confirmed.[/bold]",
-            title="LLMSQL Result", border_style="green",
+            title="SQLi-AI Result", border_style="green",
         ))
         return
 
@@ -1986,7 +1986,7 @@ def print_rollup(all_reports, console) -> None:
         f"across [bold]{len(hosts)}[/bold] host(s)\n"
         f"[bold]By type:[/bold] {type_line}\n"
         f"[bold]By host:[/bold]\n{host_lines}",
-        title="LLMSQL Result — Rollup", border_style="red",
+        title="SQLi-AI Result — Rollup", border_style="red",
     ))
 
 
@@ -1997,12 +1997,12 @@ def run_nuclei(
     headers: dict[str, str],
     cookie: str | None,
     console,
-    out_file: str = "llmsql-nuclei-urls.txt",
+    out_file: str = "sqli_ai-nuclei-urls.txt",
     timeout: int = 0,
 ) -> int:
     """Run nuclei DAST templates over the discovered URLs for multi-class
-    coverage (SQLi/XSS/SSTI/LFI/...). Complements LLMSQL's deep SQLi/NoSQLi:
-    LLMSQL does discovery + auth + deep SQLi, nuclei does breadth. Degrades to
+    coverage (SQLi/XSS/SSTI/LFI/...). Complements SQLi-AI's deep SQLi/NoSQLi:
+    SQLi-AI does discovery + auth + deep SQLi, nuclei does breadth. Degrades to
     printing the command if nuclei isn't installed."""
     import shutil
 
@@ -2039,7 +2039,7 @@ def run_nuclei(
 def _save_multi(reports, path: str) -> None:
     """Save multiple scan reports to a single JSON file."""
     import json
-    from llmsql.report import export_json
+    from sqli_ai.report import export_json
     with open(path, "w") as f:
         json.dump([export_json(r) for r in reports], f, indent=2)
 

@@ -7,13 +7,13 @@ from typing import Any, Optional
 
 import httpx
 
-from llmsql.models import AgentDecision, HttpExchange, InjectionPoint, InjectionType
-from llmsql.ollama import (
+from sqli_ai.models import AgentDecision, HttpExchange, InjectionPoint, InjectionType
+from sqli_ai.ollama import (
     DEFAULT_OLLAMA_API_KEY,
     DEFAULT_OLLAMA_MODEL,
     ollama_base_url,
 )
-from llmsql.payloads import AGENT_SYSTEM_PROMPT, ANALYZE_TARGET_PROMPT
+from sqli_ai.payloads import AGENT_SYSTEM_PROMPT, ANALYZE_TARGET_PROMPT
 
 
 def _default_base_url() -> str:
@@ -24,7 +24,7 @@ def _default_base_url() -> str:
 
 
 def _default_model() -> str:
-    return os.getenv("OLLAMA_MODEL") or os.getenv("LLMSQL_MODEL") or DEFAULT_OLLAMA_MODEL
+    return os.getenv("OLLAMA_MODEL") or os.getenv("SQLi-AI_MODEL") or DEFAULT_OLLAMA_MODEL
 
 
 def _is_ollama_backend(base_url: str) -> bool:
@@ -85,7 +85,7 @@ class LlmAgent:
         # Per-call timeout (env-overridable). A slow local model must fail fast
         # so it can't stall the whole scan — the deterministic engine carries on.
         try:
-            _to = float(os.getenv("LLMSQL_LLM_TIMEOUT", "25"))
+            _to = float(os.getenv("SQLi-AI_LLM_TIMEOUT", "25"))
         except ValueError:
             _to = 25.0
         self._client = httpx.Client(timeout=httpx.Timeout(_to, connect=5.0))

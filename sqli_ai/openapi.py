@@ -341,7 +341,7 @@ def load_openapi(
 
     'source' may be a full spec URL, a local path, or a base site URL
     (in which case common spec paths are probed). After calling this,
-    inspect `llmsql.openapi.last_probe_log` for a full diagnostic trail
+    inspect `sqli_ai.openapi.last_probe_log` for a full diagnostic trail
     of every path tried and its outcome.
     """
     # Mutate the existing list in place (not rebind) so callers who imported

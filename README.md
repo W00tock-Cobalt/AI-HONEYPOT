@@ -1,306 +1,115 @@
-# 🍯 OpenAI API Honeypot
+# SQLi-AI - AI-powered SQL injection scanner
 
-A production-grade honeypot that mimics the OpenAI API to capture and analyze attacks on AI infrastructure.
+## What it does well
 
-**Purpose**: Security research and threat intelligence gathering on API abuse patterns.
+SQLi-AI's genuine value is as a **discovery and parameter-mining layer** that feeds sqlmap:
 
-## Features
+1. **Organic discovery** — mines parameter names *and follow-up targets from the target's own responses* (HTML forms, links, JS `fetch()` URLs, JSON keys). A bare `-u https://site` reaches the vulnerable `/search?searchquery=` a homepage form points at — no baked-in endpoint list, works on any app. On by default; disable with `--no-organic`.
+2. **OpenAPI/Swagger import** — gets every endpoint *with real param names* (e.g. `?query=` on `/api/testimonials/count`) that a crawler won't see
+3. **Liveness filter** — drops dead/403 endpoints before sqlmap wastes time on them
+4. **Parameter mining** — tries common param names on bare URLs (fallback wordlist)
+5. **GraphQL probe** — detects and adds GraphQL injection points
+6. **POST body expansion** — emits POST endpoints with concrete JSON bodies
 
-- **Full OpenAI API Compatibility**: Implements all major endpoints with realistic responses
-- **Comprehensive Logging**: Captures every detail of incoming requests
-- **Geolocation**: Maps attack sources using MaxMind GeoLite2
-- **Auto-Classification**: Categorizes visitors (scanner, credential-stuffer, prompt-harvester, etc.)
-- **Admin Dashboard**: Real-time monitoring with world map visualization
-- **Always HTTP 200**: Never reveals it's a honeypot through error responses
-- **Timing Obfuscation**: Random response delays to prevent fingerprinting
+Then it hands confirmed findings to **sqlmap** for actual exploitation.
 
-## Endpoints Implemented
+## For broad vulnerability scanning (dozens of findings)
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | Chat completions (streaming supported) |
-| `/v1/completions` | POST | Legacy completions |
-| `/v1/embeddings` | POST | Text embeddings |
-| `/v1/models` | GET | List available models |
-| `/v1/models/{id}` | GET | Retrieve specific model |
-| `/v1/images/generations` | POST | Image generation |
-| `/v1/usage` | GET | Usage statistics |
-| `/v1/dashboard/billing/usage` | GET | Billing data |
-| `/v1/organization/api-keys` | GET | **HIGH VALUE LURE** - Fake API keys |
-
-## Quick Start (Local Testing)
+SQLi-AI is a SQL injection tool. For all injection types (XSS, RCE, XXE, SSTI, XPath, LDAP, command injection), use nuclei:
 
 ```bash
-# Clone and setup
-cd honeypot
-chmod +x setup.sh
-./setup.sh
-
-# Edit configuration
-nano .env
-
-# Run
-source venv/bin/activate
-python main.py
+nuclei -u https://target/ -t ~/nuclei-templates/ \
+  -tags sqli,xss,xxe,ssti,lfi,rce -severity critical,high
 ```
 
-Access the admin dashboard at `http://localhost:8000/admin`
-
-## Production Deployment (Ubuntu 24.04)
-
-### 1. Server Preparation
+## Quick start
 
 ```bash
-# Update system
-sudo apt update && sudo apt upgrade -y
+pip install httpx rich python-dotenv
 
-# Install dependencies
-sudo apt install -y python3.11 python3.11-venv python3-pip nginx certbot python3-certbot-nginx
+# Install Ollama (one-time): https://ollama.com
+# SQLi-AI auto-starts ollama serve and pulls llama3.2 on first run
 
-# Create honeypot user
-sudo useradd -r -s /bin/false honeypot
+# ZERO-CONFIG: just point it at a site. Auto-discovery (Swagger probe + app
+# fingerprint + crawl), organic param discovery, param mining, and ALL injection
+# types (error/boolean/time/NoSQL/auth-bypass) are ON BY DEFAULT.
+python -m sqli_ai -u https://target/
 
-# Create installation directory
-sudo mkdir -p /opt/honeypot
-sudo chown honeypot:honeypot /opt/honeypot
+# Same for a whole list — threads auto-scale, findings grouped per host
+python -m sqli_ai -l urls.txt
+
+# Opt OUT of pieces if you need to trim: --no-auto --no-guess-params --no-organic
+
+# Full pipeline: discover, scan, hand to sqlmap
+python -m sqli_ai -u https://target/ \
+  --then-sqlmap --ask \
+  --sqlmap-profile exploit --sqlmap-timeout 300 \
+  -o report.json -v
+
+# Just let sqlmap do everything (simpler for known apps)
+sqlmap -u "https://target/" --crawl=3 --forms --batch \
+  --level=5 --risk=3 --random-agent --threads=10
 ```
 
-### 2. Install Honeypot
+## Pipeline (when SQLi-AI adds value)
+
+```
+katana/OpenAPI → SQLi-AI (liveness + param discovery) → sqlmap (exploit)
+```
 
 ```bash
-# Copy files to server (from your local machine)
-scp -r honeypot/* user@server:/opt/honeypot/
+# Crawl first
+katana -u https://target/ -jc -silent | sort -u \
+  | python -m sqli_ai --stdin --guess-params --then-sqlmap --ask
 
-# On the server
-cd /opt/honeypot
-sudo -u honeypot chmod +x setup.sh
-sudo -u honeypot ./setup.sh
+# Or from OpenAPI spec (best for REST APIs with Swagger)
+python -m sqli_ai --openapi https://target/ \
+  --guess-params --then-sqlmap --ask -v
 ```
 
-### 3. Configure Environment
-
-```bash
-sudo -u honeypot nano /opt/honeypot/.env
-```
-
-Set these values:
-```env
-ADMIN_USERNAME=your-admin-username
-ADMIN_PASSWORD=your-secure-password-here
-JWT_SECRET=<generated-by-setup>
-MAXMIND_LICENSE_KEY=your-maxmind-key
-```
-
-### 4. Setup Systemd Service
-
-```bash
-# Copy service file
-sudo cp /opt/honeypot/honeypot.service /etc/systemd/system/
-
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable honeypot
-sudo systemctl start honeypot
-
-# Check status
-sudo systemctl status honeypot
-sudo journalctl -u honeypot -f
-```
-
-### 5. Configure Nginx
-
-```bash
-# Copy nginx config
-sudo cp /opt/honeypot/nginx.conf /etc/nginx/sites-available/honeypot
-
-# Edit domain name
-sudo nano /etc/nginx/sites-available/honeypot
-# Change api.yourdomain.com to your actual domain
-
-# Enable site
-sudo ln -s /etc/nginx/sites-available/honeypot /etc/nginx/sites-enabled/
-
-# Test and reload
-sudo nginx -t
-sudo systemctl reload nginx
-```
-
-### 6. SSL with Certbot
-
-```bash
-# Get certificate
-sudo certbot --nginx -d api.yourdomain.com
-
-# Auto-renewal is configured automatically
-sudo systemctl status certbot.timer
-```
-
-### 7. Firewall Configuration
-
-```bash
-# Allow HTTP/HTTPS
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-```
-
-## Seeding Strategies
-
-The honeypot is most effective when attackers discover it. Here are proven seeding techniques:
-
-### 1. GitHub "Leaked" .env File
-
-Create a fake repository with a "leaked" environment file:
-
-```bash
-# In a new git repo
-echo "OPENAI_API_KEY=sk-proj-$(openssl rand -hex 24)" > .env
-echo "OPENAI_BASE_URL=https://api.yourdomain.com/v1" >> .env
-git add .env
-git commit -m "add config"
-git push
-# Then "accidentally" push, wait, then delete
-```
-
-Attackers monitor GitHub for exposed secrets and will discover the base URL.
-
-### 2. Pastebin/Gist Seeds
-
-Create pastes that look like developer notes:
+## CLI reference
 
 ```
-# My OpenAI setup notes
-API_KEY: sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-Base URL: https://api.yourdomain.com/v1
-Working great for my chatbot project!
+-u, --url              Target URL
+-l, --list FILE        URL list file
+--stdin                Read URLs from stdin (pipe from katana/gau)
+--openapi SRC          Import Swagger/OpenAPI spec
+--guess-params         Mine common param names (query,id,search,...)
+--param-wordlist FILE  Custom param wordlist
+--no-organic           Disable organic param/target discovery from responses
+                       (on by default: forms, links, JS, JSON keys)
+--crawl                Run katana on each seed to discover URLs (any run, not
+                       just --auto; crawls authenticated with --cookie/--login)
+--crawl-depth N        katana crawl depth for --auto/--crawl (default 3)
+--path                 Test URL path segments too
+--fast                 Error-based payloads only (quick triage)
+--payloads MODE        {sqlmap|embedded|error|boolean|union|time|stacked}
+--sleep N              Sleep seconds for time-based payloads (default 3)
+-t, --threads N        Concurrent targets
+--timeout SECS         HTTP timeout (default 15)
+--tamper LIST          WAF evasion (space2comment,randomcase,...)
+--no-auto-tamper       Disable auto WAF detection/evasion
+--list-tamper          Show tamper techniques
+--then-sqlmap          Run sqlmap on confirmed findings after scan
+--ask                  Prompt before launching sqlmap
+--sqlmap-profile       {stealth,normal,aggressive,exploit,nuclear}
+--sqlmap-timeout SECS  Kill sqlmap after N seconds per target
+--sqlmap-menu          Interactive profile/flag selection
+--grab-cookie [URL]    Auto-capture session cookie
+--login-url/--login-data  POST credentials to get session
+--include-404          Test auth-gated/dead endpoints too
+--no-llm               Heuristic-only, no AI
+--model                Ollama model (default: llama3.2)
+--ollama-host          Ollama URL (default: localhost:11434)
+-o, --output           Save JSON report
+-v, --verbose          Show all requests
+--show-response        Print response snippet per payload (debug)
 ```
 
-### 3. HuggingFace Spaces
+## Ethical use
 
-Create a demo space with the honeypot URL in the code:
-
-```python
-import openai
-client = openai.OpenAI(
-    api_key="sk-proj-demo",
-    base_url="https://api.yourdomain.com/v1"
-)
-```
-
-### 4. Stack Overflow / Forums
-
-Answer questions about OpenAI API issues with your endpoint mentioned.
-
-### 5. Shodan/Censys Visibility
-
-The honeypot responds to HTTP requests on standard ports, making it discoverable by internet scanners.
-
-## Blog Methodology Notes
-
-### Part 1: Infrastructure Setup
-
-For your writeup, document:
-
-1. **Hypothesis**: What types of attacks do you expect to see on AI APIs?
-   - Stolen credential testing
-   - Prompt injection attempts
-   - Rate limit probing
-   - Model enumeration
-
-2. **Metrics to Track**:
-   - Time to first hit after seeding
-   - Geographic distribution of attacks
-   - Most targeted endpoints
-   - API key patterns (real stolen vs. test values)
-   - Classification breakdown over time
-
-3. **Ethical Considerations**:
-   - Honeypot disclosure: This is a research honeypot for documenting attacks
-   - Data handling: IP addresses and request data are logged for research
-   - No actual AI processing occurs
-   - Fake API keys returned are clearly honeypot tokens
-
-4. **Data Collection Period**:
-   - Recommended: 30-90 days for meaningful data
-   - Document any seeding activities with timestamps
-
-### Analysis Queries
-
-Export data and run analysis:
-
-```python
-import pandas as pd
-import json
-
-# Load export
-with open('honeypot_export.json') as f:
-    data = json.load(f)
-
-df = pd.DataFrame(data)
-
-# Top source countries
-print(df['country_code'].value_counts().head(10))
-
-# Classification breakdown
-print(df['classification'].value_counts())
-
-# Most common API keys tried
-print(df['api_key'].value_counts().head(20))
-
-# Requests over time
-df['date'] = pd.to_datetime(df['timestamp']).dt.date
-print(df.groupby('date').size())
-```
-
-## Maintenance
-
-### Update GeoIP Database Monthly
-
-```bash
-cd /opt/honeypot
-sudo -u honeypot ./download_geoip.sh
-sudo systemctl restart honeypot
-```
-
-### View Logs
-
-```bash
-# Application logs
-sudo journalctl -u honeypot -f
-
-# Nginx access logs
-sudo tail -f /var/log/nginx/honeypot_access.log
-```
-
-### Backup Data
-
-```bash
-# Export from admin dashboard or directly
-sqlite3 /opt/honeypot/honeypot.db ".dump" > backup.sql
-```
-
-## Security Considerations
-
-- **Admin Dashboard**: Always use strong credentials and consider IP restrictions in nginx
-- **Database**: SQLite file should be protected (honeypot user only)
-- **Fake API Keys**: Keys returned by `/v1/organization/api-keys` are tracked - any use confirms credential theft
-- **Rate Limiting**: Optional in nginx config - disable to capture maximum data
-
-## Contributing
-
-This is a security research tool. Contributions welcome for:
-- Additional endpoint implementations
-- Improved classification heuristics
-- Dashboard enhancements
-- Analysis tooling
+Authorized security testing only.
 
 ## License
 
-MIT License - For security research purposes only.
-
-## Disclaimer
-
-This tool is designed for defensive security research. The operator is responsible for:
-- Compliance with local laws regarding honeypots
-- Ethical handling of collected data
-- Clear documentation of research purposes
+MIT
