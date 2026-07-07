@@ -65,10 +65,18 @@ class HttpProbe:
         proxy: Optional[str] = None,
         default_headers: Optional[dict[str, str]] = None,
         cookies: Optional[dict[str, str]] = None,
+        max_retries: int = 2,
     ):
         self.timeout = timeout
         self.default_headers = default_headers or {}
         self.cookies = cookies or {}
+        # Transient-failure retries. Shared demo hosts (Heroku/Cloud Run dynos,
+        # rate-limited instances) throw sporadic 502/503/504, connection resets
+        # and timeouts. Treating one of those as a real response poisons the
+        # baseline or drops an endpoint, which is THE main cause of run-to-run
+        # inconsistency. Retrying transient failures a couple times makes scans
+        # deterministic on flaky targets.
+        self.max_retries = max_retries
         client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "verify": verify_ssl,
@@ -350,42 +358,57 @@ class HttpProbe:
                 else:
                     headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        start = time.perf_counter()
-        try:
-            resp = self._client.request(
-                method=method.upper(),
-                url=target_url,
-                content=body if method.upper() != "GET" else None,
-                headers=headers,
-                cookies=cookies,
-            )
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return HttpExchange(
-                method=method.upper(),
-                url=target_url,
-                status_code=resp.status_code,
-                response_time_ms=elapsed_ms,
-                request_headers=headers,
-                request_body=body,
-                response_headers=dict(resp.headers),
-                response_body=resp.text[:50000],
-                injected_param=inject_point.name if inject_point else None,
-                payload=payload,
-            )
-        except httpx.HTTPError as e:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return HttpExchange(
-                method=method.upper(),
-                url=target_url,
-                status_code=0,
-                response_time_ms=elapsed_ms,
-                request_headers=headers,
-                request_body=body,
-                response_headers={},
-                response_body=str(e),
-                injected_param=inject_point.name if inject_point else None,
-                payload=payload,
-            )
+        # Retry loop: transient gateway/upstream failures (502/503/504) and
+        # network errors (connection reset/refused, timeout) are retried with a
+        # short backoff so a flaky host doesn't produce a bogus baseline or a
+        # missed finding. The LAST attempt's result is always returned (so a
+        # genuinely-down endpoint still surfaces as an infra error, not a hang).
+        attempt = 0
+        last_exchange: Optional[HttpExchange] = None
+        while True:
+            start = time.perf_counter()
+            try:
+                resp = self._client.request(
+                    method=method.upper(),
+                    url=target_url,
+                    content=body if method.upper() != "GET" else None,
+                    headers=headers,
+                    cookies=cookies,
+                )
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                last_exchange = HttpExchange(
+                    method=method.upper(),
+                    url=target_url,
+                    status_code=resp.status_code,
+                    response_time_ms=elapsed_ms,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers=dict(resp.headers),
+                    response_body=resp.text[:50000],
+                    injected_param=inject_point.name if inject_point else None,
+                    payload=payload,
+                )
+                transient = resp.status_code in (502, 503, 504)
+            except httpx.HTTPError as e:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                last_exchange = HttpExchange(
+                    method=method.upper(),
+                    url=target_url,
+                    status_code=0,
+                    response_time_ms=elapsed_ms,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers={},
+                    response_body=str(e),
+                    injected_param=inject_point.name if inject_point else None,
+                    payload=payload,
+                )
+                transient = True
+
+            if not transient or attempt >= self.max_retries:
+                return last_exchange
+            attempt += 1
+            time.sleep(0.4 * attempt)  # 0.4s, 0.8s backoff
 
     def _inject(
         self,
