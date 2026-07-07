@@ -77,8 +77,12 @@ class HttpProbe:
         # inconsistency. Retrying transient failures a couple times makes scans
         # deterministic on flaky targets.
         self.max_retries = max_retries
+        # Cap the CONNECT phase hard (<=8s) so a dead/stalling host can't burn
+        # the full read timeout (×retries) just establishing a TCP connection —
+        # a live host connects in well under a second, so this only bites
+        # unreachable endpoints (and keeps them from looking like a hang).
         client_kwargs: dict[str, Any] = {
-            "timeout": timeout,
+            "timeout": httpx.Timeout(timeout, connect=min(8.0, timeout)),
             "verify": verify_ssl,
             "follow_redirects": True,
         }

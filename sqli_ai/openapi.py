@@ -7,6 +7,7 @@ POST/PUT/PATCH (JSON request bodies).
 """
 
 import json
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
@@ -332,9 +333,10 @@ last_probe_log: list[SpecProbeResult] = []
 
 def load_openapi(
     source: str,
-    timeout: float = 15.0,
+    timeout: float = 8.0,
     headers: Optional[dict[str, str]] = None,
     verify_ssl: bool = True,
+    budget: float = 40.0,
 ) -> list[SpecTarget]:
     """
     Load an OpenAPI/Swagger spec from a URL or local file and expand it.
@@ -357,7 +359,12 @@ def load_openapi(
             spec = json.load(f)
         return expand_spec(spec, None)  # type: ignore[return-value]
 
-    client = httpx.Client(timeout=timeout, verify=verify_ssl, follow_redirects=True)
+    # Cap the connect phase hard: probing dozens of candidate spec paths against
+    # a slow/unreachable host with a long connect timeout was a top cause of the
+    # scanner appearing to hang before it even started. A short connect + read
+    # timeout keeps each probe snappy.
+    _probe_timeout = httpx.Timeout(timeout, connect=min(5.0, timeout))
+    client = httpx.Client(timeout=_probe_timeout, verify=verify_ssl, follow_redirects=True)
     spec_urls_gql: list[str] = []
     try:
         # If the source already looks like a spec endpoint, fetch it directly
@@ -376,7 +383,17 @@ def load_openapi(
         seen_cands: set[str] = set()
         idx = 0
         MAX_PROBES = 80
+        _probe_start = time.monotonic()
         while idx < len(candidates) and idx < MAX_PROBES:
+            # Overall wall-clock budget: even with a short per-probe timeout, a
+            # host that stalls on many candidates could still add up. Stop
+            # probing once the budget is spent so auto-discovery never hangs.
+            if time.monotonic() - _probe_start > budget:
+                last_probe_log.append(
+                    SpecProbeResult("(probe budget reached)", 0,
+                                    f"stopped after {budget:.0f}s")
+                )
+                break
             cand = candidates[idx]
             idx += 1
             if cand in seen_cands:

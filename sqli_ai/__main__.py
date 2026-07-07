@@ -1682,16 +1682,35 @@ def main(argv: list[str] | None = None) -> int:
         # detection results or scan consistency. Skipped in --fast / --no-llm
         # and self-disables (circuit breaker) if the model is slow/unreachable.
         if use_llm and not args.fast and unique_findings:
+            import os as _os_ai
+            import time as _ai_time
+            # Hard wall-clock budget so a slow local model can't turn the
+            # end-of-run analysis into a multi-minute hang. Once spent, the
+            # remaining findings just keep their (already-complete) heuristic
+            # evidence. Override with SQLIAI_AI_BUDGET (seconds).
+            try:
+                _ai_budget = float(_os_ai.getenv("SQLIAI_AI_BUDGET", "60"))
+            except (ValueError, TypeError):
+                _ai_budget = 60.0
+            _ai_start = _ai_time.monotonic()
             console.print(
                 f"\n[bold]AI analysis[/bold] — reviewing "
                 f"{len(unique_findings)} confirmed finding(s) with "
-                f"[cyan]{agent.model}[/cyan] ..."
+                f"[cyan]{agent.model}[/cyan] "
+                f"[dim](budget {_ai_budget:.0f}s)[/dim] ..."
             )
             for i, (_r, f) in enumerate(unique_findings, 1):
                 if getattr(agent, "_disabled", False):
                     console.print(
                         "[yellow]  AI analysis disabled (model slow/unreachable) "
                         "— remaining findings use heuristic evidence only.[/yellow]"
+                    )
+                    break
+                if _ai_time.monotonic() - _ai_start > _ai_budget:
+                    console.print(
+                        f"[yellow]  AI analysis budget ({_ai_budget:.0f}s) reached "
+                        f"— {len(unique_findings) - i + 1} finding(s) left with "
+                        f"heuristic evidence only.[/yellow]"
                     )
                     break
                 console.print(

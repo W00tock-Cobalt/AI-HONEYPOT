@@ -60,8 +60,11 @@ def model_available(model: str, host: Optional[str] = None) -> bool:
 def pull_model(model: str, host: Optional[str] = None, on_status: Optional[Callable[[str], None]] = None) -> bool:
     """Pull model via Ollama API (streaming)."""
     url = f"{ollama_native_url(host)}/api/pull"
+    # No overall read timeout (pulls legitimately take minutes) but cap connect
+    # and inter-chunk reads so a stalled/dead server can't hang the pull forever.
+    _pull_timeout = httpx.Timeout(None, connect=10.0, read=120.0)
     try:
-        with httpx.stream("POST", url, json={"name": model}, timeout=None) as resp:
+        with httpx.stream("POST", url, json={"name": model}, timeout=_pull_timeout) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
                 if not line or not on_status:
