@@ -70,6 +70,11 @@ class _Form:
         self.method = (method or "GET").upper()
         self.action = action
         self.fields: list[str] = []
+        # Pre-filled values (hidden fields, selected options, defaults). These
+        # MUST be preserved when submitting — e.g. a CGI's hidden action=register
+        # selects which server-side handler runs; overwriting it with a test
+        # value would hit the wrong (or no) handler and miss the injection.
+        self.values: dict[str, str] = {}
 
 
 class _FormParser(HTMLParser):
@@ -104,7 +109,14 @@ class _FormParser(HTMLParser):
                 # Buttons don't carry injectable data — skip as candidates
                 # but they don't hurt if we only use them for names.
                 return
-            self._add_name(d.get("name") or d.get("id"))
+            name = d.get("name") or d.get("id")
+            self._add_name(name)
+            # Preserve any pre-filled value (hidden fields, defaults) so form
+            # submission keeps required selectors (e.g. action=register).
+            if name and self._cur is not None:
+                val = d.get("value", "")
+                if val != "":
+                    self._cur.values[name] = val
         elif tag in ("a", "link", "area"):
             href = d.get("href")
             if href and "?" in href:
@@ -267,7 +279,9 @@ def _post_form_targets(parser: "_FormParser", base_url: str) -> list[tuple[str, 
         absu = _same_host_abs(form.action or base_url, base_url)
         if not absu:
             continue
-        body = urlencode({f: "1" for f in form.fields})
+        # Preserve pre-filled/hidden values (e.g. action=register); seed the
+        # remaining (injectable) fields with a test value.
+        body = urlencode({f: form.values.get(f, "1") for f in form.fields})
         key = absu + "|" + body
         if key not in seen:
             seen.add(key)

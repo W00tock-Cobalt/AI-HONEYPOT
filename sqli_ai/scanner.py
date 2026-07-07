@@ -245,12 +245,14 @@ class Scanner:
         # JS fetch URLs, JSON keys). This adapts to arbitrary apps instead of
         # relying on a baked-in wordlist.
         discovered_params: Optional[list[str]] = None
+        discovered_post_forms: list[tuple[str, str, str]] = []
         if self.organic and method.upper() == "GET":
             try:
                 ct = baseline.response_headers.get("content-type", "") \
                     if baseline.response_headers else ""
                 from sqli_ai.param_discovery import discover
                 names, _param_urls, _post_forms = discover(url, baseline.response_body, ct)
+                discovered_post_forms = _post_forms or []
                 if names:
                     discovered_params = names
                     report.add_log(
@@ -352,6 +354,20 @@ class Scanner:
                         f"    PoC: {finding.poc_curl}"
                     )
 
+        # Organic POST-form testing: a GET page often SHOWS a POST form (login,
+        # register, cart, "my account", ...). Those body params are the classic
+        # injectable spots (BadStore's email/fullname/pwdhint/role/cartitem live
+        # here, reached via ?action=). Submit each discovered form and test its
+        # body fields — preserving hidden values like action=register so the
+        # right server-side handler runs. This is what lets a single homepage
+        # scan reach every action's POST params organically.
+        if discovered_post_forms and not self.fast:
+            for furl, fbody, fct in discovered_post_forms:
+                try:
+                    self._scan_post_form(furl, fbody, fct, extra_headers, report)
+                except Exception as e:
+                    report.add_error(f"POST-form scan failed for {furl}: {e}")
+
         # Second-order SQLi (opt-in): store a marked payload via a write
         # endpoint, then re-read and see if it surfaces in a SQL error later.
         if self.second_order and method.upper() in ("POST", "PUT", "PATCH") and data:
@@ -371,6 +387,65 @@ class Scanner:
             f"{len(report.findings)} finding(s) in {report.duration_seconds:.1f}s"
         )
         return report
+
+    def _scan_post_form(
+        self, furl: str, fbody: str, fct: str,
+        extra_headers: Optional[dict[str, str]], report: ScanReport,
+    ) -> None:
+        """Baseline + per-field test of a discovered POST form.
+
+        ``fbody`` already carries the form's fields (hidden values like
+        action=register preserved; injectable fields seeded with a test value).
+        Each non-hidden field is tested as a body param via _test_parameter, so
+        the same precheck + technique battery that runs on query params also
+        covers POST bodies — organically, no per-app knowledge."""
+        # De-dup: don't rescan the same (url, body) form twice in one run.
+        seen = getattr(report, "_post_forms_seen", None)
+        if seen is None:
+            seen = set()
+            report._post_forms_seen = seen
+        key = furl + "|" + fbody
+        if key in seen:
+            return
+        seen.add(key)
+
+        method = "POST"
+        baseline = self.probe.send(furl, method, fbody, fct, extra_headers)
+        report.add_request()
+        # A dead/erroring endpoint baseline is useless — skip (infra errors etc.)
+        if self.detector.is_infra_error(baseline):
+            return
+
+        points = self.probe.extract_injection_points(
+            furl, method, fbody, fct, extra_headers,
+        )
+        # Only test the actual body params of THIS form (skip discovered headers/
+        # cookies here — they're covered by the GET-page scan).
+        body_points = [p for p in points if p.location == ParamLocation.BODY]
+        if not body_points:
+            return
+        self.on_progress(
+            f"[*] Testing POST form {furl} — {len(body_points)} body field(s): "
+            + ", ".join(p.name for p in body_points[:15])
+        )
+        for point in body_points:
+            try:
+                finding = self._test_parameter(
+                    furl, method, fbody, fct, extra_headers, point, baseline, report,
+                )
+            except Exception as e:
+                report.add_error(f"POST field {point.name} failed: {e}")
+                continue
+            if finding is not None:
+                report.findings.append(finding)
+                self.on_progress(
+                    f"[!] VULNERABLE: {furl} [POST]\n"
+                    f"    Param: {finding.param} ({finding.location.value}) "
+                    f"| Type: {finding.injection_type.value} "
+                    f"| DB: {finding.db_type or '?'} "
+                    f"| Confidence: {finding.confidence:.0%}\n"
+                    f"    PoC: {finding.poc_curl}"
+                )
 
     def _test_second_order(
         self, url, method, data, content_type, extra_headers, points, report,
