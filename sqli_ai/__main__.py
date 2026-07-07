@@ -1800,12 +1800,36 @@ def main(argv: list[str] | None = None) -> int:
     # (it was deliberately kept open past the scan's finally block for the pass).
     agent.close()
 
+    # Raw per-URL report(s): honour -o if given (unchanged behaviour).
     if args.output:
         if len(all_reports) == 1:
             save_json(all_reports[0], args.output)
         else:
             _save_multi(all_reports, args.output)
-        console.print(f"[dim]SQLi-AI report saved to {args.output}[/dim]")
+        console.print(f"[dim]Raw report saved to {args.output}[/dim]")
+
+    # ALWAYS remember every finding in a consolidated report at the end — a
+    # JSON (machine-readable) + a Markdown summary — so results are never lost,
+    # even when -o wasn't passed. Derived from -o's stem when given, else a
+    # timestamped default in the CWD.
+    if all_reports:
+        import os as _os
+        import time as _time
+        if args.output:
+            stem = args.output.rsplit(".", 1)[0]
+        else:
+            stem = f"sql-ai-report-{_time.strftime('%Y%m%d-%H%M%S')}"
+        json_path = f"{stem}.findings.json"
+        md_path = f"{stem}.findings.md"
+        try:
+            write_findings_report(all_reports, json_path, md_path)
+            console.print(
+                f"[dim]All findings remembered in[/dim] "
+                f"[cyan]{_os.path.abspath(json_path)}[/cyan] "
+                f"[dim]and[/dim] [cyan]{_os.path.abspath(md_path)}[/cyan]"
+            )
+        except Exception as e:
+            console.print(f"[yellow]Could not write consolidated report: {e}[/yellow]")
 
     # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
     if args.then_sqlmap and not interrupted:
@@ -2180,6 +2204,87 @@ def _save_multi(reports, path: str) -> None:
     from sqli_ai.report import export_json
     with open(path, "w") as f:
         json.dump([export_json(r) for r in reports], f, indent=2)
+
+
+def _aggregate_findings(all_reports) -> list[dict]:
+    """Flatten every finding across all scanned URLs into a single list, deduped
+    by (host, endpoint, param), each row carrying its full evidence + PoC."""
+    from urllib.parse import urlparse as _up
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in all_reports:
+        host = _up(r.target_url).netloc
+        for f in r.findings:
+            key = (host, _up(r.target_url).path, f.param, f.injection_type.value)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "host": host,
+                "url": f.payload_url or r.target_url,
+                "param": f.param,
+                "location": f.location.value,
+                "type": f.injection_type.value,
+                "db": f.db_type or "unknown",
+                "severity": f.severity.value,
+                "confidence": f.confidence,
+                "payload": f.payload,
+                "evidence": f.evidence,
+                "poc_curl": f.poc_curl,
+                "response_before": f.response_before,
+                "response_after": f.response_after,
+                "ai_analysis": f.ai_analysis,
+            })
+    out.sort(key=lambda d: (d["host"], -d["confidence"], d["param"]))
+    return out
+
+
+def write_findings_report(all_reports, json_path: str, md_path: str) -> None:
+    """Persist ALL findings at the end of a run: a machine-readable JSON and a
+    human-readable Markdown report. Written even without -o so nothing is lost."""
+    import json
+    from collections import Counter
+    findings = _aggregate_findings(all_reports)
+    by_type = Counter(f["type"] for f in findings)
+    by_host: dict[str, list] = {}
+    for f in findings:
+        by_host.setdefault(f["host"], []).append(f)
+
+    summary = {
+        "scanned_urls": len(all_reports),
+        "total_findings": len(findings),
+        "by_type": dict(by_type),
+        "by_host": {h: len(v) for h, v in by_host.items()},
+        "findings": findings,
+    }
+    with open(json_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    lines = ["# SQL-AI scan report", ""]
+    lines.append(f"- URLs scanned: **{len(all_reports)}**")
+    lines.append(f"- Confirmed findings: **{len(findings)}**")
+    if by_type:
+        lines.append(f"- By type: " + ", ".join(f"{t}: {n}" for t, n in by_type.most_common()))
+    lines.append("")
+    for host, flist in by_host.items():
+        dbs = sorted({f["db"] for f in flist if f["db"] != "unknown"})
+        lines.append(f"## {host}  ({len(flist)} finding(s)"
+                     + (f", db: {'/'.join(dbs)}" if dbs else "") + ")")
+        lines.append("")
+        for i, f in enumerate(flist, 1):
+            lines.append(f"### {i}. {f['type']} — `{f['param']}` ({f['location']}) "
+                         f"[{f['severity']}, {f['confidence']:.0%}]")
+            lines.append(f"- URL: `{f['url']}`")
+            lines.append(f"- DB: {f['db']}")
+            lines.append(f"- Payload: `{f['payload']}`")
+            lines.append(f"- Evidence: {f['evidence']}")
+            if f["poc_curl"]:
+                lines.append(f"- PoC:\n\n```bash\n{f['poc_curl']}\n```")
+            if f["ai_analysis"]:
+                lines.append(f"- AI analysis:\n\n{f['ai_analysis']}")
+            lines.append("")
+    with open(md_path, "w") as fh:
+        fh.write("\n".join(lines))
 
 
 if __name__ == "__main__":
