@@ -205,6 +205,39 @@ class LlmAgent:
         except Exception:
             return []
 
+    def suggest_targeted_payloads(
+        self,
+        url: str,
+        method: str,
+        point: InjectionPoint,
+        content_type: Optional[str],
+        baseline: HttpExchange,
+        injected: HttpExchange,
+    ) -> list[str]:
+        """Near-miss assist: the deterministic engine saw this parameter REACT
+        to injection but couldn't confirm it. Show the LLM the baseline vs the
+        most-reactive injected response and ask for a few TARGETED payloads that
+        would confirm/exploit it (right quoting/boundary/technique). This is the
+        high-value, low-volume way to use the model."""
+        prompt = (
+            "A parameter appears injectable but is unconfirmed. Craft up to 6 "
+            "targeted SQL-injection payloads (varied quoting/boundary/comment "
+            "styles and techniques: error, boolean, UNION, time) most likely to "
+            "confirm it for THIS context. Consider the reflected error/behavior.\n\n"
+            f"URL: {url}\nMethod: {method}\nParameter: {point.name} "
+            f"({point.location.value})\nOriginal value: {point.original_value}\n"
+            f"Content-Type: {content_type or 'unknown'}\n"
+            f"Baseline HTTP {baseline.status_code}:\n{baseline.response_body[:1200]}\n\n"
+            f"Injected (payload={injected.payload!r}) HTTP {injected.status_code}:\n"
+            f"{injected.response_body[:1200]}\n\n"
+            'Respond ONLY as JSON: {"payloads": ["<p1>", "<p2>", ...]}'
+        )
+        try:
+            result = self._chat(AGENT_SYSTEM_PROMPT, prompt)
+            return _coerce_payloads(result.get("payloads", []))[:6]
+        except Exception:
+            return []
+
     def analyze_exchange(
         self,
         baseline: HttpExchange,

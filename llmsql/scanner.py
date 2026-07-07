@@ -77,6 +77,7 @@ class Scanner:
         seed_payloads: Optional[list[str]] = None,
         organic: bool = True,
         second_order: bool = False,
+        llm_deep: bool = False,
     ):
         self.agent = agent
         self.probe = probe
@@ -95,6 +96,10 @@ class Scanner:
         self.continue_on_found = continue_on_found
         self.organic = organic  # mine params from the response itself
         self.second_order = second_order
+        # llm_deep: call the LLM aggressively (per-param suggestion + per-payload
+        # analysis). Default False — the LLM is used sparingly as a near-miss
+        # ASSIST only (see _llm_assist), which is faster and higher-value.
+        self.llm_deep = llm_deep
         self._seed_payloads = seed_payloads  # None = use default SEED_PAYLOADS
         self._sleep_ms = 3000  # calibrated by CLI --sleep
         # Precheck is always on unless explicitly disabled.
@@ -652,7 +657,7 @@ class Scanner:
         # In fast mode, skip the per-parameter LLM suggestion call (slow on
         # local models). Rely on seed payloads + heuristics, use the LLM only
         # to confirm strong hits.
-        if self.use_llm and not self.fast:
+        if self.use_llm and not self.fast and self.llm_deep:
             try:
                 llm_payloads = self.agent.suggest_initial_payloads(
                     url, method, point, content_type, baseline
@@ -766,8 +771,9 @@ class Scanner:
                         f"    [!] confirmed (score {score:.0%}) — continuing for more types"
                     )
 
-            # LLM-guided continuation — skipped in fast mode (heuristics only)
-            if self.use_llm and not self.fast and score >= 0.3:
+            # LLM-guided continuation — only in DEEP mode (per-payload LLM calls
+            # are the slow, hang-prone path). Default uses the near-miss assist.
+            if self.use_llm and not self.fast and self.llm_deep and score >= 0.3:
                 try:
                     decision = self.agent.analyze_exchange(
                         baseline, injected, point, score, evidence,
@@ -804,7 +810,7 @@ class Scanner:
 
         # Final check on best candidate
         if best_exchange and best_score >= 0.6:
-            if self.use_llm and not self.fast:
+            if self.use_llm and not self.fast and self.llm_deep:
                 try:
                     confirm = self.agent.confirm_finding(baseline, best_exchange, point)
                     if confirm.get("vulnerable") and confirm.get("confidence", 0) >= 0.6:
@@ -889,10 +895,58 @@ class Scanner:
         if nosql_finding is not None:
             return nosql_finding
 
+        # LLM ASSIST (near-miss): the deterministic engine couldn't confirm, but
+        # this param REACTED (0.3 <= best_score < 0.75). Ask the model for a few
+        # targeted payloads for THIS context and try them. Low-volume (once per
+        # near-miss param), high-value — the sparing way to use the LLM.
+        if (self.use_llm and not self.fast and not interim_findings
+                and best_exchange is not None and 0.3 <= best_score < 0.75):
+            afind = self._llm_assist(
+                url, method, data, content_type, extra_headers,
+                point, baseline, best_exchange, report,
+            )
+            if afind is not None:
+                return afind
+
         # If continue_on_found, return the highest-confidence interim finding
         if interim_findings:
             return max(interim_findings, key=lambda f: f.confidence)
 
+        return None
+
+    def _llm_assist(
+        self, url, method, data, content_type, extra_headers, point, baseline,
+        best_exchange, report,
+    ) -> Optional[Finding]:
+        """Ask the LLM for targeted payloads on a near-miss param, try them, and
+        confirm with the deterministic scorer. One LLM call + a few requests."""
+        try:
+            payloads = self.agent.suggest_targeted_payloads(
+                url, method, point, content_type, baseline, best_exchange,
+            )
+        except Exception as e:
+            report.add_error(f"LLM assist failed for {point.name}: {e}")
+            return None
+        if not payloads:
+            return None
+        report.add_log(f"LLM assist: {len(payloads)} targeted payload(s) for {point.name}")
+        for pl in payloads[:6]:
+            if not isinstance(pl, str) or not pl:
+                continue
+            ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=self._apply_tamper(pl),
+            )
+            report.add_request()
+            score, ev = self.detector.quick_score(baseline, ex)
+            if score >= 0.85:
+                finding = self._build_finding(
+                    point, ex, baseline, f"LLM-assisted: {ev}", score,
+                )
+                return self._enrich_error(
+                    finding, url, method, data, content_type, extra_headers,
+                    point, report,
+                )
         return None
 
     def _boolean_ratio_detect(

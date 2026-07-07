@@ -264,6 +264,11 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--base-url", help="Override LLM base URL (skips Ollama default)")
     p.add_argument("--no-llm", action="store_true",
                    help="Heuristic-only mode (no LLM, works offline)")
+    p.add_argument("--llm-deep", action="store_true",
+                   help="Aggressive LLM use: per-parameter suggestion + per-payload "
+                        "analysis + confirmation (many calls, slower). Default is a "
+                        "sparing 'assist' — the LLM is only queried on near-miss "
+                        "parameters the deterministic engine couldn't confirm.")
 
     # Output
     p.add_argument("-o", "--output", help="Save JSON report to file")
@@ -1422,6 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
         seed_payloads=display_payloads,
         organic=args.organic,
         second_order=args.second_order,
+        llm_deep=args.llm_deep,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
         ),
