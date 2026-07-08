@@ -714,6 +714,21 @@ def _is_static(url: str) -> bool:
     return any(s in url.lower() for s in _STATIC_SEGS)
 
 
+def _is_session_destroying(url: str) -> bool:
+    """True for logout/sign-out URLs that would DESTROY an authenticated session.
+
+    Visiting these mid-scan (or mid-crawl) with a valid cookie logs us out, so
+    every request after that is silently unauthenticated — the #1 way an
+    authenticated scan quietly turns into an unauthenticated one. They're never
+    injection targets, so skipping them is pure upside.
+    """
+    import re as _re
+    return bool(_re.search(
+        r"log[\-_]?out|sign[\-_]?out|log[\-_]?off|/logoff|/signoff|(?:^|[/?&=])exit(?:$|[/?&=.])",
+        url, _re.IGNORECASE,
+    ))
+
+
 def organic_expand_targets(
     targets: list[str],
     headers: dict[str, str],
@@ -826,7 +841,11 @@ def katana_crawl(
         )
         return []
 
-    cmd = ["katana", "-u", site, "-jc", "-silent", "-d", str(depth)]
+    # -cos excludes logout/sign-out URLs from the crawl SCOPE so katana never
+    # fetches them with our session cookie (which would log us out and make the
+    # rest of the authenticated crawl/scan silently unauthenticated).
+    cmd = ["katana", "-u", site, "-jc", "-silent", "-d", str(depth),
+           "-cos", "log[-_]?out|sign[-_]?out|log[-_]?off"]
     for k, v in (headers or {}).items():
         if k.lower() == "user-agent":
             cmd += ["-H", f"User-Agent: {v}"]
@@ -1400,6 +1419,18 @@ def main(argv: list[str] | None = None) -> int:
                 f"only seeded host(s) {', '.join(sorted(seed_hosts))} are tested[/dim]"
             )
 
+    # Never scan logout/sign-out URLs — visiting one with a session cookie logs
+    # us out and silently turns the rest of an authenticated scan unauthenticated.
+    _before_logout = len(targets)
+    targets = [t for t in targets if not _is_session_destroying(t)]
+    spec_extras = {u: v for u, v in spec_extras.items()
+                   if not _is_session_destroying(u)}
+    if len(targets) < _before_logout:
+        console.print(
+            f"[dim]Auth-safe: skipped {_before_logout - len(targets)} logout/"
+            f"sign-out URL(s) that would destroy the session[/dim]"
+        )
+
     # ---- Generic organic authentication (per host) ---------------------
     # For any seeded host that gates content behind a login form, try to log in
     # with default credentials (CSRF-aware) and reuse the resulting session for
@@ -1407,20 +1438,24 @@ def main(argv: list[str] | None = None) -> int:
     # vulnerable pages 302 to login when unauthenticated). Fully generic: it only
     # submits whatever login form the app itself serves. Skipped when the user
     # supplied their own auth/cookie or passed --no-auto-auth.
-    # Inherit any sessions already established during auto-discovery (auth runs
-    # there BEFORE crawl so protected pages are discovered). Only authenticate
-    # hosts not already covered (e.g. --no-auto / stdin runs where discovery,
-    # and thus its pre-crawl auth, never ran).
-    host_cookies: dict[str, dict[str, str]] = dict(getattr(args, "_host_cookies", {}))
+    # Establish a FRESH scanning session per host. Discovery already ran its own
+    # pre-crawl auth so protected pages were crawled — but that session may have
+    # been burned (the crawl can trip a logout link before we filter them), so we
+    # re-authenticate here for a clean session used throughout the scan. Only
+    # re-auth hosts discovery found a login on (the gated apps); open apps have no
+    # form and would just waste probes. Skipped if the user supplied their own auth.
+    host_cookies: dict[str, dict[str, str]] = {}
+    _discovery_authed = set(getattr(args, "_host_cookies", {}))
     _user_supplied_auth = bool(
         args.auth_token or (args.auth_url and args.auth_data)
         or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
     )
     if not args.no_auto_auth and not _user_supplied_auth and seed_hosts:
         from sqli_ai.session import establish_session
-        for host in sorted(seed_hosts):
-            if host in host_cookies:
-                continue
+        # Re-auth the gated hosts (found during discovery); also try any seed host
+        # not yet covered by discovery (e.g. --no-auto runs).
+        _auth_hosts = _discovery_authed | (seed_hosts if not _discovery_authed else set())
+        for host in sorted(_auth_hosts or seed_hosts):
             scheme = "https"
             for t in targets:
                 if _up_seed(t).netloc == host:
@@ -1436,6 +1471,7 @@ def main(argv: list[str] | None = None) -> int:
                 jar, msg = {}, f"auth error: {e}"
             if jar:
                 host_cookies[host] = jar
+                console.print(f"[green]✓ Scan session ready for {host}[/green]")
             elif "no login form" not in msg:
                 console.print(f"[dim]Auth ({host}): {msg}[/dim]")
 
