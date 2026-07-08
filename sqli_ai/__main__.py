@@ -1365,6 +1365,39 @@ def main(argv: list[str] | None = None) -> int:
                 f"only seeded host(s) {', '.join(sorted(seed_hosts))} are tested[/dim]"
             )
 
+    # ---- Generic organic authentication (per host) ---------------------
+    # For any seeded host that gates content behind a login form, try to log in
+    # with default credentials (CSRF-aware) and reuse the resulting session for
+    # that host's scan — doubling reachable surface (DVWA/bWAPP-style apps whose
+    # vulnerable pages 302 to login when unauthenticated). Fully generic: it only
+    # submits whatever login form the app itself serves. Skipped when the user
+    # supplied their own auth/cookie or passed --no-auto-auth.
+    host_cookies: dict[str, dict[str, str]] = {}
+    _user_supplied_auth = bool(
+        args.auth_token or (args.auth_url and args.auth_data)
+        or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
+    )
+    if not args.no_auto_auth and not _user_supplied_auth and seed_hosts:
+        from sqli_ai.session import establish_session
+        for host in sorted(seed_hosts):
+            scheme = "https"
+            for t in targets:
+                if _up_seed(t).netloc == host:
+                    scheme = _up_seed(t).scheme or "https"
+                    break
+            site_root = f"{scheme}://{host}/"
+            try:
+                jar, msg = establish_session(
+                    site_root, console=console,
+                    timeout=min(args.timeout, 12.0), headers=headers,
+                )
+            except Exception as e:
+                jar, msg = {}, f"auth error: {e}"
+            if jar:
+                host_cookies[host] = jar
+            elif "no login form" not in msg:
+                console.print(f"[dim]Auth ({host}): {msg}[/dim]")
+
     # Organic cookie capture: if the target sets a session cookie (CartID,
     # SSOid, PHPSESSID, ...) and the user didn't supply one, grab it and add it
     # as an injection point. Because the precheck APPENDS to the cookie's real
@@ -1626,6 +1659,20 @@ def main(argv: list[str] | None = None) -> int:
                 for k, v in spec_headers.items():
                     if k not in merged_headers:
                         merged_headers[k] = v
+
+            # Attach this host's authenticated session (from generic auto-auth),
+            # so each app in a multi-host list is scanned with its OWN session.
+            _thost = _up_seed(target).netloc
+            if _thost in host_cookies:
+                _cookie_hdr = "; ".join(f"{k}={v}" for k, v in host_cookies[_thost].items())
+                existing_cookie = next(
+                    (merged_headers[k] for k in merged_headers if k.lower() == "cookie"),
+                    "",
+                )
+                merged_headers["Cookie"] = (
+                    (existing_cookie.rstrip("; ") + "; " + _cookie_hdr)
+                    if existing_cookie else _cookie_hdr
+                )
 
             # If the spec pins a method for this URL, use only that.
             # Otherwise try every method the user requested.
