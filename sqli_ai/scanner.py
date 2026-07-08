@@ -246,6 +246,7 @@ class Scanner:
         # relying on a baked-in wordlist.
         discovered_params: Optional[list[str]] = None
         discovered_post_forms: list[tuple[str, str, str]] = []
+        discovered_get_forms: list[str] = []
         if self.organic and method.upper() == "GET":
             try:
                 ct = baseline.response_headers.get("content-type", "") \
@@ -253,6 +254,16 @@ class Scanner:
                 from sqli_ai.param_discovery import discover
                 names, _param_urls, _post_forms = discover(url, baseline.response_body, ct)
                 discovered_post_forms = _post_forms or []
+                # GET-form action URLs pre-filled with ALL their fields (e.g.
+                # ".../sqli/?id=1&Submit=Submit"). Testing these is essential for
+                # forms whose injectable field only reaches SQL when a COMPANION
+                # field is also present (DVWA needs id AND Submit together) — a
+                # per-field mine of the bare page would submit id alone and miss
+                # it. Only keep same-page multi-value form targets, not the URL
+                # we're already scanning.
+                discovered_get_forms = [
+                    u for u in (_param_urls or []) if u != url
+                ]
                 if names:
                     discovered_params = names
                     report.add_log(
@@ -368,6 +379,16 @@ class Scanner:
                 except Exception as e:
                     report.add_error(f"POST-form scan failed for {furl}: {e}")
 
+        # Organic GET-form testing: scan action URLs pre-filled with ALL their
+        # fields so a field that only injects with a companion present (DVWA's
+        # id+Submit) is actually reached. Bounded per scan to stay cheap.
+        if discovered_get_forms and not self.fast:
+            for furl in discovered_get_forms[:15]:
+                try:
+                    self._scan_get_form(furl, extra_headers, report)
+                except Exception as e:
+                    report.add_error(f"GET-form scan failed for {furl}: {e}")
+
         # Second-order SQLi (opt-in): store a marked payload via a write
         # endpoint, then re-read and see if it surfaces in a SQL error later.
         if self.second_order and method.upper() in ("POST", "PUT", "PATCH") and data:
@@ -440,6 +461,59 @@ class Scanner:
                 report.findings.append(finding)
                 self.on_progress(
                     f"[!] VULNERABLE: {furl} [POST]\n"
+                    f"    Param: {finding.param} ({finding.location.value}) "
+                    f"| Type: {finding.injection_type.value} "
+                    f"| DB: {finding.db_type or '?'} "
+                    f"| Confidence: {finding.confidence:.0%}\n"
+                    f"    PoC: {finding.poc_curl}"
+                )
+
+    def _scan_get_form(
+        self, furl: str,
+        extra_headers: Optional[dict[str, str]], report: ScanReport,
+    ) -> None:
+        """Baseline + per-field test of a discovered GET form (action?all=fields).
+
+        ``furl`` already carries EVERY field of the form (submit buttons and
+        hidden state included), so injecting into one query param while the
+        others stay present reaches injection points that need a companion field
+        — e.g. DVWA's ``?id=1'&Submit=Submit``. Deduped and query-only so it
+        stays cheap and never recurses into organic discovery."""
+        seen = getattr(report, "_get_forms_seen", None)
+        if seen is None:
+            seen = set()
+            report._get_forms_seen = seen
+        if furl in seen:
+            return
+        seen.add(furl)
+
+        baseline = self.probe.send(furl, "GET", None, None, extra_headers)
+        report.add_request()
+        if self.detector.is_infra_error(baseline):
+            return
+
+        points = self.probe.extract_injection_points(
+            furl, "GET", None, None, extra_headers,
+        )
+        query_points = [p for p in points if p.location == ParamLocation.QUERY]
+        if not query_points:
+            return
+        self.on_progress(
+            f"[*] Testing GET form {furl} — {len(query_points)} field(s): "
+            + ", ".join(p.name for p in query_points[:15])
+        )
+        for point in query_points:
+            try:
+                finding = self._test_parameter(
+                    furl, "GET", None, None, extra_headers, point, baseline, report,
+                )
+            except Exception as e:
+                report.add_error(f"GET field {point.name} failed: {e}")
+                continue
+            if finding is not None:
+                report.findings.append(finding)
+                self.on_progress(
+                    f"[!] VULNERABLE: {furl} [GET]\n"
                     f"    Param: {finding.param} ({finding.location.value}) "
                     f"| Type: {finding.injection_type.value} "
                     f"| DB: {finding.db_type or '?'} "

@@ -106,8 +106,14 @@ class _FormParser(HTMLParser):
         elif tag in ("input", "select", "textarea", "button"):
             itype = d.get("type", "").lower()
             if itype in ("submit", "reset", "button", "image"):
-                # Buttons don't carry injectable data — skip as candidates
-                # but they don't hurt if we only use them for names.
+                # Submit buttons carry no injectable data, but their name=value
+                # often GATES the server-side handler (DVWA needs Submit=Submit
+                # alongside id for the query to run; CGI apps need action=...).
+                # Record the value so form submission includes it — but do NOT
+                # add it as an injectable field/candidate.
+                name = d.get("name")
+                if name and self._cur is not None and itype == "submit":
+                    self._cur.values.setdefault(name, d.get("value", "") or name)
                 return
             name = d.get("name") or d.get("id")
             self._add_name(name)
@@ -250,11 +256,19 @@ def _form_target(form: _Form, base_url: str) -> str | None:
     """
     if form.method != "GET" or not form.fields:
         return None
-    absu = _same_host_abs(form.action or base_url, base_url)
+    # action="#", "" or None means "submit to the current page".
+    action = form.action
+    if not action or action.strip() in ("#", "."):
+        action = base_url
+    absu = _same_host_abs(action, base_url)
     if not absu:
         return None
     parsed = urlparse(absu)
     existing = parse_qs(parsed.query, keep_blank_values=True)
+    # Preserve gating values (submit buttons, hidden state, e.g. Submit=Submit)
+    # so the server-side handler that runs the query is actually triggered.
+    for k, v in form.values.items():
+        existing.setdefault(k, [v])
     for f in form.fields:
         existing.setdefault(f, ["1"])
     from urllib.parse import urlencode, urlunparse
