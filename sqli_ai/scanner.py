@@ -653,6 +653,23 @@ class Scanner:
                 )
 
             if status_changed:
+                # Guard against status "changes" that are NOT a SQL signal:
+                #  - injected request failed entirely (status 0): a timeout /
+                #    connection reset / aborted request is infrastructure, not a
+                #    SQL error (this is the classic "500 -> 0 on quote only" FP);
+                #  - baseline is already a server error (>=500): the endpoint is
+                #    broken regardless of input, so any "change" is meaningless
+                #    (these are usually dead/crawl-junk URLs);
+                #  - gateway/upstream failure on the probe (502/503/504, conn
+                #    reset): the request never reached a working app.
+                # Genuine error-based SQLi still surfaces above via SQL error
+                # TEXT (quote_errors), and a clean 2xx->5xx break from a healthy
+                # baseline still passes every guard below.
+                if (quote_probe.status_code == 0
+                        or baseline.status_code >= 500
+                        or self.detector.is_infra_error(quote_probe)):
+                    return None
+
                 # Status changed but no recognisable SQL error text. This is
                 # ambiguous — could be real SQLi with a swallowed error, or just
                 # "any unexpected input breaks this endpoint" (generic validation).
@@ -1383,19 +1400,41 @@ class Scanner:
             )
             report.add_request()
             ctrl_delay = ctrl_ex.response_time_ms - baseline.response_time_ms
-            if ctrl_delay < thresh * 0.6:
-                if itype == InjectionType.STACKED:
-                    kind = "stacked-query"
-                elif replace:
-                    kind = "polyglot"
-                else:
-                    kind = "per-context"
-                return self._build_finding(
-                    point, ex, baseline,
-                    f"Time-based blind ({kind}): {payload!r} delayed +{delay:.0f}ms "
-                    f"(~{sleep_s}s); control (0s) returned fast (+{ctrl_delay:.0f}ms)",
-                    0.9, inj_type=itype,
-                )
+            if ctrl_delay >= thresh * 0.6:
+                continue
+
+            # Scaling confirmation: a genuine time-based injection delays in
+            # PROPORTION to the requested sleep — ask for 2x and it takes ~2x.
+            # Server/network jitter (common on shared/rate-limited hosts, which
+            # is exactly what produced the /metrics & /application FPs) does not
+            # scale. Requiring the doubled sleep to clear a doubled threshold
+            # turns a noisy single-sample signal into a reliable one.
+            long_s = sleep_s * 2
+            long_tpl = tpl.format(s=long_s)
+            send_long = self._apply_tamper(long_tpl if replace else orig + long_tpl)
+            long_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=send_long,
+            )
+            long_ex.expected_sleep_ms = long_s * 1000
+            report.add_request()
+            long_delay = long_ex.response_time_ms - baseline.response_time_ms
+            if long_delay < long_s * 1000 * 0.7:
+                continue  # didn't scale with the sleep → timing noise, not SQLi
+
+            if itype == InjectionType.STACKED:
+                kind = "stacked-query"
+            elif replace:
+                kind = "polyglot"
+            else:
+                kind = "per-context"
+            return self._build_finding(
+                point, ex, baseline,
+                f"Time-based blind ({kind}): {payload!r} delayed +{delay:.0f}ms "
+                f"(~{sleep_s}s); control (0s) fast (+{ctrl_delay:.0f}ms); "
+                f"scaled to +{long_delay:.0f}ms at {long_s}s (confirms proportional delay)",
+                0.9, inj_type=itype,
+            )
         return None
 
     def _test_union(
@@ -1416,6 +1455,22 @@ class Scanner:
         if marker in (baseline.response_body or ""):
             return None
         orig = point.original_value or ""
+
+        # Reflection guard: many apps echo the request path/params back in an
+        # error page (e.g. Juice Shop's "Unexpected path: /api/..?x=<value>").
+        # That makes a UNION marker "reflect" even though no query ran — a
+        # false positive. Send the marker as a PLAIN value first: if it comes
+        # back, this endpoint echoes arbitrary input, so the marker-reflection
+        # signal is meaningless here and UNION detection must abort.
+        refl_marker = "zXrefl0Q42tk"
+        refl = self.probe.send(
+            url, method, data, content_type, extra_headers,
+            inject_point=point, payload=orig + refl_marker,
+        )
+        report.add_request()
+        if refl_marker in (refl.response_body or ""):
+            return None
+
         max_cols = 8
         for prefix in ("'", ""):
             # 1) Find the column count with ORDER BY N: it succeeds up to the

@@ -28,3 +28,8 @@ Thumbs.db
 sqli_ai-sqlmap-urls.txt
 sqli_ai-nuclei-urls.txt
 *-report.json
+*.findings.json
+*.findings.md
+sql-ai-report-*
+scans/
+urls.txt

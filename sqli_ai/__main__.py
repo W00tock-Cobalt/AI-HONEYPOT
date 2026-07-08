@@ -737,10 +737,12 @@ def organic_expand_targets(
     """
     import httpx
 
+    from sqli_ai.js_endpoints import discover_js_endpoints
     from sqli_ai.param_discovery import discover
 
     existing = set(targets)
     discovered: list[str] = []
+    n_js = 0
     post_extras = post_extras if post_extras is not None else {}
     kwargs: dict = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
     if proxy:
@@ -757,7 +759,7 @@ def organic_expand_targets(
             try:
                 _names, urls, post_forms = discover(seed, resp.text, ct)
             except Exception:
-                continue
+                urls, post_forms = [], []
             for u in urls:
                 if u in existing or _is_static(u) or len(discovered) >= max_new:
                     continue
@@ -770,12 +772,29 @@ def organic_expand_targets(
                 existing.add(furl)
                 discovered.append(furl)
                 post_extras[furl] = ("POST", fbody, fct, None)
+            # JS-bundle endpoint mining: read the app's own JS to learn the API
+            # routes (and query params) it calls at runtime — the SPA endpoints a
+            # DOM crawler can't see (e.g. /rest/products/search?q=). Fully generic.
+            if "html" in ct.lower() or "<script" in resp.text[:4000].lower():
+                try:
+                    js_eps = discover_js_endpoints(
+                        seed, resp.text, c, headers=headers or {}
+                    )
+                except Exception:
+                    js_eps = set()
+                for u in sorted(js_eps):
+                    if u in existing or _is_static(u) or len(discovered) >= max_new:
+                        continue
+                    existing.add(u)
+                    discovered.append(u)
+                    n_js += 1
 
     if discovered:
         n_post = sum(1 for u in discovered if u in post_extras)
         console.print(
             f"[green]✓ Organic crawl found {len(discovered)} extra target(s)[/green] "
-            f"[dim](forms/links on the seed page(s); {n_post} POST form(s))[/dim]"
+            f"[dim](forms/links on the seed page(s); {n_post} POST form(s); "
+            f"{n_js} from JS bundles)[/dim]"
         )
         for u in discovered[:15]:
             tag = " [dim]POST[/dim]" if u in post_extras else ""
@@ -912,30 +931,11 @@ def _auto_discover(args, targets: list[str], console) -> None:
         if not args.verbose:
             console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
 
-        # ---- Step 1.5: fingerprint well-known vulnerable training apps ---
-        known_app_seeds: list[tuple] = []  # (method, url, body, content_type)
-        try:
-            from sqli_ai.known_apps import KNOWN_APPS, fingerprint, get_seed_urls
-            app_id = fingerprint(site)
-            if app_id:
-                app = KNOWN_APPS[app_id]
-                known_app_seeds = get_seed_urls(site, app_id)
-                if app.auth:
-                    # Per-site auth config so each app can auto-authenticate.
-                    auths = getattr(args, "_known_app_auths", {})
-                    auths[site] = app.auth
-                    args._known_app_auths = auths
-                    # Back-compat single-site attribute (first one wins).
-                    if not hasattr(args, "_known_app_auth"):
-                        args._known_app_auth = (site, app.auth)
-                console.print(
-                    f"[green]✓ Recognized target as {app.name}[/green] — "
-                    f"seeding {len(known_app_seeds)} known-vulnerable endpoint(s)"
-                )
-                for method, url, _, _ in known_app_seeds:
-                    console.print(f"    [cyan]->[/cyan] {method} {url}")
-        except Exception as e:
-            console.print(f"[dim]App fingerprinting skipped: {e}[/dim]")
+        # No hardcoded per-app knowledge: discovery is fully organic — spec
+        # import (above), JS-aware crawl, form/link/JS-fetch extraction and
+        # parameter mining (below). Nothing about the specific target app is
+        # baked in, so the same pipeline generalizes to any site.
+        known_app_seeds: list[tuple] = []  # kept empty (no seeding)
 
         # ---- Step 2: crawl to discover additional URLs ------------------
         crawled = katana_crawl(
@@ -945,6 +945,37 @@ def _auto_discover(args, targets: list[str], console) -> None:
         )
         from urllib.parse import urlparse as _up_site
         args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
+
+        # ---- Step 2.5: JS-bundle endpoint mining (SPA discovery) --------
+        # Read the app's own JavaScript to learn the API routes (and their query
+        # params) it calls at runtime. This is how single-page apps expose
+        # endpoints like /rest/products/search?q= that never appear in the DOM,
+        # so a link crawler misses them. Fully generic — no per-app knowledge.
+        js_eps: list[str] = []
+        try:
+            import httpx as _httpx_js
+
+            from sqli_ai.js_endpoints import discover_js_endpoints
+            _js_hdrs = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+            with _httpx_js.Client(timeout=min(getattr(args, "timeout", 15), 12.0),
+                                  verify=False, follow_redirects=True) as _jc:
+                _root = _jc.get(site, headers=_js_hdrs)
+                js_eps = sorted(discover_js_endpoints(
+                    site, _root.text, _jc, headers=_js_hdrs
+                ))
+            if js_eps:
+                console.print(
+                    f"[green]✓ JS mining found {len(js_eps)} endpoint(s) "
+                    f"in the app's bundles[/green]"
+                )
+                show_j = js_eps if args.verbose else js_eps[:15]
+                for u in show_j:
+                    console.print(f"    [cyan]->[/cyan] {u}")
+                if len(show_j) < len(js_eps):
+                    console.print(f"    [dim]... and {len(js_eps) - len(show_j)} more (-v to see all)[/dim]")
+        except Exception as e:
+            console.print(f"[dim]JS endpoint mining skipped: {e}[/dim]")
 
         # ---- Step 3: organic path brute-forcing (content discovery) -----
         bruted: list[str] = []
@@ -978,7 +1009,7 @@ def _auto_discover(args, targets: list[str], console) -> None:
                     console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
 
         known_urls = [u for _, u, _, _ in known_app_seeds]
-        all_discovered |= set(known_urls) | set(crawled) | set(bruted)
+        all_discovered |= set(known_urls) | set(crawled) | set(bruted) | set(js_eps)
         known_extras.update({
             url: (method, body, ct, None)
             for method, url, body, ct in known_app_seeds
@@ -1012,6 +1043,14 @@ def main(argv: list[str] | None = None) -> int:
 
     targets = collect_targets(args)
 
+    # Capture the ORIGINAL seed host(s) up front. Every target discovered later
+    # (crawl, JS mining, organic expansion, brute) is hard-restricted to these
+    # hosts before scanning — testing a host the user never seeded would be both
+    # out-of-scope/unauthorized and a false-positive source (off-site links like
+    # social/CDN/other domains routinely appear in a page's HTML and JS).
+    from urllib.parse import urlparse as _up_seed
+    seed_hosts = {_up_seed(t).netloc for t in targets if _up_seed(t).netloc}
+
     # sqlmap-style '*' marker: if the user put a '*' in a URL they are telling us
     # EXACTLY where to inject. Respect that — don't let auto-discovery, organic
     # expansion, brute-forcing or param mining replace/dilute the marked target.
@@ -1035,9 +1074,14 @@ def main(argv: list[str] | None = None) -> int:
     # It's skipped for list/stdin input (those already come from a crawler) and
     # when an explicit --openapi spec is given, and can be forced with --auto or
     # disabled with --no-auto.
-    single_seed = bool(args.url) and not args.url_list and not args.stdin
+    # Auto-discovery runs for a single -u site AND for an explicit -l list of
+    # app roots — both are "seed" inputs the user expects to be expanded
+    # (fingerprint + spec import + crawl + known-vuln seeding, per host). It
+    # stays OFF for --stdin (that is already-expanded crawler output) unless the
+    # user forces it with --auto, and can always be disabled with --no-auto.
+    seed_input = (bool(args.url) or bool(args.url_list)) and not args.stdin
     auto_on = (
-        (args.auto or single_seed)
+        (args.auto or seed_input)
         and not args.no_auto
         and not args.openapi
         and bool(targets)
@@ -1142,6 +1186,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     headers = parse_headers(args.headers)
+    # Default to a real browser User-Agent for the actual injection probes.
+    # Without it httpx sends "python-httpx/x", which many WAFs / rate-limiters
+    # block outright (403) — silently turning every endpoint into a false
+    # negative. Only set when the user didn't supply their own UA.
+    if not any(k.lower() == "user-agent" for k in headers):
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+        )
     cookies = parse_cookies(args.cookie) if args.cookie else {}
     content_type = headers.get("Content-Type") or headers.get("content-type")
     # max_attempts must be >= len(seed_payloads) so all payloads get tested.
@@ -1293,6 +1346,24 @@ def main(argv: list[str] | None = None) -> int:
             proxy=args.proxy, timeout=min(args.timeout, 10.0),
             post_extras=spec_extras,
         )
+
+    # ---- Scope enforcement: NEVER scan a host the user didn't seed --------
+    # Discovery (katana crawl, JS mining, organic form/link expansion) can pull
+    # in off-site URLs (social links, CDNs, other domains referenced by the app).
+    # Scanning those is out-of-scope/unauthorized AND a false-positive source.
+    # Hard-filter every target down to the original seed host(s).
+    if seed_hosts:
+        _before_scope = len(targets)
+        targets = [t for t in targets if _up_seed(t).netloc in seed_hosts]
+        # Drop any off-host spec/known extras too, so they can't re-enter.
+        spec_extras = {u: v for u, v in spec_extras.items()
+                       if _up_seed(u).netloc in seed_hosts}
+        _dropped_scope = _before_scope - len(targets)
+        if _dropped_scope:
+            console.print(
+                f"[dim]Scope: dropped {_dropped_scope} off-host target(s) — "
+                f"only seeded host(s) {', '.join(sorted(seed_hosts))} are tested[/dim]"
+            )
 
     # Organic cookie capture: if the target sets a session cookie (CartID,
     # SSOid, PHPSESSID, ...) and the user didn't supply one, grab it and add it

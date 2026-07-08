@@ -10,6 +10,23 @@ import httpx
 
 from sqli_ai.models import HttpExchange, InjectionPoint, ParamLocation
 
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse a Retry-After header (delta-seconds form) into seconds, or None.
+
+    Only the numeric-seconds form is honored; HTTP-date form is ignored (falls
+    back to exponential backoff). Never returns a negative or absurd value.
+    """
+    if not value:
+        return None
+    try:
+        secs = float(value.strip())
+    except (ValueError, AttributeError):
+        return None
+    if secs < 0:
+        return None
+    return min(secs, 30.0)
+
 # CGI/web-app action → likely injectable params (for ?action=X style apps like BadStore).
 # When katana finds /page.cgi?action=search but no searchquery param in the URL,
 # these will be probed first before the generic param wordlist.
@@ -404,6 +421,14 @@ class HttpProbe:
                     payload=payload,
                 )
                 transient = resp.status_code in (502, 503, 504)
+                # Rate-limit / WAF block: a 429 or 403 under scan load is almost
+                # always throttling, not a real verdict. Treating it as final is
+                # THE main cause of intermittent false negatives on shared/flaky
+                # hosts (a vulnerable endpoint's quote probe gets a 403 and the
+                # finding is silently dropped). Retry these with a longer,
+                # Retry-After-aware backoff so the real 200/500 gets observed.
+                rate_limited = resp.status_code in (429, 403)
+                retry_after = _parse_retry_after(resp.headers.get("retry-after"))
             except httpx.HTTPError as e:
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 last_exchange = HttpExchange(
@@ -419,11 +444,24 @@ class HttpProbe:
                     payload=payload,
                 )
                 transient = True
+                rate_limited = False
+                retry_after = None
 
-            if not transient or attempt >= self.max_retries:
+            # Rate-limited responses get extra patience (they clear on their own);
+            # plain transient errors use the base retry budget.
+            max_for_code = self.max_retries + (3 if rate_limited else 0)
+            if not (transient or rate_limited) or attempt >= max_for_code:
                 return last_exchange
             attempt += 1
-            time.sleep(0.4 * attempt)  # 0.4s, 0.8s backoff
+            if rate_limited:
+                if retry_after is not None:
+                    delay = min(retry_after, 8.0)
+                else:
+                    delay = min(6.0, 0.75 * (2 ** attempt))  # 1.5s, 3s, 6s...
+                delay += (attempt % 3) * 0.15  # small jitter to desync threads
+            else:
+                delay = 0.4 * attempt  # 0.4s, 0.8s backoff
+            time.sleep(delay)
 
     def _inject(
         self,
