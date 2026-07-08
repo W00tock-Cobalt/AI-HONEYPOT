@@ -937,10 +937,40 @@ def _auto_discover(args, targets: list[str], console) -> None:
         # baked in, so the same pipeline generalizes to any site.
         known_app_seeds: list[tuple] = []  # kept empty (no seeding)
 
-        # ---- Step 2: crawl to discover additional URLs ------------------
+        # ---- Step 1.6: generic auth BEFORE crawling --------------------
+        # Auth-gated apps (DVWA/bWAPP-style) redirect every internal page to a
+        # login form when unauthenticated, so an unauthenticated crawl finds
+        # nothing. Establish a session with default creds FIRST, then crawl and
+        # brute-force WITH that session so the protected pages are discovered.
+        # Fully generic (submits only the app's own login form); per-host cookies
+        # are stored for the scan phase too.
+        site_cookie_str: Optional[str] = None
+        _host_cookies = getattr(args, "_host_cookies", {})
+        _user_auth = bool(
+            args.auth_token or (args.auth_url and args.auth_data)
+            or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
+        )
+        if not args.no_auto_auth and not _user_auth:
+            try:
+                from sqli_ai.session import establish_session
+                _jar, _msg = establish_session(site, console=console,
+                                               timeout=min(getattr(args, "timeout", 15), 12.0))
+            except Exception as e:
+                _jar, _msg = {}, f"auth error: {e}"
+            if _jar:
+                from urllib.parse import urlparse as _up_site0
+                host = _up_site0(site).netloc
+                _host_cookies[host] = _jar
+                args._host_cookies = _host_cookies
+                site_cookie_str = "; ".join(f"{k}={v}" for k, v in _jar.items())
+            elif "no login form" not in _msg:
+                console.print(f"[dim]Auth ({site}): {_msg}[/dim]")
+
+        # ---- Step 2: crawl to discover additional URLs (authenticated) --
         crawled = katana_crawl(
             site, console,
             depth=getattr(args, "crawl_depth", 3),
+            cookie=site_cookie_str,
             verbose=args.verbose,
         )
         from urllib.parse import urlparse as _up_site
@@ -958,6 +988,8 @@ def _auto_discover(args, targets: list[str], console) -> None:
             from sqli_ai.js_endpoints import discover_js_endpoints
             _js_hdrs = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+            if site_cookie_str:
+                _js_hdrs["Cookie"] = site_cookie_str
             with _httpx_js.Client(timeout=min(getattr(args, "timeout", 15), 12.0),
                                   verify=False, follow_redirects=True) as _jc:
                 _root = _jc.get(site, headers=_js_hdrs)
@@ -989,10 +1021,13 @@ def _auto_discover(args, targets: list[str], console) -> None:
                         extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
                 except OSError as e:
                     console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+            _bf_hdrs = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+            if site_cookie_str:
+                _bf_hdrs["Cookie"] = site_cookie_str
             try:
                 bruted = discover_paths(
                     site,
-                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+                    headers=_bf_hdrs,
                     extra_words=extra_words,
                     on_status=lambda m: console.print(m),
                 )
@@ -1372,7 +1407,11 @@ def main(argv: list[str] | None = None) -> int:
     # vulnerable pages 302 to login when unauthenticated). Fully generic: it only
     # submits whatever login form the app itself serves. Skipped when the user
     # supplied their own auth/cookie or passed --no-auto-auth.
-    host_cookies: dict[str, dict[str, str]] = {}
+    # Inherit any sessions already established during auto-discovery (auth runs
+    # there BEFORE crawl so protected pages are discovered). Only authenticate
+    # hosts not already covered (e.g. --no-auto / stdin runs where discovery,
+    # and thus its pre-crawl auth, never ran).
+    host_cookies: dict[str, dict[str, str]] = dict(getattr(args, "_host_cookies", {}))
     _user_supplied_auth = bool(
         args.auth_token or (args.auth_url and args.auth_data)
         or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
@@ -1380,6 +1419,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_auto_auth and not _user_supplied_auth and seed_hosts:
         from sqli_ai.session import establish_session
         for host in sorted(seed_hosts):
+            if host in host_cookies:
+                continue
             scheme = "https"
             for t in targets:
                 if _up_seed(t).netloc == host:

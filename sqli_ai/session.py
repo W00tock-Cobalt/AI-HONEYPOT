@@ -210,10 +210,23 @@ def establish_session(
                     resp = c.post(login_url, data=fields, headers=hdrs)
             except (httpx.HTTPError, OSError):
                 continue
-            if _looks_authenticated(resp, login_url):
-                jar = {k: v for k, v in c.cookies.items()}
-                if jar:
-                    log(f"[green]✓ Auth: logged in as {user}/{pw}[/green] "
-                        f"[dim]({len(jar)} session cookie(s))[/dim]")
-                    return jar, f"authenticated as {user}/{pw}"
-        return {}, "login form found but all default credentials failed"
+            if not _looks_authenticated(resp, login_url):
+                continue
+            # Verify the session actually persists: re-request the login page
+            # with the captured cookies. If we're bounced back to a login form,
+            # the "success" was illusory (stale CSRF / session regeneration /
+            # session fixation) — keep trying other credentials rather than
+            # returning a dead session that finds nothing.
+            try:
+                check = c.get(login_url, headers=hdrs)
+            except (httpx.HTTPError, OSError):
+                check = resp
+            if _PW_INPUT.search(check.text or "") and \
+                    urlparse(str(check.url)).path == urlparse(login_url).path:
+                continue  # still shown a login form → not really authenticated
+            jar = {k: v for k, v in c.cookies.items()}
+            if jar:
+                log(f"[green]✓ Auth: logged in as {user}/{pw}[/green] "
+                    f"[dim]({len(jar)} session cookie(s), verified)[/dim]")
+                return jar, f"authenticated as {user}/{pw}"
+        return {}, "login form found but all default credentials failed/didn't persist"
