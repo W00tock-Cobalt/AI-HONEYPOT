@@ -69,6 +69,26 @@ def _name_of(tag: str) -> str | None:
     return _ATTR(tag, "name") or _ATTR(tag, "id")
 
 
+def _prefer_vulnerable_difficulty(jar: dict[str, str]) -> dict[str, str]:
+    """Lower any difficulty/security-level cookie to its most-vulnerable value.
+
+    Training and demo apps commonly gate their intentionally-vulnerable code
+    behind a difficulty cookie (DVWA ``security``, bWAPP ``security_level``, ...)
+    that often defaults to a hardened level where the vulnerabilities are patched
+    out. Maximizing testable surface by choosing the lowest difficulty is a
+    generic scanner behavior — it keys off the cookie NAME, not any specific app.
+    """
+    for k in list(jar.keys()):
+        kl = k.lower()
+        if "security" in kl or "difficulty" in kl or kl.endswith("level"):
+            v = jar[k]
+            if v.isdigit():
+                jar[k] = "0"          # numeric scales: 0 = lowest
+            elif v.lower() != "low":
+                jar[k] = "low"        # named scales: low/medium/high/impossible
+    return jar
+
+
 def _find_login_form(html: str):
     """Return (action, method, username_field, password_field) or None.
 
@@ -212,20 +232,28 @@ def establish_session(
                 continue
             if not _looks_authenticated(resp, login_url):
                 continue
-            # Verify the session actually persists: re-request the login page
-            # with the captured cookies. If we're bounced back to a login form,
-            # the "success" was illusory (stale CSRF / session regeneration /
-            # session fixation) — keep trying other credentials rather than
-            # returning a dead session that finds nothing.
+            # Verify the session actually persists by re-requesting the
+            # POST-LOGIN LANDING page (not the login page itself — many apps,
+            # e.g. DVWA, keep serving /login.php with a form even when you're
+            # authenticated, so re-checking it gives a false failure). If the
+            # landing page bounces us back to a login form, the "success" was
+            # illusory (stale CSRF / session regeneration / uninitialized DB) —
+            # keep trying other credentials rather than returning a dead session.
+            landing = str(resp.url)
+            if urlparse(landing).path == urlparse(login_url).path:
+                landing = site.rstrip("/") + "/"  # fall back to the site root
             try:
-                check = c.get(login_url, headers=hdrs)
+                check = c.get(landing, headers=hdrs)
             except (httpx.HTTPError, OSError):
                 check = resp
-            if _PW_INPUT.search(check.text or "") and \
-                    urlparse(str(check.url)).path == urlparse(login_url).path:
-                continue  # still shown a login form → not really authenticated
+            check_is_login = _PW_INPUT.search(check.text or "") and (
+                urlparse(str(check.url)).path == urlparse(login_url).path
+            )
+            if check_is_login:
+                continue  # bounced back to login → not really authenticated
             jar = {k: v for k, v in c.cookies.items()}
             if jar:
+                jar = _prefer_vulnerable_difficulty(jar)
                 log(f"[green]✓ Auth: logged in as {user}/{pw}[/green] "
                     f"[dim]({len(jar)} session cookie(s), verified)[/dim]")
                 return jar, f"authenticated as {user}/{pw}"
