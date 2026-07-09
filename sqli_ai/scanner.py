@@ -647,6 +647,36 @@ class Scanner:
                     and inert_probe.response_body == baseline.response_body):
                 return None  # param has no effect — identical to baseline
 
+            # Raw-SQL executor (e.g. BrokenCrystals /api/testimonials/count?query=
+            # runs the value verbatim as SQL): EVERY input errors, so "a quote
+            # causes an error" can't distinguish it. Inject a unique marker and
+            # confirm it comes back INSIDE a SQL error (e.g. Postgres 'syntax
+            # error at or near "<marker>"'). A random marker sitting next to a SQL
+            # parser error is definitive proof the input is parsed as SQL — a
+            # high-confidence, near-zero-FP error-based finding.
+            marker = "SQLiAiZ9x8Q"
+            mk_probe = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=marker,
+            )
+            report.add_request()
+            mk_body = mk_probe.response_body or ""
+            errs = self.detector.find_sql_errors(mk_body)
+            if marker in mk_body and errs:
+                idx_m, idx_e = mk_body.find(marker), mk_body.find(errs[0])
+                if idx_e >= 0 and abs(idx_m - idx_e) <= 120:
+                    finding = self._build_finding(
+                        point, mk_probe, baseline,
+                        f"Raw-SQL execution: injected marker {marker!r} reflected "
+                        f"inside a SQL error ({errs[0][:60]}) — the parameter is "
+                        f"parsed directly as SQL",
+                        0.95, inj_type=InjectionType.ERROR_BASED,
+                    )
+                    return self._enrich_error(
+                        finding, url, method, data, content_type,
+                        extra_headers, point, report,
+                    )
+
         if self._precheck and not self.detector.baseline_already_erroring(baseline):
             # Inject relative to the ORIGINAL value, not by replacing it. Real
             # SQLi context is preserved by appending: for q=apple the probe
@@ -1474,15 +1504,31 @@ class Scanner:
             )
             report.add_request()
             ctrl_delay = ctrl_ex.response_time_ms - baseline.response_time_ms
-            if ctrl_delay >= thresh * 0.6:
+            # The 0-sleep control must be fast in absolute terms AND clearly
+            # faster than the payload (rules out a uniformly slow endpoint).
+            if ctrl_delay >= thresh * 0.6 or ctrl_delay >= delay * 0.5:
+                continue
+            # A real SLEEP(n) delays ~n seconds; a delay many multiples past the
+            # request is a noise spike, not the sleep executing.
+            if delay > self._sleep_ms * 2.5:
                 continue
 
-            # Scaling confirmation: a genuine time-based injection delays in
-            # PROPORTION to the requested sleep — ask for 2x and it takes ~2x.
-            # Server/network jitter (common on shared/rate-limited hosts, which
-            # is exactly what produced the /metrics & /application FPs) does not
-            # scale. Requiring the doubled sleep to clear a doubled threshold
-            # turns a noisy single-sample signal into a reliable one.
+            # (1) REPRODUCE at the same sleep. A genuine injection delays on
+            # EVERY request; a one-off network/rate-limit spike does not. This is
+            # the decisive anti-jitter check on shared/flaky hosts (where a single
+            # slow sample previously produced dozens of false positives).
+            rep_ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=send_payload,
+            )
+            report.add_request()
+            rep_delay = rep_ex.response_time_ms - baseline.response_time_ms
+            if rep_delay < thresh:
+                continue
+
+            # (2) SCALE at 2x. The delay must grow by ~the added sleep time —
+            # proportional to the request, not an absolute threshold (noise is
+            # slow in both samples and passes an absolute bar; it does not scale).
             long_s = sleep_s * 2
             long_tpl = tpl.format(s=long_s)
             send_long = self._apply_tamper(long_tpl if replace else orig + long_tpl)
@@ -1493,20 +1539,10 @@ class Scanner:
             long_ex.expected_sleep_ms = long_s * 1000
             report.add_request()
             long_delay = long_ex.response_time_ms - baseline.response_time_ms
-            # PROPORTIONAL scaling is the real discriminator, not an absolute
-            # threshold. Doubling the sleep must ADD ~the extra sleep time to the
-            # delay. On rate-limited/flaky hosts random requests are slow in BOTH
-            # samples, so an absolute check ("6s delay > 4.2s") passes on noise
-            # (we saw +7277ms@3s then only +4204ms@6s wrongly "confirm"). Require:
-            #   • the doubled-sleep delay is clearly LARGER than the single (it
-            #     grew by at least the added sleep * 0.6), and
-            #   • the single-sleep delay is in a sane band for the sleep (not a
-            #     noise spike an order of magnitude past the requested seconds).
+            base_delay = min(delay, rep_delay)  # the reliable (reproduced) delay
             added_ms = (long_s - sleep_s) * 1000
-            grew_enough = long_delay >= delay + added_ms * 0.6
-            sane_single = delay <= self._sleep_ms * 2.5
-            if not (grew_enough and sane_single):
-                continue  # not proportional → timing noise, not SQLi
+            if long_delay < base_delay + added_ms * 0.6:
+                continue  # didn't scale with the sleep → timing noise, not SQLi
 
             if itype == InjectionType.STACKED:
                 kind = "stacked-query"
@@ -1516,9 +1552,10 @@ class Scanner:
                 kind = "per-context"
             return self._build_finding(
                 point, ex, baseline,
-                f"Time-based blind ({kind}): {payload!r} delayed +{delay:.0f}ms "
-                f"(~{sleep_s}s); control (0s) fast (+{ctrl_delay:.0f}ms); "
-                f"scaled to +{long_delay:.0f}ms at {long_s}s (confirms proportional delay)",
+                f"Time-based blind ({kind}): {payload!r} delayed +{base_delay:.0f}ms "
+                f"(~{sleep_s}s, reproduced +{max(delay, rep_delay):.0f}ms); "
+                f"control (0s) fast (+{ctrl_delay:.0f}ms); scaled to +{long_delay:.0f}ms "
+                f"at {long_s}s (proportional — confirms real delay)",
                 0.9, inj_type=itype,
             )
         return None

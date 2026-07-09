@@ -1753,7 +1753,22 @@ def main(argv: list[str] | None = None) -> int:
 
             # If the spec pins a method for this URL, use only that.
             # Otherwise try every method the user requested.
-            methods = [spec_method] if spec_method else cli_methods
+            methods = [spec_method] if spec_method else list(cli_methods)
+
+            # Auth-endpoint bypass: login/authenticate endpoints are the classic
+            # SQLi auth-bypass sink (Juice Shop's POST /rest/user/login with
+            # email=' OR 1=1--). They're almost always POST + a JSON credential
+            # body, which a plain GET scan never exercises — so if a discovered
+            # endpoint's path looks like authentication and the user didn't pin a
+            # method, also POST it with a credential body. Fully generic (keys off
+            # the path shape, not any specific app).
+            import re as _re_auth
+            _auth_path = bool(_re_auth.search(
+                r"(log[-_]?in|sign[-_]?in|authenticate|/auth\b|/session|/token)",
+                _up_seed(target).path, _re_auth.IGNORECASE,
+            ))
+            if _auth_path and not spec_method and "POST" not in methods:
+                methods.append("POST")
 
             reports = []
             for m in methods:
