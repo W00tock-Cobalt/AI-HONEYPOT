@@ -88,17 +88,35 @@ def print_report(report: ScanReport, console: Console | None = None) -> None:
 
 
 def export_json(report: ScanReport) -> dict[str, Any]:
-    """Serialize a ScanReport to a JSON-compatible dict."""
+    """Serialize a ScanReport to a JSON-compatible dict.
+
+    Deliberately DROPS the raw per-request ``exchanges`` log and caps oversized
+    strings: on a large crawl that log holds one full response body (up to 50 KB)
+    per request across hundreds of URLs, ballooning the report to 100 MB+ and
+    OOM-killing the process. The confirmed findings (with their own
+    before/after snippets) are what the report is for; ``total_requests`` still
+    records how many requests ran.
+    """
+    import dataclasses
+
+    _MAX_STR = 8000
 
     def _serialize(obj):
         if hasattr(obj, "value"):          # Enum → string
             return obj.value
-        if hasattr(obj, "__dataclass_fields__"):  # dataclass → dict
-            return {k: _serialize(v) for k, v in asdict(obj).items()}
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            out = {}
+            for fld in dataclasses.fields(obj):
+                if fld.name == "exchanges":   # bulk HTTP log — skip (memory)
+                    continue
+                out[fld.name] = _serialize(getattr(obj, fld.name))
+            return out
         if isinstance(obj, list):
             return [_serialize(i) for i in obj]
         if isinstance(obj, dict):
             return {k: _serialize(v) for k, v in obj.items()}
+        if isinstance(obj, str) and len(obj) > _MAX_STR:
+            return obj[:_MAX_STR] + "…[truncated]"
         return obj
 
     return _serialize(report)

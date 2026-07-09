@@ -1493,8 +1493,20 @@ class Scanner:
             long_ex.expected_sleep_ms = long_s * 1000
             report.add_request()
             long_delay = long_ex.response_time_ms - baseline.response_time_ms
-            if long_delay < long_s * 1000 * 0.7:
-                continue  # didn't scale with the sleep → timing noise, not SQLi
+            # PROPORTIONAL scaling is the real discriminator, not an absolute
+            # threshold. Doubling the sleep must ADD ~the extra sleep time to the
+            # delay. On rate-limited/flaky hosts random requests are slow in BOTH
+            # samples, so an absolute check ("6s delay > 4.2s") passes on noise
+            # (we saw +7277ms@3s then only +4204ms@6s wrongly "confirm"). Require:
+            #   • the doubled-sleep delay is clearly LARGER than the single (it
+            #     grew by at least the added sleep * 0.6), and
+            #   • the single-sleep delay is in a sane band for the sleep (not a
+            #     noise spike an order of magnitude past the requested seconds).
+            added_ms = (long_s - sleep_s) * 1000
+            grew_enough = long_delay >= delay + added_ms * 0.6
+            sane_single = delay <= self._sleep_ms * 2.5
+            if not (grew_enough and sane_single):
+                continue  # not proportional → timing noise, not SQLi
 
             if itype == InjectionType.STACKED:
                 kind = "stacked-query"
