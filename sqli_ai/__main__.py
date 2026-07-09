@@ -904,7 +904,6 @@ def _auto_discover(args, targets: list[str], console) -> None:
 
     all_discovered: set[str] = set(targets)  # never drop the original seeds
     spec_sites: list[str] = []
-    known_extras: dict = {}
 
     for site in list(targets):
         console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
@@ -954,7 +953,6 @@ def _auto_discover(args, targets: list[str], console) -> None:
         # import (above), JS-aware crawl, form/link/JS-fetch extraction and
         # parameter mining (below). Nothing about the specific target app is
         # baked in, so the same pipeline generalizes to any site.
-        known_app_seeds: list[tuple] = []  # kept empty (no seeding)
 
         # ---- Step 1.6: generic auth BEFORE crawling --------------------
         # Auth-gated apps (DVWA/bWAPP-style) redirect every internal page to a
@@ -1062,15 +1060,9 @@ def _auto_discover(args, targets: list[str], console) -> None:
                 if len(show_b) < len(bruted):
                     console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
 
-        known_urls = [u for _, u, _, _ in known_app_seeds]
-        all_discovered |= set(known_urls) | set(crawled) | set(bruted) | set(js_eps)
-        known_extras.update({
-            url: (method, body, ct, None)
-            for method, url, body, ct in known_app_seeds
-        })
+        all_discovered |= set(crawled) | set(bruted) | set(js_eps)
 
     args._auto_targets = sorted(all_discovered)
-    args._known_app_extras = known_extras
     args._spec_sites = spec_sites
     # Back-compat: keep args.openapi pointing at the first spec site so any code
     # path that only checks args.openapi still triggers an import.
@@ -1149,11 +1141,6 @@ def main(argv: list[str] | None = None) -> int:
     # OpenAPI/Swagger import — discover endpoints with their real param names
     # spec_extras maps url -> (method, body, content_type, inject_headers)
     spec_extras: dict[str, tuple[str, Optional[str], Optional[str], Optional[dict]]] = {}
-
-    # Known-app fingerprinting (from --auto) seeds well-known vulnerable
-    # endpoints with their method/body — merge those in the same way.
-    if hasattr(args, "_known_app_extras"):
-        spec_extras.update(args._known_app_extras)
 
     # Spec sources: explicit --openapi plus every site auto-discovery found a
     # spec on (args._spec_sites). Import them ALL so a list of API targets is
@@ -1293,21 +1280,6 @@ def main(argv: list[str] | None = None) -> int:
             token_path=args.auth_token_path, proxy=args.proxy,
         )
         console.print(f"[green]✓[/green] {msg}" if auth_token else f"[yellow]{msg}[/yellow]")
-    elif not args.no_auto_auth and hasattr(args, "_known_app_auth"):
-        site, (login_path, login_body, tok_path) = args._known_app_auth
-        login_url = site.rstrip("/") + login_path
-        console.print(f"[*] Auto-authenticating recognized app via {login_url} ...")
-        auth_token, msg = obtain_token(
-            login_url, login_body, headers=headers,
-            token_path=tok_path, proxy=args.proxy,
-        )
-        if auth_token:
-            console.print(
-                f"[green]✓ Authenticated[/green] — token obtained, "
-                f"authenticated endpoints are now in scope"
-            )
-        else:
-            console.print(f"[yellow]Auto-auth failed: {msg}[/yellow]")
 
     if auth_token:
         # Attach to every request. Not treated as an injection point
