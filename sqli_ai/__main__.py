@@ -724,6 +724,24 @@ def _is_static(url: str) -> bool:
     return any(s in url.lower() for s in _STATIC_SEGS)
 
 
+def _sink_key(url: str, param: str) -> tuple:
+    """A per-SINK dedup key: same param reached through a DIFFERENT server-side
+    handler is a distinct injection point, not a duplicate.
+
+    Keys on (host, path, other-param-names, action-value, param). The ``action``
+    value is the semantic discriminator for CGI/handler-style apps (BadStore's
+    ?action=register vs ?action=login vs ?action=cartadd are separate SQL sinks
+    for the same field name). Other params contribute only their NAMES, so
+    varying values (crawl noise) don't inflate the count.
+    """
+    from urllib.parse import parse_qsl, urlparse
+    pr = urlparse(url or "")
+    q = dict(parse_qsl(pr.query, keep_blank_values=True))
+    other_names = tuple(sorted(k for k in q if k != param))
+    action = q.get("action", "")
+    return (pr.netloc, pr.path, other_names, action, param)
+
+
 def _parse_creds(raw: list[str] | None) -> list[tuple[str, str]]:
     """Parse --creds 'user:pass' strings into (user, pass) pairs.
 
@@ -1873,13 +1891,13 @@ def main(argv: list[str] | None = None) -> int:
         # Collect unique findings and GROUP THEM BY HOST so the output is linear
         # per site (not interleaved in scan-completion order). Within a host,
         # highest-confidence findings come first.
-        seen_sinks: set[tuple[str, str, str]] = set()
+        seen_sinks: set[tuple] = set()
         rows: list[tuple] = []  # (host, report, finding)
         deduped = 0
         for r in all_reports:
             host = _up(r.target_url).netloc
             for f in r.findings:
-                sink = (host, _up(r.target_url).path, f.param)
+                sink = _sink_key(f.payload_url or r.target_url, f.param)
                 if sink in seen_sinks:
                     deduped += 1
                     continue
@@ -2346,13 +2364,14 @@ def print_rollup(all_reports, console) -> None:
 
     from rich.panel import Panel
 
-    # Dedup to unique sinks (host, path, param) so the count matches the table.
+    # Dedup to unique SINKS so the count matches the table (same param via a
+    # different handler/action is a distinct injection point — see _sink_key).
     seen: set[tuple] = set()
     findings: list[tuple] = []  # (host, finding)
     for r in all_reports:
         host = _up(r.target_url).netloc
         for f in r.findings:
-            sink = (host, _up(r.target_url).path, f.param)
+            sink = _sink_key(f.payload_url or r.target_url, f.param)
             if sink in seen:
                 continue
             seen.add(sink)
