@@ -83,6 +83,7 @@ class Scanner:
         seed_payloads: Optional[list[str]] = None,
         organic: bool = True,
         second_order: bool = False,
+        time_based: bool = False,
         llm_deep: bool = False,
     ):
         self.agent = agent
@@ -102,6 +103,12 @@ class Scanner:
         self.continue_on_found = continue_on_found
         self.organic = organic  # mine params from the response itself
         self.second_order = second_order
+        # Time-based/blind detection is OFF by default: on shared or rate-limited
+        # hosts, response timing is dominated by network jitter, which produces
+        # false positives no timing heuristic can fully filter. Error-based,
+        # boolean-blind, UNION and auth-bypass are deterministic (content/status,
+        # not timing) and stay on. Enable time-based with --time on stable infra.
+        self.time_based = time_based
         # llm_deep: call the LLM aggressively (per-param suggestion + per-payload
         # analysis). Default False — the LLM is used sparingly as a near-miss
         # ASSIST only (see _llm_assist), which is faster and higher-value.
@@ -1465,8 +1472,8 @@ class Scanner:
         Cheap on non-injectable params (the sleep is a literal string → fast
         response); only genuinely injectable params incur the delay.
         """
-        if self.fast:
-            return None
+        if self.fast or not self.time_based:
+            return None  # time-based is opt-in (--time) — see __init__ note
         from sqli_ai.payloads import (
             STACKED_TIME_TEMPLATES, TIME_BASED_POLYGLOTS, TIME_BASED_TEMPLATES,
         )

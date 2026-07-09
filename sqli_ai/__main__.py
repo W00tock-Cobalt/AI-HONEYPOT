@@ -102,6 +102,12 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                         "via write endpoints (POST/PUT), then re-read and flag if "
                         "the stored value surfaces in a SQL error later. NOTE: "
                         "writes marker data to the target, so it is opt-in.")
+    p.add_argument("--time", action="store_true", dest="time_based",
+                   help="Enable time-based/blind detection (SLEEP/pg_sleep/WAITFOR). "
+                        "OFF by default: response timing is unreliable on shared or "
+                        "rate-limited hosts and causes false positives. Use only "
+                        "against stable targets; error/boolean/UNION/auth-bypass "
+                        "detection (deterministic) always runs.")
     p.add_argument("--openapi",
                    help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
                         "to discover endpoints WITH their real parameter names")
@@ -1690,6 +1696,9 @@ def main(argv: list[str] | None = None) -> int:
         seed_payloads=display_payloads,
         organic=args.organic,
         second_order=args.second_order,
+        # Time-based is opt-in via --time, or implied by explicitly selecting the
+        # time/stacked payload modes.
+        time_based=args.time_based or args.payloads in ("time", "stacked"),
         llm_deep=args.llm_deep,
         on_progress=progress if verbose_progress else lambda m: (
             console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
