@@ -45,6 +45,15 @@ _DEFAULT_CREDS = (
     ("admin", "changeme"), ("demo", "demo"),
 )
 
+# Links whose href points at a login/register/account page — followed from the
+# landing page so login forms at non-conventional URLs (CGI ?action=login, etc.)
+# are discovered without any per-app path list.
+_LOGIN_LINK_RE = re.compile(
+    r"""href=['"]([^'"]*(?:log[-_]?in|log[-_]?on|sign[-_]?in|sign[-_]?up|"""
+    r"""register|loginregister|my[-_]?account|/account)[^'"]*)['"]""",
+    re.IGNORECASE,
+)
+
 _PW_INPUT = re.compile(r"<input[^>]*type=['\"]?password['\"]?[^>]*>", re.IGNORECASE)
 _FORM_TAG = re.compile(r"<form\b[^>]*>", re.IGNORECASE)
 _ATTR = lambda tag, name: (  # noqa: E731
@@ -184,11 +193,23 @@ def establish_session(
     )
     kwargs = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
 
-    # 1. Locate a login form: landing page first, then conventional paths.
+    # 1. Locate a login form: landing page, then any login/register LINK the
+    # landing page points at (so non-conventional login URLs like BadStore's
+    # /cgi-bin/badstore.cgi?action=login are found), then conventional paths.
     login_url = None
     form = None
     with httpx.Client(**kwargs) as c:
-        candidates = [site.rstrip("/") + "/"]
+        root_url = site.rstrip("/") + "/"
+        candidates = [root_url]
+        base_host = urlparse(site).netloc
+        try:
+            root_html = c.get(root_url, headers=hdrs).text
+            for href in _LOGIN_LINK_RE.findall(root_html):
+                absu = urljoin(root_url, href)
+                if urlparse(absu).netloc == base_host and absu not in candidates:
+                    candidates.append(absu)
+        except (httpx.HTTPError, OSError):
+            pass
         candidates += [urljoin(site, p) for p in _LOGIN_PATHS]
         seen: set[str] = set()
         for url in candidates:
