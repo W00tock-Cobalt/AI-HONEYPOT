@@ -162,12 +162,16 @@ def establish_session(
     timeout: float = 12.0,
     verify_ssl: bool = False,
     headers: dict[str, str] | None = None,
+    creds: list[tuple[str, str]] | None = None,
 ) -> tuple[dict[str, str], str]:
-    """Try to log in to ``site`` with default creds; return (cookies, message).
+    """Try to log in to ``site``; return (cookies, message).
 
-    ``cookies`` is empty when no login form is found or every credential failed.
-    Fully organic: it only ever interacts with a form the app itself serves.
+    ``creds`` (user, pass) pairs are tried FIRST, before the built-in defaults,
+    so the operator can supply real credentials for a target. ``cookies`` is
+    empty when no login form is found or every credential failed. Fully organic:
+    it only ever interacts with a form the app itself serves.
     """
+    cred_list = list(creds or []) + list(_DEFAULT_CREDS)
     def log(msg: str) -> None:
         if console is not None:
             console.print(msg)
@@ -210,8 +214,8 @@ def establish_session(
         log(f"[dim]Auth: login form at {login_url} "
             f"(user='{user_field}', pass='{pw_field}')[/dim]")
 
-        # 2. Try default credentials.
-        for user, pw in _DEFAULT_CREDS:
+        # 2. Try operator-supplied credentials first, then the built-in defaults.
+        for user, pw in cred_list:
             # Fresh GET → new CSRF token + session cookie for this attempt.
             try:
                 page = c.get(login_url, headers=hdrs)

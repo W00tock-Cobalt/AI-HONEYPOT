@@ -154,6 +154,10 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
     p.add_argument("--no-auto-auth", action="store_true",
                    help="Disable automatic authentication for recognized apps "
                         "(e.g. Juice Shop login-SQLi self-auth)")
+    p.add_argument("--creds", action="append", metavar="USER:PASS",
+                   help="Credentials to try at any discovered login form, tried "
+                        "BEFORE the built-in defaults (repeatable, e.g. "
+                        "--creds admin:letmein --creds bee:bug)")
     p.add_argument("-p", "--param", action="append", dest="params",
                    help="Test only this parameter (repeatable)")
     p.add_argument("--proxy", help="HTTP proxy URL")
@@ -714,6 +718,22 @@ def _is_static(url: str) -> bool:
     return any(s in url.lower() for s in _STATIC_SEGS)
 
 
+def _parse_creds(raw: list[str] | None) -> list[tuple[str, str]]:
+    """Parse --creds 'user:pass' strings into (user, pass) pairs.
+
+    Split on the FIRST ':' only, so passwords may contain colons. Entries
+    without a ':' are skipped with their value treated as a username + empty pass.
+    """
+    out: list[tuple[str, str]] = []
+    for item in (raw or []):
+        if ":" in item:
+            u, p = item.split(":", 1)
+            out.append((u, p))
+        elif item:
+            out.append((item, ""))
+    return out
+
+
 def _is_session_destroying(url: str) -> bool:
     """True for logout/sign-out URLs that would DESTROY an authenticated session.
 
@@ -970,8 +990,10 @@ def _auto_discover(args, targets: list[str], console) -> None:
         if not args.no_auto_auth and not _user_auth:
             try:
                 from sqli_ai.session import establish_session
-                _jar, _msg = establish_session(site, console=console,
-                                               timeout=min(getattr(args, "timeout", 15), 12.0))
+                _jar, _msg = establish_session(
+                    site, console=console,
+                    timeout=min(getattr(args, "timeout", 15), 12.0),
+                    creds=_parse_creds(getattr(args, "creds", None)))
             except Exception as e:
                 _jar, _msg = {}, f"auth error: {e}"
             if _jar:
@@ -1438,6 +1460,7 @@ def main(argv: list[str] | None = None) -> int:
                 jar, msg = establish_session(
                     site_root, console=console,
                     timeout=min(args.timeout, 12.0), headers=headers,
+                    creds=_parse_creds(getattr(args, "creds", None)),
                 )
             except Exception as e:
                 jar, msg = {}, f"auth error: {e}"
