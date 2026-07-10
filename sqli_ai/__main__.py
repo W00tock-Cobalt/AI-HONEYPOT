@@ -2467,7 +2467,10 @@ def _aggregate_findings(all_reports) -> list[dict]:
     for r in all_reports:
         host = _up(r.target_url).netloc
         for f in r.findings:
-            key = (host, _up(r.target_url).path, f.param, f.injection_type.value)
+            # Per-SINK key (host, path, other-params, action, param) so the saved
+            # report matches the console rollup — same param via a different
+            # handler is a distinct injection point.
+            key = _sink_key(f.payload_url or r.target_url, f.param)
             if key in seen:
                 continue
             seen.add(key)
