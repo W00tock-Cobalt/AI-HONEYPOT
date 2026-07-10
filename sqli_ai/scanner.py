@@ -195,6 +195,16 @@ class Scanner:
             )
             return report
 
+        # Skip web-server directory-listing pages (Apache/nginx/IIS auto-index).
+        # They have no SQL behind them; their sort-order links (?C=N;O=A ...)
+        # change on "injection", which fools content-diff detection into a false
+        # positive. Not a real endpoint — don't scan it.
+        if self.detector.looks_like_directory_listing(baseline):
+            report.add_error("Skipped: web-server directory listing (no SQL sink)")
+            self.on_progress("[*] Skipping (directory listing — not an app endpoint)")
+            report.duration_seconds = time.perf_counter() - start
+            return report
+
         # Skip auth-gated / WAF-blocked baselines — can't test unauthenticated.
         # EXCEPTION: a POST/PUT with credential-like body params (a login attempt)
         # naturally returns 401 to wrong creds — that's the auth-bypass target,

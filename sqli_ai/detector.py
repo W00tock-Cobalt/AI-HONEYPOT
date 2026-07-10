@@ -83,6 +83,24 @@ class SqlDetector:
             return True
         return self.is_db_offline(exchange)
 
+    _DIR_LISTING = re.compile(
+        r"<title>\s*Index of /|<h1>\s*Index of /|"
+        r"Directory Listing (?:For|of)|\[To Parent Directory\]",
+        re.IGNORECASE,
+    )
+
+    def looks_like_directory_listing(self, exchange: HttpExchange) -> bool:
+        """True for a web-server auto-index page (Apache mod_autoindex, nginx
+        autoindex, IIS directory browsing).
+
+        These are static file listings with NO server-side query behind them.
+        Their sort links (Apache's ?C=N;O=A / ?C=S;O=D column+order controls)
+        change the response when 'injected', which fools content-diff detection
+        into a false positive — so such pages must not be scanned as SQL sinks.
+        """
+        body = exchange.response_body or ""
+        return bool(self._DIR_LISTING.search(body[:2000]))
+
     _PASSWORD_INPUT = re.compile(r'type=["\']?password', re.IGNORECASE)
 
     def looks_like_login_page(self, exchange: HttpExchange) -> bool:
