@@ -94,6 +94,12 @@ class HttpProbe:
         # inconsistency. Retrying transient failures a couple times makes scans
         # deterministic on flaky targets.
         self.max_retries = max_retries
+        # Host-wide block detection: a target that keeps returning 403/429 has
+        # blocked us (WAF/rate-limit), not hiccupped. Track consecutive blocks so
+        # we fail fast instead of burning full backoff on every request, and so
+        # the caller can warn loudly. Reset on any normal (<500) response.
+        self._consec_block = 0
+        self.host_blocked = False
         # Cap the CONNECT phase hard (<=8s) so a dead/stalling host can't burn
         # the full read timeout (×retries) just establishing a TCP connection —
         # a live host connects in well under a second, so this only bites
@@ -447,18 +453,35 @@ class HttpProbe:
                 rate_limited = False
                 retry_after = None
 
-            # Rate-limited responses get extra patience (they clear on their own);
-            # plain transient errors use the base retry budget.
-            max_for_code = self.max_retries + (3 if rate_limited else 0)
-            if not (transient or rate_limited) or attempt >= max_for_code:
+            # Track consecutive WAF/rate-limit blocks so a persistently-blocked
+            # host fails fast (and the caller can warn loudly) instead of burning
+            # backoff on every request.
+            status_code = last_exchange.status_code
+            if status_code in (403, 429):
+                self._consec_block += 1
+                if self._consec_block >= 6:
+                    self.host_blocked = True
+            elif status_code and status_code < 500:
+                self._consec_block = 0
+
+            # Retry budget: 429 (genuine rate-limit) gets full patience with
+            # Retry-After backoff; 403 is usually a persistent block, so just ONE
+            # brief retry; other transient errors use the base budget. Once the
+            # host is confirmed blocked, stop retrying blocks entirely.
+            max_for_code = self.max_retries + (
+                3 if status_code == 429 else (1 if status_code == 403 else 0)
+            )
+            block_now = status_code in (403, 429)
+            if (self.host_blocked and block_now) or not (transient or rate_limited) \
+                    or attempt >= max_for_code:
                 return last_exchange
             attempt += 1
-            if rate_limited:
-                if retry_after is not None:
-                    delay = min(retry_after, 8.0)
-                else:
-                    delay = min(6.0, 0.75 * (2 ** attempt))  # 1.5s, 3s, 6s...
-                delay += (attempt % 3) * 0.15  # small jitter to desync threads
+            if status_code == 429:
+                delay = min(retry_after, 8.0) if retry_after is not None \
+                    else min(6.0, 0.75 * (2 ** attempt))
+                delay += (attempt % 3) * 0.15  # jitter to desync threads
+            elif status_code == 403:
+                delay = 1.0  # brief single retry — 403 is usually a real block
             else:
                 delay = 0.4 * attempt  # 0.4s, 0.8s backoff
             time.sleep(delay)

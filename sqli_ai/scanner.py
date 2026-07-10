@@ -221,15 +221,34 @@ class Scanner:
 
         if (not self.include_dead and baseline.status_code in (401, 403)
                 and not is_login_attempt):
-            report.add_error(
-                f"Skipped: baseline HTTP {baseline.status_code} "
-                f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "
-                f"or --cookie, or use --include-404 to force)"
+            # A host that keeps returning 403 has BLOCKED us (WAF/rate-limit) —
+            # say so loudly and actionably rather than a quiet per-URL skip, since
+            # no amount of scanning gets past a block.
+            _body = (baseline.response_body or "").lower()
+            _waf_block = getattr(self.probe, "host_blocked", False) or (
+                baseline.status_code == 403
+                and len(_body) < 1500 and "forbidden" in _body
             )
+            if baseline.status_code == 403 and _waf_block:
+                report.add_error(
+                    "TARGET IS BLOCKING YOU (HTTP 403 on every request) — WAF or "
+                    "rate-limit. Wait for the block to clear, route through a "
+                    "different IP with --proxy, or slow down (-t 1, --no-brute)."
+                )
+                self.on_progress(
+                    "[!] TARGET BLOCKING YOU (403 WAF/rate-limit) — wait, use "
+                    "--proxy, or slow down (-t 1 --no-brute). Not a scanner issue."
+                )
+            else:
+                report.add_error(
+                    f"Skipped: baseline HTTP {baseline.status_code} "
+                    f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "
+                    f"or --cookie, or use --include-404 to force)"
+                )
+                self.on_progress(
+                    f"[*] Skipping (baseline HTTP {baseline.status_code}, needs auth/bypass)"
+                )
             report.duration_seconds = time.perf_counter() - start
-            self.on_progress(
-                f"[*] Skipping (baseline HTTP {baseline.status_code}, needs auth/bypass)"
-            )
             return report
 
         # Login-wall detection: an unauthenticated request bounced to a login
