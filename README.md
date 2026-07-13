@@ -8,10 +8,28 @@ SQLi-AI's genuine value is as a **discovery and parameter-mining layer** that fe
 2. **OpenAPI/Swagger import** — gets every endpoint *with real param names* (e.g. `?query=` on `/api/testimonials/count`) that a crawler won't see
 3. **Liveness filter** — drops dead/403 endpoints before sqlmap wastes time on them
 4. **Parameter mining** — tries common param names on bare URLs (fallback wordlist)
-5. **GraphQL probe** — detects and adds GraphQL injection points
-6. **POST body expansion** — emits POST endpoints with concrete JSON bodies
+5. **POST body expansion** — emits POST endpoints with concrete JSON bodies
 
 Then it hands confirmed findings to **sqlmap** for actual exploitation.
+
+## Injection vectors it tests
+
+Beyond query/body/JSON params, SQLi-AI covers the vectors commodity scanners miss:
+
+- **URL path segments** — `WHERE id=<seg>` lookups (`/api/user/1`), ID-like segments always tested
+- **HTTP headers** — auth/token headers (`X-Auth-Token`, `Authorization`) and entity-name headers (`x-product-name`, `x-username`) that get interpolated into SQL
+- **JWT `kid` header** — a SQL payload inside the `kid` claim of a bearer token, on JWT/auth-validation endpoints (key looked up by `kid` in SQL); boolean status oracle, self-declines when the DB is offline
+- **GraphQL arguments** — introspects `/graphql` and injects into every String mutation/query argument (bypasses REST WAF rules)
+- **Raw SQL/XPath executors** — endpoints that run a param verbatim (`?query=`, `?sql=`, `?xpath=`) confirmed via a reflected-marker-in-SQL-error test
+- **Auth-bypass** — `' OR '1'='1'--` on login/credential fields
+
+## Default-credentials check
+
+Once the DBMS is fingerprinted, `--db-creds` probes its standard port for
+vendor-default credentials (postgres/postgres, root with empty password, `sa`,
+...). Uses optional DB drivers (`psycopg`, `PyMySQL`; Redis needs none) when
+installed, otherwise reports the open port and the exact credentials to try.
+SQLite and file-based backends are skipped. Opt-in (it actively touches a DB port).
 
 ## For broad vulnerability scanning (dozens of findings)
 
@@ -56,6 +74,10 @@ python -m sqli_ai -u https://target/
 python -m sqli_ai -l urls.txt
 
 # Opt OUT of pieces if you need to trim: --no-auto --no-guess-params --no-organic
+
+# Quick local testing: ./scan bakes in --no-llm --no-auto --db-creds
+./scan https://target/api/endpoint     # one URL
+./scan -l urls.txt                     # a list (extra flags pass through)
 
 # Full pipeline: discover, scan, hand to sqlmap
 python -m sqli_ai -u https://target/ \
@@ -113,6 +135,9 @@ python -m sqli_ai --openapi https://target/ \
 --sqlmap-profile       {stealth,normal,aggressive,exploit,nuclear}
 --sqlmap-timeout SECS  Kill sqlmap after N seconds per target
 --sqlmap-menu          Interactive profile/flag selection
+--db-creds             After scan, probe each detected DBMS's port for
+                       vendor-default credentials (opt-in; touches a DB port)
+--db-creds-timeout N   Per-connection timeout for --db-creds (default 4s)
 --grab-cookie [URL]    Auto-capture session cookie
 --login-url/--login-data  POST credentials to get session
 --include-404          Test auth-gated/dead endpoints too
