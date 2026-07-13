@@ -217,8 +217,20 @@ class HttpProbe:
                         mined=True,  # speculative wordlist guess
                     ))
 
+        # Path-segment injection. ID-like segments (numeric /42, UUID/long
+        # alphanumeric tokens) are self-evidently injection points — they almost
+        # always back a `WHERE id = <seg>` lookup — so they're ALWAYS tested,
+        # organically, with no flag required (this is the common REST path-SQLi
+        # spot that param/body-only scanners miss). --path / path_all only widen
+        # testing to non-ID segments (the last segment, then every segment).
+        seen_path_idx = set()
+        for p in self._path_points(parsed, all_segments=False, ids_only=True):
+            points.append(p)
+            seen_path_idx.add(p.path_index)
         if test_path:
-            points.extend(self._path_points(parsed, path_all_segments))
+            for p in self._path_points(parsed, path_all_segments):
+                if p.path_index not in seen_path_idx:
+                    points.append(p)
 
         if data and method.upper() in ("POST", "PUT", "PATCH"):
             ct = (content_type or "").lower()
@@ -272,11 +284,15 @@ class HttpProbe:
 
         return points
 
-    def _path_points(self, parsed, all_segments: bool) -> list[InjectionPoint]:
+    def _path_points(self, parsed, all_segments: bool,
+                     ids_only: bool = False) -> list[InjectionPoint]:
         """Treat URL path segments as injection points.
 
-        By default only test 'interesting' segments (numeric IDs, or the last
-        segment) to avoid request explosion. all_segments tests every segment.
+        - ids_only=True: ONLY ID-like segments (numeric, UUID, or long
+          alphanumeric token). These are always worth testing — they back
+          `WHERE id = <seg>` lookups — so the caller tests them unconditionally.
+        - default: ID-like segments plus the last segment.
+        - all_segments=True: every segment (request-heavy, opt-in via --path-all).
         """
         points: list[InjectionPoint] = []
         raw = parsed.path.split("/")  # keeps leading '' so indexes map to _inject
@@ -285,11 +301,20 @@ class HttpProbe:
             return points
         last_idx = non_empty[-1]
 
+        def _id_like(seg: str) -> bool:
+            # numeric (/42), or UUID/long token with both letters and digits.
+            return seg.isdigit() or (
+                len(seg) >= 8 and any(c.isdigit() for c in seg)
+                and any(c.isalpha() for c in seg)
+            )
+
         for i in non_empty:
             seg = raw[i]
-            is_numeric = seg.isdigit()
-            looks_like_id = is_numeric or (len(seg) >= 8 and any(c.isdigit() for c in seg))
-            if all_segments or is_numeric or looks_like_id or i == last_idx:
+            if ids_only:
+                take = _id_like(seg)
+            else:
+                take = all_segments or _id_like(seg) or i == last_idx
+            if take:
                 points.append(InjectionPoint(
                     name=f"path[{i}]:{seg[:20]}",
                     location=ParamLocation.PATH,
