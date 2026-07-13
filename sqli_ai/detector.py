@@ -89,6 +89,28 @@ class SqlDetector:
         re.IGNORECASE,
     )
 
+    _WAF_BLOCK = re.compile(
+        r"attention required|cloudflare|access denied|request unsuccessful|"
+        r"blocked by|security policy|akamai|incapsula|has been blocked|"
+        r"forbidden|not acceptable|<title>\s*403|web application firewall|"
+        r"ray id|cf-error|mod_security|modsecurity",
+        re.IGNORECASE,
+    )
+
+    def looks_like_waf_block(self, exchange: HttpExchange) -> bool:
+        """True when a response is a WAF/CDN block page (Cloudflare, Akamai,
+        ModSecurity, ...).
+
+        Injecting a quote/SQLi pattern often makes a WAF return a block page
+        (usually 403/406) — a 200->403 that a naive detector reads as a SQL
+        'error'. It's the WAF refusing the metacharacter, not a database error,
+        so it must never count as an injection signal.
+        """
+        if exchange.status_code in (403, 406, 429):
+            body = (exchange.response_body or "")[:2000]
+            return bool(self._WAF_BLOCK.search(body))
+        return False
+
     def looks_like_directory_listing(self, exchange: HttpExchange) -> bool:
         """True for a web-server auto-index page (Apache mod_autoindex, nginx
         autoindex, IIS directory browsing).

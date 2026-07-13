@@ -816,6 +816,17 @@ class Scanner:
                         or self.detector.is_infra_error(quote_probe)):
                     return None
 
+                # A 2xx -> 403/406/429/503 transition on the quote is a WAF/CDN
+                # BLOCKING the metacharacter, not a database error. Cloudflare,
+                # Akamai, etc. return a block page ("Attention Required",
+                # "Request unsuccessful", "Access denied") the instant they see a
+                # quote/SQLi pattern — which is the classic X-Forwarded-For/Host
+                # 200->403 false positive. Real SQLi surfaces as a SQL error
+                # (handled above) or a 5xx from the app itself, never a WAF 403.
+                if quote_probe.status_code in (403, 406, 429, 503) \
+                        or self.detector.looks_like_waf_block(quote_probe):
+                    return None
+
                 # Status changed but no recognisable SQL error text. This is
                 # ambiguous — could be real SQLi with a swallowed error, or just
                 # "any unexpected input breaks this endpoint" (generic validation).
