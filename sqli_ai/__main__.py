@@ -257,6 +257,15 @@ API spec (--openapi), mine param names (--guess-params), or crawl first
                    help="Extra args appended to the nuclei command")
     p.add_argument("--ask", action="store_true",
                    help="After Stage 1, show all findings and ask before launching sqlmap")
+    # Default-credentials check keyed by the detected DB type. Active probe of a
+    # DB port, so it's opt-in.
+    p.add_argument("--db-creds", action="store_true",
+                   help="After scanning, probe each detected DBMS's standard port "
+                        "for vendor-default credentials (postgres/postgres, root "
+                        "with empty pw, sa, ...). Uses optional DB drivers if "
+                        "installed; otherwise reports the open port + creds to try")
+    p.add_argument("--db-creds-timeout", type=float, default=4.0,
+                   help="Per-connection timeout (s) for the --db-creds probe (default: 4)")
     p.add_argument("--sqlmap-timeout", type=int, default=0,
                    help="Max seconds per sqlmap target before it's killed and skipped "
                         "(0 = no limit). Prevents one endpoint from hanging the run")
@@ -2082,6 +2091,10 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             console.print(f"[yellow]Could not write consolidated report: {e}[/yellow]")
 
+    # Default-credentials check keyed by the DB type we fingerprinted.
+    if args.db_creds and not interrupted:
+        run_db_creds_check(all_reports, timeout=args.db_creds_timeout, console=console)
+
     # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
     if args.then_sqlmap and not interrupted:
         if total_findings == 0:
@@ -2157,6 +2170,73 @@ def main(argv: list[str] | None = None) -> int:
     print_rollup(all_reports, console)
 
     return 1 if total_findings else 0
+
+
+def run_db_creds_check(reports, timeout: float, console) -> None:
+    """Probe each detected DBMS's standard port for vendor-default credentials.
+
+    One check per unique (host, db_type) pair fingerprinted during the scan.
+    SQLite (and any DB with no known network port) is skipped automatically.
+    """
+    from urllib.parse import urlparse
+    from rich.panel import Panel
+
+    from sqli_ai.db_creds import check_default_creds
+
+    # Collect unique (host, db_type) from confirmed findings.
+    pairs: dict[tuple[str, str], None] = {}
+    for r in reports:
+        for f in r.findings:
+            db = (f.db_type or "").strip().lower()
+            if not db or db in ("?", "unknown"):
+                continue
+            host = urlparse(f.payload_url or r.target_url).hostname
+            if host:
+                pairs[(host, db)] = None
+
+    if not pairs:
+        console.print(
+            "\n[bold]── Default-credentials check[/bold]\n"
+            "  [dim]No DBMS was fingerprinted from the findings — nothing to probe.[/dim]"
+        )
+        return
+
+    console.print(
+        f"\n[bold]── Default-credentials check[/bold] "
+        f"[dim](probing {len(pairs)} host/DBMS pair(s), timeout {timeout:.0f}s)[/dim]"
+    )
+    for (host, db) in pairs:
+        try:
+            results = check_default_creds(host, db, timeout=timeout)
+        except Exception as e:
+            console.print(f"  [yellow]{host} ({db}): probe failed — {e}[/yellow]")
+            continue
+        for res in results:
+            if res.working:
+                creds = ", ".join(
+                    f"{u or '<no-user>'}:{pw or '<empty>'}" for u, pw in res.working
+                )
+                body = (
+                    f"[bold red]DEFAULT CREDENTIALS ACCEPTED[/bold red]\n"
+                    f"[bold]Host:[/bold] {res.host}:{res.port}  "
+                    f"[bold]DBMS:[/bold] {res.db_type}\n"
+                    f"[bold]Working:[/bold] [red]{creds}[/red]\n"
+                    f"[dim]{res.note}[/dim]"
+                )
+                console.print(Panel(body, border_style="red",
+                                    title=f"[red]{res.host} — weak DB creds[/red]"))
+            elif res.reachable and not res.tested:
+                cand = ", ".join(f"{u or '<no-user>'}:{pw or '<empty>'}"
+                                 for u, pw in res.candidates[:6])
+                console.print(
+                    f"  [yellow]{res.host}:{res.port} ({res.db_type})[/yellow] — {res.note}\n"
+                    f"    [dim]try: {cand}[/dim]"
+                )
+            else:
+                console.print(
+                    f"  [green]{res.host}:{res.port or '—'} ({res.db_type})[/green] "
+                    f"— [dim]{res.note}[/dim]"
+                )
 
 
 def run_sqlmap_on_findings(

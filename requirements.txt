@@ -5,3 +5,9 @@ python-dotenv>=1.0
 
 # Optional: YAML OpenAPI/Swagger specs (spec import falls back gracefully if absent)
 PyYAML>=6.0
+
+# Optional: --db-creds default-credential login attempts. Without these, the
+# check still runs but only reports open ports + credentials to try (no login).
+# psycopg  -> PostgreSQL   |  PyMySQL -> MySQL/MariaDB   (Redis needs no driver)
+# psycopg[binary]>=3.1
+# PyMySQL>=1.1
