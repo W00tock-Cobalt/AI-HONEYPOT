@@ -1850,7 +1850,9 @@ def main(argv: list[str] | None = None) -> int:
                     console.print(
                         f"\n[bold]── ({done}/{len(targets)}):[/bold] {report.target_url}"
                     )
-                    print_report(report, console)
+                    print_report(report, console,
+                                 run_sqli_total=total_findings,
+                                 run_urls_done=done, run_urls_total=len(targets))
             except KeyboardInterrupt:
                 interrupted = True
                 for f in futures:
@@ -1869,7 +1871,12 @@ def main(argv: list[str] | None = None) -> int:
                         continue
                     all_reports.append(report)
                     total_findings += len(report.findings)
-                    print_report(report, console)
+                    if len(targets) > 1:
+                        print_report(report, console,
+                                     run_sqli_total=total_findings,
+                                     run_urls_done=idx, run_urls_total=len(targets))
+                    else:
+                        print_report(report, console)
             except KeyboardInterrupt:
                 interrupted = True
     finally:
@@ -1886,6 +1893,10 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(all_reports)} URL(s) scanned, "
         f"[bold]{total_findings}[/bold] finding(s)"
     )
+    # Multi-URL run: dump EVERY SQL error observed (even on unconfirmed params),
+    # so DB leakage surfaced during probing is never lost in the noise.
+    if len(all_reports) > 1:
+        print_all_sql_errors(all_reports, console)
     # Reconcile DB type per host (one host = one backend). This corrects
     # outlier/unknown guesses and is what sqlmap's --dbms is derived from.
     if total_findings:
@@ -2170,6 +2181,43 @@ def main(argv: list[str] | None = None) -> int:
     print_rollup(all_reports, console)
 
     return 1 if total_findings else 0
+
+
+def print_all_sql_errors(reports, console) -> None:
+    """List every distinct SQL error observed across a multi-URL run, grouped by
+    host. Shows DB leakage even for params that were never confirmed as SQLi."""
+    from urllib.parse import urlparse
+    from collections import OrderedDict
+
+    grouped: "OrderedDict[str, list]" = OrderedDict()
+    total = 0
+    for r in reports:
+        if not r.sql_errors:
+            continue
+        parsed = urlparse(r.target_url)
+        host = parsed.netloc
+        for param, err in r.sql_errors:
+            grouped.setdefault(host, []).append((parsed.path or "/", param, err))
+            total += 1
+
+    if not total:
+        console.print(
+            "\n[bold]── SQL errors observed[/bold] "
+            "[dim](none — no DB errors leaked during probing)[/dim]"
+        )
+        return
+
+    console.print(
+        f"\n[bold]── SQL errors observed[/bold] "
+        f"[dim]({total} distinct across {len(grouped)} host(s))[/dim]"
+    )
+    for host, rows in grouped.items():
+        console.print(f"  [magenta]{host}[/magenta]")
+        for path, param, err in rows:
+            err_1line = " ".join(err.split())[:160]
+            console.print(
+                f"    [cyan]{path}[/cyan] [yellow]{param}[/yellow] — [red]{err_1line}[/red]"
+            )
 
 
 def run_db_creds_check(reports, timeout: float, console) -> None:

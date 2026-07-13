@@ -21,15 +21,39 @@ def _indent(text: str, prefix: str = "    ", limit: int = 600) -> str:
     return "\n".join(prefix + ln for ln in lines)
 
 
-def print_report(report: ScanReport, console: Console | None = None) -> None:
-    """Print a human-readable scan report to the console."""
+def print_report(
+    report: ScanReport,
+    console: Console | None = None,
+    run_sqli_total: int | None = None,
+    run_urls_done: int | None = None,
+    run_urls_total: int | None = None,
+) -> None:
+    """Print a human-readable scan report to the console.
+
+    When ``run_sqli_total`` is provided (multi-URL runs), the panel also shows a
+    running tally of SQLi confirmed across the whole run so far.
+    """
     con = console or Console()
 
-    con.print(Panel.fit(
+    body = (
         f"[bold]Target:[/bold] {report.target_url}\n"
         f"[bold]Requests:[/bold] {report.total_requests}  "
         f"[bold]Duration:[/bold] {report.duration_seconds:.1f}s  "
-        f"[bold]LLM:[/bold] {report.llm_model}",
+        f"[bold]LLM:[/bold] {report.llm_model}"
+    )
+    if run_sqli_total is not None:
+        here = len(report.findings)
+        here_txt = f"[red]{here}[/red]" if here else "0"
+        run_txt = f"[bold red]{run_sqli_total}[/bold red]" if run_sqli_total else "0"
+        pos = ""
+        if run_urls_done is not None and run_urls_total is not None:
+            pos = f" across {run_urls_done}/{run_urls_total} URL(s)"
+        body += (
+            f"\n[bold]SQLi here:[/bold] {here_txt}   "
+            f"[bold]Run total:[/bold] {run_txt}{pos}"
+        )
+    con.print(Panel.fit(
+        body,
         title="SQLi-AI Scan Report",
         border_style="cyan",
     ))

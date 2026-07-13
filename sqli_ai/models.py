@@ -117,6 +117,10 @@ class ScanReport:
     duration_seconds: float = 0.0
     llm_model: str = ""
     total_requests: int = 0
+    # Every distinct SQL error string observed while probing this target (even
+    # on params that weren't ultimately confirmed) — (param, error) deduped.
+    # Surfaced at the end of a multi-URL run so DB leakage is never lost.
+    sql_errors: list[tuple[str, str]] = field(default_factory=list)
 
     def __post_init__(self):
         import threading
@@ -134,6 +138,15 @@ class ScanReport:
         """Thread-safe error append."""
         with self._lock:
             self.errors.append(msg)
+
+    def add_sql_error(self, param: str, error: str) -> None:
+        """Thread-safe, deduped record of a SQL error seen while probing."""
+        error = (error or "").strip()
+        if not error:
+            return
+        with self._lock:
+            if (param, error) not in self.sql_errors:
+                self.sql_errors.append((param, error))
 
     def add_log(self, msg: str) -> None:
         """Thread-safe agent log append."""

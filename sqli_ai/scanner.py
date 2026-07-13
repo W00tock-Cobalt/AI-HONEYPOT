@@ -756,7 +756,7 @@ class Scanner:
             )
             report.add_request()
             mk_body = mk_probe.response_body or ""
-            errs = self.detector.find_sql_errors(mk_body)
+            errs = self._note_sql_errors(report, point.name, mk_body)
             if marker in mk_body and errs:
                 idx_m, idx_e = mk_body.find(marker), mk_body.find(errs[0])
                 if idx_e >= 0 and abs(idx_m - idx_e) <= 120:
@@ -796,7 +796,7 @@ class Scanner:
             )
             report.add_request()
 
-            quote_errors = self.detector.find_sql_errors(quote_probe.response_body)
+            quote_errors = self._note_sql_errors(report, point.name, quote_probe.response_body)
             status_changed = quote_probe.status_code != baseline.status_code
 
             # Truly dead param: neither the wildcard NOR the quote changed
@@ -1943,7 +1943,7 @@ class Scanner:
         point = InjectionPoint(
             name=f"{fname}({arg})", location=ParamLocation.BODY, original_value="1",
         )
-        quote_errs = self.detector.find_sql_errors(quote.response_body)
+        quote_errs = self._note_sql_errors(report, f"{fname}({arg})", quote.response_body)
         benign_errs = self.detector.find_sql_errors(benign.response_body)
 
         # Case 1: normal field — benign is clean, a quote triggers a SQL error.
@@ -1962,7 +1962,7 @@ class Scanner:
             marker = "SQLiAiZ9x8Q"
             mk = send(build(marker))
             mk_body = mk.response_body or ""
-            errs = self.detector.find_sql_errors(mk_body)
+            errs = self._note_sql_errors(report, f"{fname}({arg})", mk_body)
             if marker in mk_body and errs:
                 idx_m, idx_e = mk_body.find(marker), mk_body.find(errs[0])
                 if idx_e >= 0 and abs(idx_m - idx_e) <= 160:
@@ -1974,6 +1974,14 @@ class Scanner:
                         0.95, inj_type=InjectionType.ERROR_BASED,
                     )
         return None
+
+    def _note_sql_errors(self, report: ScanReport, param: str, body: str) -> list[str]:
+        """Record any SQL errors seen in `body` on `report` (deduped) and return
+        them. Lets the run surface DB leakage even where nothing was confirmed."""
+        errs = self.detector.find_sql_errors(body or "")
+        for e in errs:
+            report.add_sql_error(param, e)
+        return errs
 
     def _test_jwt_kid(
         self,
@@ -2016,7 +2024,7 @@ class Scanner:
 
         # Oracle 1: an actual SQL error leaked in the broken-quote response.
         if not self.detector.is_db_offline(brk):
-            errs = self.detector.find_sql_errors(brk.response_body)
+            errs = self._note_sql_errors(report, point.name, brk.response_body)
             if errs:
                 return self._build_finding(
                     point, brk, baseline,
