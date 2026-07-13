@@ -84,7 +84,57 @@ _COMMON_INJECTABLE_HEADERS: list[tuple[str, str]] = [
     ("X-Account-Id", "1"),
     ("Authentication", "1"),
     ("X-Token", "1"),
+    # Entity-name headers: apps interpolate these straight into SQL (e.g.
+    # BrokenCrystals `UPDATE product ... WHERE name = '<x-product-name>'`). A
+    # very common header-SQLi spot that IP/auth-header testing alone misses.
+    ("X-Product-Name", "1"),
+    ("X-Username", "1"),
+    ("X-User-Name", "1"),
+    ("X-Customer-Id", "1"),
+    ("X-Tenant-Id", "1"),
 ]
+
+# Path substrings that mark an endpoint as JWT/auth validation — the only place
+# the JWT `kid`-SQLi vector is worth testing. Gating on these keeps the probe to
+# a single extra injection point on relevant endpoints (e.g. brokencrystals
+# /api/auth/jwt/kid-sql/validate) instead of bogus-token noise everywhere.
+def _looks_jwt_kid_endpoint(path: str) -> bool:
+    pl = path.lower()
+    if "jwt" in pl or "kid" in pl:
+        return True
+    # /auth/.../validate|verify|sign style token endpoints
+    return (("auth" in pl or "token" in pl)
+            and ("valid" in pl or "verif" in pl or "sign" in pl))
+
+
+def _b64url(raw: bytes) -> str:
+    """base64url-encode without padding (JWT segment encoding)."""
+    import base64
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def build_jwt_with_kid(kid: str, secret: str = "1234") -> str:
+    """Craft an HS256 JWT whose header `kid` claim carries an arbitrary value.
+
+    The SQL key-lookup on `kid` runs *before* signature verification in the
+    vulnerable pattern, so the signature need not be valid to reach the sink —
+    but we sign with the well-known weak demo secret ``1234`` (BrokenCrystals'
+    JWT_SECRET_KEY) so the token also passes apps that verify first. The header
+    JSON, payload, and timestamps are fixed so the probe is deterministic.
+    """
+    import hashlib
+    import hmac
+    import json as _json
+    header = {"alg": "HS256", "typ": "JWT", "kid": kid}
+    payload = {"user": "admin", "sub": "1", "email": "admin@admin.com",
+               "iat": 1700000000}
+    signing_input = (
+        _b64url(_json.dumps(header, separators=(",", ":")).encode())
+        + "."
+        + _b64url(_json.dumps(payload, separators=(",", ":")).encode())
+    )
+    sig = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{_b64url(sig)}"
 
 
 class HttpProbe:
@@ -206,9 +256,13 @@ class HttpProbe:
                 and any(seg in path_lower for seg in ("/api/", "/rest/", "/v1/", "/v2/", "/graphql"))
             )
             if is_rest_api and not priority:
-                # Short REST-focused list: search, filter, id, q are most common SQLi vectors
-                candidate_params = ["q", "search", "query", "id", "filter", "name",
-                                    "email", "username", "orderBy", "sort"]
+                # Short REST-focused list: search, filter, id, q are most common SQLi vectors.
+                # `query`/`sql`/`xpath` also catch raw query-executor endpoints
+                # (e.g. /api/testimonials/count?query=, /api/partners/query?xpath=)
+                # that run the parameter verbatim as SQL/XPath.
+                candidate_params = ["q", "search", "query", "sql", "xpath", "id",
+                                    "filter", "name", "email", "username",
+                                    "orderBy", "sort"]
             elif not url_existing and not action_val:
                 # Generic page (no existing params, no known ?action=) — this is
                 # usually an SPA route or static-ish page. Cap the guess list so
@@ -289,6 +343,15 @@ class HttpProbe:
                         location=ParamLocation.HEADER,
                         original_value=hval,
                     ))
+            # JWT `kid`-header SQLi — only on JWT/auth-validation endpoints, where
+            # the signing key is looked up by `kid` in SQL. One extra point; the
+            # payload rides inside a crafted bearer token (see build_jwt_with_kid).
+            if _looks_jwt_kid_endpoint(parsed.path):
+                points.append(InjectionPoint(
+                    name="kid (JWT header)",
+                    location=ParamLocation.JWT_KID,
+                    original_value="1",
+                ))
 
         for name, value in self.cookies.items():
             points.append(InjectionPoint(
@@ -573,6 +636,11 @@ class HttpProbe:
 
         elif point.location == ParamLocation.HEADER:
             headers[point.name] = payload
+
+        elif point.location == ParamLocation.JWT_KID:
+            # Payload rides inside the JWT header's `kid` claim, carried as the
+            # bearer token. Overwrites any existing Authorization for this probe.
+            headers["Authorization"] = f"Bearer {build_jwt_with_kid(payload)}"
 
         elif point.location == ParamLocation.COOKIE:
             cookies[point.name] = payload

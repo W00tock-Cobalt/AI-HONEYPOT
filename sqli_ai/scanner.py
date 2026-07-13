@@ -138,6 +138,24 @@ class Scanner:
         self.on_progress(f"[*] Target: {url}")
         self.on_progress(f"[*] Method: {method}")
 
+        # GraphQL endpoints need a bespoke path: the payload rides inside a
+        # mutation/query argument in the POST body, not a normal param. Detect
+        # and hand off before the ordinary GET-baseline battery (which is useless
+        # against /graphql and often just 400s).
+        _u = url.split("?", 1)[0].rstrip("/").lower()
+        is_graphql = _u.endswith(("/graphql", "/gql", "/api/graphql")) or (
+            (data or "").lstrip().startswith("{") and '"query"' in (data or "")
+            and "graphql" in url.lower()
+        )
+        if is_graphql:
+            self._scan_graphql(url, extra_headers, report)
+            report.duration_seconds = time.perf_counter() - start
+            self.on_progress(
+                f"\n[*] GraphQL scan complete: {report.total_requests} requests, "
+                f"{len(report.findings)} finding(s)"
+            )
+            return report
+
         # JSON body field discovery: for a JSON-body write (POST/PUT/PATCH),
         # GET the same resource and merge its real field names into the body so
         # injection hits actual fields, not just our synthesized guesses. Many
@@ -229,10 +247,25 @@ class Scanner:
                 and not is_login_attempt):
             # A host that keeps returning 403 has BLOCKED us (WAF/rate-limit) —
             # say so loudly; no amount of scanning gets past a real block.
+            # BUT: an application auth guard also returns 403 (e.g. NestJS
+            # `{"statusCode":403,"message":"Forbidden resource"}`), and that is
+            # exactly the token/kid-lookup surface we WANT to test — not a WAF.
+            # So a JSON API auth-error is auth_gated, never a WAF block.
             _body = (baseline.response_body or "").lower()
+            _json_guard = (
+                '"statuscode"' in _body
+                or 'forbidden resource' in _body
+                or '"error":"forbidden"' in _body
+                or '"error":"unauthorized"' in _body
+            )
+            _waf_sig = any(s in _body for s in (
+                "access denied", "request blocked", "cloudflare", "akamai",
+                "incapsula", "captcha", "attention required", "ray id",
+                "blocked by", "security policy", "not acceptable",
+            ))
             _waf_block = getattr(self.probe, "host_blocked", False) or (
-                baseline.status_code == 403
-                and len(_body) < 1500 and "forbidden" in _body
+                baseline.status_code == 403 and not _json_guard
+                and (_waf_sig or (len(_body) < 1500 and "forbidden" in _body))
             )
             if baseline.status_code == 403 and _waf_block:
                 report.add_error(
@@ -341,7 +374,8 @@ class Scanner:
         # just the reachable ones — that's where a token-lookup SQLi lives.
         if auth_gated:
             points = [p for p in points
-                      if p.location in (ParamLocation.HEADER, ParamLocation.PATH)]
+                      if p.location in (ParamLocation.HEADER, ParamLocation.PATH,
+                                        ParamLocation.JWT_KID)]
 
         if not points:
             report.add_error("No injection points found")
@@ -657,6 +691,15 @@ class Scanner:
         # method may run concurrently for other parameters on the same report,
         # and stashing scratch state on the shared object was a real race bug).
         interim_findings: list[Finding] = []
+
+        # JWT `kid`-header SQLi has its own oracle: the value is concatenated into
+        # a SQL key-lookup whose error is swallowed to a generic 401, so the plain
+        # body-reflection precheck never fires. Handle it with a dedicated probe.
+        if point.location == ParamLocation.JWT_KID:
+            return self._test_jwt_kid(
+                url, method, data, content_type, extra_headers,
+                point, baseline, report,
+            )
 
         # Quick pre-check: send a single quote before running the full payload suite.
         # If the response is identical to baseline, this param ignores the value.
@@ -1760,6 +1803,247 @@ class Scanner:
                     point, true_ex, baseline, evidence, score,
                     inj_type=InjectionType.NOSQL,
                 )
+        return None
+
+    # ---- GraphQL SQLi -------------------------------------------------------
+    # The GraphQL introspection query: enumerate every field on the Query and
+    # Mutation root types plus their argument types (unwrapping NON_NULL/LIST).
+    _GQL_INTROSPECT = (
+        "query{__schema{queryType{name}mutationType{name}"
+        "types{name kind fields{name args{name type{kind name "
+        "ofType{kind name ofType{kind name ofType{kind name}}}}}}}}}"
+    )
+
+    @staticmethod
+    def _gql_arg_is_string(type_obj: dict) -> bool:
+        """Unwrap NON_NULL/LIST wrappers and report whether the base is String."""
+        t = type_obj
+        for _ in range(6):
+            if not isinstance(t, dict):
+                return False
+            if t.get("name") in ("String", "ID"):
+                return True
+            if t.get("kind") in ("NON_NULL", "LIST") and t.get("ofType"):
+                t = t["ofType"]
+                continue
+            return t.get("name") in ("String", "ID")
+        return False
+
+    @staticmethod
+    def _gql_str_literal(v: str) -> str:
+        """Render a Python string as a GraphQL string literal (inner escaping)."""
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    def _scan_graphql(
+        self,
+        url: str,
+        extra_headers: Optional[dict[str, str]],
+        report: ScanReport,
+    ) -> None:
+        """Introspect a GraphQL endpoint and test each String argument for SQLi.
+
+        Query/mutation arguments are common SQL sinks that bypass REST WAF rules
+        (e.g. BrokenCrystals `viewProduct(productName:)` and
+        `testimonialsCount(query:)`). We enumerate them via introspection rather
+        than hard-coding field names, then inject into each String argument.
+        """
+        import json as _json
+
+        self.on_progress("[*] GraphQL endpoint — introspecting schema ...")
+        introspect = self.probe.send(
+            url, "POST", _json.dumps({"query": self._GQL_INTROSPECT}),
+            "application/json", extra_headers,
+        )
+        report.add_request(introspect)
+        try:
+            schema = _json.loads(introspect.response_body)["data"]["__schema"]
+        except (ValueError, KeyError, TypeError):
+            report.add_error(
+                "GraphQL introspection unavailable (disabled or non-GraphQL) — "
+                "cannot enumerate injectable fields."
+            )
+            self.on_progress("[*] GraphQL introspection disabled — skipping")
+            return
+
+        types = {t.get("name"): t for t in schema.get("types", []) if t.get("name")}
+        roots = []
+        for key, opkw in (("queryType", "query"), ("mutationType", "mutation")):
+            tname = (schema.get(key) or {}).get("name")
+            if tname and tname in types:
+                roots.append((opkw, types[tname]))
+
+        # (op_keyword, field_name, [all_string_arg_names])
+        targets: list[tuple[str, str, list[str]]] = []
+        for opkw, tdef in roots:
+            for fld in (tdef.get("fields") or []):
+                str_args = [a["name"] for a in (fld.get("args") or [])
+                            if self._gql_arg_is_string(a.get("type") or {})]
+                if str_args:
+                    targets.append((opkw, fld["name"], str_args))
+
+        if not targets:
+            self.on_progress("[*] GraphQL: no String-typed arguments to test")
+            return
+        self.on_progress(
+            f"[*] GraphQL: testing {sum(len(a) for _,_,a in targets)} String "
+            f"argument(s) across {len(targets)} field(s)"
+        )
+
+        for opkw, fname, str_args in targets:
+            for arg in str_args:
+                if report.findings and not self.continue_on_found:
+                    return
+                try:
+                    finding = self._test_graphql_arg(
+                        url, extra_headers, opkw, fname, str_args, arg, report,
+                    )
+                except Exception as e:
+                    report.add_error(f"GraphQL test error ({fname}.{arg}): {e}")
+                    continue
+                if finding:
+                    report.findings.append(finding)
+                    self.on_progress(
+                        f"[!] VULNERABLE (GraphQL): {fname}({arg})\n"
+                        f"    Type: {finding.injection_type.value} "
+                        f"| DB: {finding.db_type or '?'} "
+                        f"| Confidence: {finding.confidence:.0%}\n"
+                        f"    PoC: {finding.poc_curl}"
+                    )
+
+    def _test_graphql_arg(
+        self,
+        url: str,
+        extra_headers: Optional[dict[str, str]],
+        opkw: str,
+        fname: str,
+        str_args: list[str],
+        arg: str,
+        report: ScanReport,
+    ) -> Optional[Finding]:
+        """Inject into one GraphQL String argument; confirm via SQL error text."""
+        import json as _json
+
+        def build(value_for_arg: str) -> str:
+            rendered = ", ".join(
+                f"{a}: {self._gql_str_literal(value_for_arg if a == arg else '1')}"
+                for a in str_args
+            )
+            return _json.dumps({"query": f"{opkw} {{ {fname}({rendered}) }}"})
+
+        def send(body: str) -> HttpExchange:
+            ex = self.probe.send(url, "POST", body, "application/json", extra_headers)
+            report.add_request(ex)
+            return ex
+
+        benign = send(build("1"))
+        quote = send(build("1'"))
+        if self.detector.is_db_offline(quote):
+            return None
+
+        point = InjectionPoint(
+            name=f"{fname}({arg})", location=ParamLocation.BODY, original_value="1",
+        )
+        quote_errs = self.detector.find_sql_errors(quote.response_body)
+        benign_errs = self.detector.find_sql_errors(benign.response_body)
+
+        # Case 1: normal field — benign is clean, a quote triggers a SQL error.
+        if quote_errs and not benign_errs:
+            return self._build_finding(
+                point, quote, benign,
+                f"GraphQL {opkw} SQLi: a single quote in `{fname}({arg}:)` "
+                f"triggered a SQL error ({quote_errs[0][:60]})",
+                0.9, inj_type=InjectionType.ERROR_BASED,
+            )
+
+        # Case 2: raw-SQL executor (e.g. testimonialsCount(query:)) — EVERY value
+        # errors, so a quote can't distinguish it. Inject a unique marker and
+        # confirm it comes back inside a SQL error (definitive: parsed as SQL).
+        if benign_errs:
+            marker = "SQLiAiZ9x8Q"
+            mk = send(build(marker))
+            mk_body = mk.response_body or ""
+            errs = self.detector.find_sql_errors(mk_body)
+            if marker in mk_body and errs:
+                idx_m, idx_e = mk_body.find(marker), mk_body.find(errs[0])
+                if idx_e >= 0 and abs(idx_m - idx_e) <= 160:
+                    return self._build_finding(
+                        point, mk, benign,
+                        f"GraphQL raw-SQL execution: marker {marker!r} reflected "
+                        f"inside a SQL error ({errs[0][:60]}) — `{fname}({arg}:)` "
+                        f"is parsed directly as SQL",
+                        0.95, inj_type=InjectionType.ERROR_BASED,
+                    )
+        return None
+
+    def _test_jwt_kid(
+        self,
+        url: str,
+        method: str,
+        data: Optional[str],
+        content_type: Optional[str],
+        extra_headers: Optional[dict[str, str]],
+        point: InjectionPoint,
+        baseline: HttpExchange,
+        report: ScanReport,
+    ) -> Optional[Finding]:
+        """Confirm SQLi in a JWT `kid` header (key-id looked up in SQL).
+
+        The vulnerable pattern (`... WHERE keys.id = '<kid>'`) executes before
+        signature verification, and any query error is swallowed to a generic
+        401 — so there is no reflected SQL error to match. Two independent
+        oracles catch it:
+
+        1. Error-based — some implementations DO surface the SQL error (500).
+        2. Boolean/status — a bare quote makes the key-lookup a syntax error
+           (request denied); commenting the quote out restores valid SQL (request
+           behaves like the benign token again). ``break != fix == benign`` can
+           only happen if the value is concatenated into SQL — a near-zero-FP
+           signal. When the DB is offline every probe fails identically, so this
+           correctly declines to confirm rather than guessing.
+        """
+        orig = point.original_value or "1"
+
+        def probe(payload: str) -> HttpExchange:
+            ex = self.probe.send(
+                url, method, data, content_type, extra_headers,
+                inject_point=point, payload=payload,
+            )
+            report.add_request()
+            return ex
+
+        benign = probe(orig)
+        brk = probe(orig + "'")
+
+        # Oracle 1: an actual SQL error leaked in the broken-quote response.
+        if not self.detector.is_db_offline(brk):
+            errs = self.detector.find_sql_errors(brk.response_body)
+            if errs:
+                return self._build_finding(
+                    point, brk, baseline,
+                    f"JWT kid SQLi: a single quote in the JWT `kid` claim triggered "
+                    f"a SQL error ({errs[0][:60]}) — the kid value is concatenated "
+                    f"into a SQL key-lookup",
+                    0.9, inj_type=InjectionType.ERROR_BASED,
+                )
+
+        # Oracle 2: break-vs-comment status differential.
+        fixed = probe(orig + "'-- -")
+        broke_it = (
+            brk.status_code != fixed.status_code
+            and fixed.status_code == benign.status_code
+            and benign.status_code not in (0,) and benign.status_code < 500
+            and brk.status_code != 0
+            and not self.detector.is_db_offline(brk)
+        )
+        if broke_it:
+            return self._build_finding(
+                point, fixed, baseline,
+                f"JWT kid SQLi (boolean): kid=`{orig}'` → HTTP {brk.status_code} "
+                f"(SQL syntax error, request denied) but kid=`{orig}'-- ` "
+                f"(quote commented out) → HTTP {fixed.status_code} (restored, same as "
+                f"benign kid) — the kid value is concatenated into a SQL key-lookup",
+                0.9, inj_type=InjectionType.BOOLEAN_BLIND,
+            )
         return None
 
     def _build_finding(

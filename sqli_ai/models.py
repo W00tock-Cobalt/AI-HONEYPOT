@@ -31,6 +31,11 @@ class ParamLocation(str, Enum):
     COOKIE = "cookie"
     JSON = "json"
     PATH = "path"
+    # A SQL payload carried inside the `kid` (key-id) claim of a JWT header,
+    # sent in the Authorization bearer token. Apps that look up the signing key
+    # by kid in SQL (`... WHERE id = '<kid>'`) are injectable here even though
+    # the value never appears as a plain query/body/header param.
+    JWT_KID = "jwt_kid"
 
 
 @dataclass
