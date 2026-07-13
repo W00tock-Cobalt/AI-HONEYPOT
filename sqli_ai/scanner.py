@@ -219,11 +219,16 @@ class Scanner:
             )
         is_login_attempt = method.upper() in ("POST", "PUT", "PATCH") and has_auth_field
 
+        # auth_gated: a 401/403 baseline means the app wants a token/credential.
+        # We DON'T skip outright — the auth CHECK itself is frequently SQL
+        # (SELECT ... WHERE token = '<X-Auth-Token>'), so we still test the
+        # auth-check inputs (headers + path segments). Body/query params are
+        # behind the gate and can't be reached unauthenticated, so we drop them.
+        auth_gated = False
         if (not self.include_dead and baseline.status_code in (401, 403)
                 and not is_login_attempt):
             # A host that keeps returning 403 has BLOCKED us (WAF/rate-limit) —
-            # say so loudly and actionably rather than a quiet per-URL skip, since
-            # no amount of scanning gets past a block.
+            # say so loudly; no amount of scanning gets past a real block.
             _body = (baseline.response_body or "").lower()
             _waf_block = getattr(self.probe, "host_blocked", False) or (
                 baseline.status_code == 403
@@ -239,17 +244,15 @@ class Scanner:
                     "[!] TARGET BLOCKING YOU (403 WAF/rate-limit) — wait, use "
                     "--proxy, or slow down (-t 1 --no-brute). Not a scanner issue."
                 )
-            else:
-                report.add_error(
-                    f"Skipped: baseline HTTP {baseline.status_code} "
-                    f"(auth-gated or WAF-blocked; supply -H 'Authorization: ...' "
-                    f"or --cookie, or use --include-404 to force)"
-                )
-                self.on_progress(
-                    f"[*] Skipping (baseline HTTP {baseline.status_code}, needs auth/bypass)"
-                )
-            report.duration_seconds = time.perf_counter() - start
-            return report
+                report.duration_seconds = time.perf_counter() - start
+                return report
+            # Auth-gated (not a WAF block): keep going, but only against the
+            # auth-check inputs (headers + path) — that's where the token SQLi is.
+            auth_gated = True
+            self.on_progress(
+                f"[*] Auth-gated (HTTP {baseline.status_code}) — testing the "
+                f"auth-check inputs (headers/path) for injectable token lookups"
+            )
 
         # Login-wall detection: an unauthenticated request bounced to a login
         # page has NOTHING injectable on it — every param just re-renders the
@@ -332,6 +335,13 @@ class Scanner:
         if params:
             allowed = set(params)
             points = [p for p in points if p.name in allowed]
+
+        # Auth-gated endpoint: only the auth-check inputs (headers + path) are
+        # reachable pre-auth; query/body/json params sit behind the gate. Test
+        # just the reachable ones — that's where a token-lookup SQLi lives.
+        if auth_gated:
+            points = [p for p in points
+                      if p.location in (ParamLocation.HEADER, ParamLocation.PATH)]
 
         if not points:
             report.add_error("No injection points found")

@@ -69,6 +69,21 @@ _COMMON_INJECTABLE_HEADERS: list[tuple[str, str]] = [
     ("X-Real-IP", "127.0.0.1"),
     ("Client-IP", "127.0.0.1"),
     ("X-Api-Version", "1"),
+    # Auth/token/api-key headers: APIs routinely look these up in SQL
+    # (SELECT ... WHERE token = '<X-Auth-Token>'), so a quote in them is a very
+    # common header-SQLi spot that IP/Referer-only header testing misses. Tested
+    # generically (a wordlist, like param mining) — nothing app-specific.
+    ("X-Auth-Token", "1"),
+    ("Authorization", "1"),
+    ("X-Api-Key", "1"),
+    ("Api-Key", "1"),
+    ("X-Access-Token", "1"),
+    ("X-Session-Token", "1"),
+    ("X-Session-Id", "1"),
+    ("X-User-Id", "1"),
+    ("X-Account-Id", "1"),
+    ("Authentication", "1"),
+    ("X-Token", "1"),
 ]
 
 
