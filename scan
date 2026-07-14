@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Quick test wrapper — bakes in the flags used for local testing.
+#   ./scan <URL>                 scan one URL
+#   ./scan -l urls.txt           scan a list
+#   ./scan <URL> --then-sqlmap   add any extra sqlmap-ai flags after
+# Override the baked-in defaults by just repeating a flag (last one wins).
+cd "$(dirname "$0")" || exit 1
+
+# If the first arg looks like a URL, pass it via -u; otherwise pass args through.
+if [[ "$1" == http* ]]; then
+  URL="$1"; shift
+  exec .venv/bin/python -m sqli_ai -u "$URL" --no-llm --no-auto --db-creds "$@"
+else
+  exec .venv/bin/python -m sqli_ai --no-llm --no-auto --db-creds "$@"
+fi

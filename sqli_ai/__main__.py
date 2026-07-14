@@ -1,0 +1,2674 @@
+"""
+SQLi-AI CLI — AI-powered SQL injection scanner.
+
+Usage:
+  python -m sqli_ai -u "http://target/page?id=1"
+  python -m sqli_ai -u "http://target/api" --data '{"user":"admin"}' --header "Content-Type: application/json"
+  python -m sqli_ai -u "http://target/login" --data "user=admin&pass=test" --method POST
+"""
+
+import argparse
+import sys
+from typing import Optional
+
+from rich.console import Console
+
+from sqli_ai import __version__
+from sqli_ai.agent import LlmAgent
+from sqli_ai.http_probe import HttpProbe
+from sqli_ai.ollama import (
+    DEFAULT_OLLAMA_MODEL,
+    ensure_ready,
+    ollama_base_url,
+)
+from sqli_ai.report import print_report, save_json
+from sqli_ai.scanner import Scanner
+
+
+def parse_headers(header_args: list[str]) -> dict[str, str]:
+    headers = {}
+    for h in header_args:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            headers[k.strip()] = v.strip()
+        elif "=" in h:
+            k, v = h.split("=", 1)
+            headers[k.strip()] = v.strip()
+    return headers
+
+
+def parse_cookies(cookie_str: str) -> dict[str, str]:
+    cookies = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    return cookies
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="sqli-ai",
+        description="SQLi-AI — AI-powered SQL injection scanner (sqlmap alternative)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -u "http://testphp.vulnweb.com/artists.php?artist=1"
+  %(prog)s -u "http://target/search" --data "q=test" --method POST
+  %(prog)s -l urls.txt --only-with-params        # scan a URL list
+  katana -u https://target -f qurl -silent | %(prog)s --stdin --only-with-params
+  %(prog)s --openapi https://target/            # import Swagger/OpenAPI spec
+  %(prog)s -u "http://target/api/count" --guess-params   # mine param names
+  %(prog)s -u "http://target/page?id=1" --no-llm          # heuristic-only
+
+Note: a bare host with no ?params has nothing to inject. Either import the
+API spec (--openapi), mine param names (--guess-params), or crawl first
+(katana/gau) to collect parameterized URLs and pipe them in.
+        """,
+    )
+
+    # Target (sqlmap-style). A bare positional URL also works:
+    #   python -m sqli_ai https://target/
+    p.add_argument("target", nargs="?", default=None,
+                   help="Target URL (positional; equivalent to -u)")
+    p.add_argument("-u", "--url", help="Target URL")
+    p.add_argument("-l", "--list", dest="url_list",
+                   help="File with target URLs, one per line (e.g. katana output)")
+    p.add_argument("--stdin", action="store_true",
+                   help="Read target URLs from stdin (e.g. katana ... | sqli_ai --stdin)")
+    p.add_argument("--only-with-params", action="store_true",
+                   help="Skip URLs with no query params AND no path segments to test")
+    p.add_argument("--path", dest="test_path", action="store_true",
+                   help="Test URL path segments too (e.g. /api/products/1). Auto-on for crawl input")
+    p.add_argument("--path-all", action="store_true",
+                   help="Test every path segment, not just IDs/last segment")
+    p.add_argument("--no-path", dest="no_path", action="store_true",
+                   help="Disable path-segment testing even in crawl mode")
+    p.add_argument("--guess-params", action="store_true",
+                   help="Mine common param names (query,q,id,search,...) on each URL. "
+                        "ON BY DEFAULT; this flag is kept for compatibility.")
+    p.add_argument("--no-guess-params", action="store_true",
+                   help="Disable common-param mining (organic discovery still runs)")
+    p.add_argument("--param-wordlist",
+                   help="File of parameter names to guess (implies --guess-params)")
+    p.add_argument("--no-organic", dest="organic", action="store_false",
+                   default=True,
+                   help="Disable organic parameter discovery (mining param names "
+                        "from the target's own forms/links/JS/JSON responses). "
+                        "On by default so the scanner adapts to any app.")
+    p.add_argument("--second-order", action="store_true",
+                   help="Test for SECOND-ORDER SQLi: submit a unique marker+quote "
+                        "via write endpoints (POST/PUT), then re-read and flag if "
+                        "the stored value surfaces in a SQL error later. NOTE: "
+                        "writes marker data to the target, so it is opt-in.")
+    p.add_argument("--time", action="store_true", dest="time_based",
+                   help="Enable time-based/blind detection (SLEEP/pg_sleep/WAITFOR). "
+                        "OFF by default: response timing is unreliable on shared or "
+                        "rate-limited hosts and causes false positives. Use only "
+                        "against stable targets; error/boolean/UNION/auth-bypass "
+                        "detection (deterministic) always runs.")
+    p.add_argument("--openapi",
+                   help="Import an OpenAPI/Swagger spec (URL, file, or site root) "
+                        "to discover endpoints WITH their real parameter names")
+    p.add_argument("--auto", action="store_true",
+                   help="Force smart discovery (Swagger probe + app fingerprint "
+                        "+ katana crawl). This is ON BY DEFAULT for a single -u "
+                        "target; the flag just forces it on for list/stdin input.")
+    p.add_argument("--no-auto", action="store_true",
+                   help="Disable the default auto-discovery for a single -u target")
+    p.add_argument("--crawl", action="store_true",
+                   help="Run katana on each seed target to discover URLs "
+                        "(works without --auto; crawls authenticated when a "
+                        "--cookie/--login session is set)")
+    p.add_argument("--crawl-depth", type=int, default=3,
+                   help="katana crawl depth for --auto/--crawl (default: 3)")
+    p.add_argument("--brute", action="store_true",
+                   help="Brute-force common web/API paths to discover endpoints "
+                        "organically (soft-404 aware). On by default in --auto.")
+    p.add_argument("--no-brute", action="store_true",
+                   help="Disable the default path brute-forcing in --auto mode")
+    p.add_argument("--brute-wordlist", metavar="FILE",
+                   help="Custom path wordlist for --brute (e.g. a SecLists file); "
+                        "merged with the built-in list")
+    p.add_argument("--data", help="POST data (form or JSON string)")
+    p.add_argument("--method", default="GET",
+                   help="HTTP method(s), comma-separated to try several "
+                        "(e.g. 'GET,POST'). Default: GET")
+    p.add_argument("-H", "--header", action="append", default=[], dest="headers",
+                   help="Extra header (Name: Value or Name=Value)")
+    p.add_argument("--cookie", help="Cookie string (name=value; name2=value2)")
+    p.add_argument("--grab-cookie", nargs="?", const="__FIRST__", metavar="URL",
+                   help="Fetch a URL (or the first target) and capture its Set-Cookie "
+                        "session cookie, then reuse it for the scan and sqlmap handoff")
+    p.add_argument("--login-url", help="POST credentials here to obtain a session cookie")
+    p.add_argument("--login-data", help="Login POST body (form or JSON) for --login-url")
+
+    # Authenticated scanning (bearer/JWT token auth)
+    p.add_argument("--auth-url",
+                   help="Login endpoint to POST credentials to and extract a bearer/JWT "
+                        "token for authenticated scanning")
+    p.add_argument("--auth-data",
+                   help="Credentials body for --auth-url (JSON or form)")
+    p.add_argument("--auth-token",
+                   help="Use this bearer/JWT token directly (skips login)")
+    p.add_argument("--auth-token-path",
+                   help="Dotted JSON path to the token in the login response "
+                        "(e.g. 'authentication.token'); auto-detected if omitted")
+    p.add_argument("--auth-header", default="Authorization",
+                   help="Header to carry the token (default: Authorization)")
+    p.add_argument("--no-auto-auth", action="store_true",
+                   help="Disable automatic authentication for recognized apps "
+                        "(e.g. Juice Shop login-SQLi self-auth)")
+    p.add_argument("--creds", action="append", metavar="USER:PASS",
+                   help="Credentials to try at any discovered login form, tried "
+                        "BEFORE the built-in defaults (repeatable, e.g. "
+                        "--creds admin:letmein --creds bee:bug)")
+    p.add_argument("-p", "--param", action="append", dest="params",
+                   help="Test only this parameter (repeatable)")
+    p.add_argument("--proxy", help="HTTP proxy URL")
+    p.add_argument("--timeout", type=float, default=15.0,
+                   help="HTTP request timeout in seconds for SQLi-AI's own requests (default: 15)")
+
+    # Scan depth
+    p.add_argument("--level", type=int, default=1, choices=[1, 2, 3],
+                   help="Test depth: 1=quick, 2=normal, 3=deep (default: 1)")
+    p.add_argument("--risk", type=int, default=1, choices=[1, 2, 3],
+                   help="Risk: 1=safe payloads, 3=aggressive (default: 1)")
+    p.add_argument("--max-attempts", type=int, default=None,
+                   help="Max payloads per parameter (default: level-based)")
+
+    # Performance
+    p.add_argument("--threads", "-t", type=int, default=None,
+                   help="Concurrent targets to scan (default: auto — 1 for a "
+                        "single target, up to 8 when many targets are discovered)")
+    p.add_argument("--fast", action="store_true",
+                   help="Skip per-param LLM payload suggestion; heuristics + LLM confirm only "
+                        "(much faster with local models like llama3.2)")
+    p.add_argument("--no-precheck", action="store_true",
+                   help="Disable the quick pre-check that skips params with no response diff "
+                        "(default: precheck ON — drops dead params after 1 request)")
+    p.add_argument("--payloads", default="sqlmap",
+                   choices=["sqlmap", "embedded", "error", "boolean", "union", "time", "stacked"],
+                   help="Payload source: 'sqlmap' reads from sqlmap XML library, "
+                        "'embedded' uses built-in set, or pick a technique (default: sqlmap)")
+    p.add_argument("--sqlmap-data", metavar="DIR",
+                   help="Path to sqlmap data/xml/payloads dir (auto-detected if not set)")
+    p.add_argument("--sleep", type=int, default=3,
+                   help="Sleep seconds for time-based payloads (default: 3)")
+    # Default: keep testing every parameter on every URL, even after confirming
+    # SQLi, so the FULL set of findings is known before ever asking about sqlmap.
+    # --stop-on-first-finding restores the old "stop at the first hit" behavior
+    # for faster (but less complete) scans.
+    p.add_argument("--continue-on-found", dest="continue_on_found",
+                   action="store_true", default=True,
+                   help="(default) Keep testing all parameters/URLs to find every "
+                        "SQLi point before offering to run sqlmap")
+    p.add_argument("--stop-on-first-finding", dest="continue_on_found",
+                   action="store_false",
+                   help="Stop testing a parameter/URL as soon as one finding is "
+                        "confirmed (faster, but may miss additional injection points)")
+    p.add_argument("--probe", dest="probe_alive", action="store_true",
+                   help="Pre-filter dead URLs with a liveness check (auto-on for crawl input)")
+    p.add_argument("--no-probe", action="store_true",
+                   help="Disable liveness pre-filter")
+    p.add_argument("--probe-threads", type=int, default=20,
+                   help="Concurrency for liveness probe (default: 20)")
+    p.add_argument("--include-404", dest="include_dead", action="store_true",
+                   help="Test endpoints even if baseline is 404/405/401/403 (dead/auth-gated)")
+
+    # WAF evasion
+    p.add_argument("--tamper",
+                   help="Comma-separated tamper chain applied to every payload "
+                        "(e.g. space2comment,randomcase,charencode)")
+    p.add_argument("--no-auto-tamper", action="store_true",
+                   help="Do not auto-try evasion payloads when a WAF/block is detected")
+    p.add_argument("--list-tamper", action="store_true",
+                   help="List available tamper techniques and exit")
+
+    # sqlmap handoff — use SQLi-AI for discovery, sqlmap for exploitation
+    p.add_argument("--sqlmap", action="store_true",
+                   help="Don't scan; discover injectable URLs and emit a sqlmap "
+                        "target list + command (recon -> sqlmap handoff)")
+    p.add_argument("--run-sqlmap", action="store_true",
+                   help="Like --sqlmap, but also execute sqlmap if it is installed")
+    p.add_argument("--sqlmap-out", default="sqli_ai-sqlmap-urls.txt",
+                   help="File to write discovered sqlmap targets (default: sqli_ai-sqlmap-urls.txt)")
+    p.add_argument("--sqlmap-profile", choices=["stealth", "normal", "aggressive", "exploit", "nuclear"],
+                   default="normal",
+                   help="sqlmap intensity preset (default: normal). "
+                        "aggressive=level5/risk3; exploit=+auto-dump; nuclear=+all techniques/tampers")
+    p.add_argument("--sqlmap-args", default="",
+                   help="Extra sqlmap args appended to the profile (e.g. '--dbms=postgresql -p query')")
+    p.add_argument("--sqlmap-menu", action="store_true",
+                   help="Interactively choose the sqlmap profile and edit flags before running")
+    p.add_argument("--then-sqlmap", action="store_true",
+                   help="Scan with SQLi-AI first, then run sqlmap ONLY on the confirmed "
+                        "injectable URLs (fast + deep exploitation of real hits)")
+
+    # nuclei handoff — multi-class DAST breadth on discovered URLs
+    p.add_argument("--nuclei", action="store_true",
+                   help="After scanning, run nuclei DAST templates on the "
+                        "discovered URLs for multi-class coverage (sqli/xss/ssti/...)")
+    p.add_argument("--nuclei-tags", default="sqli,dast",
+                   help="nuclei -tags to run (default: sqli,dast). e.g. "
+                        "'sqli,xss,ssti,lfi,redirect'")
+    p.add_argument("--nuclei-args", default="",
+                   help="Extra args appended to the nuclei command")
+    p.add_argument("--ask", action="store_true",
+                   help="After Stage 1, show all findings and ask before launching sqlmap")
+    # Default-credentials check keyed by the detected DB type. Active probe of a
+    # DB port, so it's opt-in.
+    p.add_argument("--db-creds", action="store_true",
+                   help="After scanning, probe each detected DBMS's standard port "
+                        "for vendor-default credentials (postgres/postgres, root "
+                        "with empty pw, sa, ...). Uses optional DB drivers if "
+                        "installed; otherwise reports the open port + creds to try")
+    p.add_argument("--db-creds-timeout", type=float, default=4.0,
+                   help="Per-connection timeout (s) for the --db-creds probe (default: 4)")
+    p.add_argument("--sqlmap-timeout", type=int, default=0,
+                   help="Max seconds per sqlmap target before it's killed and skipped "
+                        "(0 = no limit). Prevents one endpoint from hanging the run")
+
+    # LLM backend — Ollama is default
+    p.add_argument("--ollama-host", default=None,
+                   help="Ollama host (default: http://127.0.0.1:11434)")
+    p.add_argument("--model", default=DEFAULT_OLLAMA_MODEL,
+                   help=f"Ollama/LLM model (default: {DEFAULT_OLLAMA_MODEL})")
+    p.add_argument("--no-start-ollama", action="store_true",
+                   help="Do not auto-start Ollama; expect it already running")
+    p.add_argument("--no-pull", action="store_true",
+                   help="Do not auto-pull model if missing")
+    p.add_argument("--api-key", help="Override API key (for non-Ollama backends)")
+    p.add_argument("--base-url", help="Override LLM base URL (skips Ollama default)")
+    p.add_argument("--no-llm", action="store_true",
+                   help="Heuristic-only mode (no LLM, works offline)")
+    p.add_argument("--llm-deep", action="store_true",
+                   help="Aggressive LLM use: per-parameter suggestion + per-payload "
+                        "analysis + confirmation (many calls, slower). Default is a "
+                        "sparing 'assist' — the LLM is only queried on near-miss "
+                        "parameters the deterministic engine couldn't confirm.")
+
+    # Output
+    p.add_argument("-o", "--output", help="Save JSON report to file")
+    p.add_argument("--batch", action="store_true", help="Non-interactive mode")
+    p.add_argument("-v", "--verbose", action="count", default=0,
+                   help="Verbose output (repeatable: -v, -vv, -vvv)")
+    p.add_argument("--show-response", action="store_true",
+                   help="Print a snippet of each injected response (debug detection)")
+    p.add_argument("--version", action="version", version=f"sqli_ai {__version__}")
+
+    return p
+
+
+def level_to_attempts(level: int) -> int:
+    return {1: 5, 2: 8, 3: 15}[level]
+
+
+def collect_targets(args) -> list[str]:
+    """Gather target URLs from -u, a bare positional URL, -l file, and/or stdin."""
+    targets: list[str] = []
+    # A bare positional URL is treated like -u (standard CLI ergonomics).
+    if getattr(args, "target", None) and not args.url:
+        args.url = args.target.strip()
+    if args.url:
+        targets.append(args.url.strip())
+
+    if args.url_list:
+        try:
+            with open(args.url_list) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        targets.append(line)
+        except OSError as e:
+            raise SystemExit(f"Cannot read --list file: {e}")
+
+    if args.stdin or (not sys.stdin.isatty() and not args.url and not args.url_list):
+        for line in sys.stdin:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                targets.append(line)
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique
+
+
+def probe_alive(
+    urls: list[str],
+    threads: int = 20,
+    timeout: float = 8.0,
+    headers: dict[str, str] | None = None,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+    keep_urls: set[str] | None = None,
+) -> tuple[list[str], dict[str, int]]:
+    """
+    httpx-style liveness check. Returns (alive_urls, status_map).
+
+    A URL is 'alive' unless it returns a truly-dead status. Note that 405
+    (Method Not Allowed) means the endpoint EXISTS but doesn't accept GET —
+    that's exactly a POST-only endpoint (e.g. a login route), so it is NOT
+    treated as dead. URLs in `keep_urls` (known POST/PUT targets whose GET
+    probe is meaningless) are never filtered out.
+    """
+    import concurrent.futures
+
+    import httpx
+
+    # 405 removed: it means "endpoint exists, wrong method" = alive (POST route).
+    dead_statuses = {0, 404, 410, 501}
+    keep_urls = keep_urls or set()
+    status_map: dict[str, int] = {}
+
+    client_kwargs = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+
+    def check(url: str) -> tuple[str, int]:
+        try:
+            with httpx.Client(**client_kwargs) as c:
+                resp = c.get(url, headers=headers or {})
+                return url, resp.status_code
+        except (httpx.HTTPError, OSError):
+            return url, 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, threads)) as ex:
+        for url, status in ex.map(check, urls):
+            status_map[url] = status
+
+    alive = [
+        u for u in urls
+        if u in keep_urls or status_map.get(u, 0) not in dead_statuses
+    ]
+    return alive, status_map
+
+
+# sqlmap intensity presets. Each is a full base flag string.
+SQLMAP_PROFILES = {
+    # cautious: low level/risk, delay, safe techniques
+    "stealth": "--batch --random-agent --level 1 --risk 1 --delay 1 --time-sec 2 --technique=BEU",
+    # balanced default
+    "normal": "--batch --random-agent --level 3 --risk 2 --threads 4",
+    # loud: max level/risk, more threads
+    "aggressive": "--batch --random-agent --level 5 --risk 3 --threads 10",
+    # aggressive + automatic exploitation (enumerate + dump everything)
+    "exploit": (
+        "--batch --random-agent --level 5 --risk 3 --threads 10 "
+        "--dbs --tables --dump-all --exclude-sysdbs"
+    ),
+    # everything on: all techniques, tamper suite, full retrieval, banner/users/etc.
+    "nuclear": (
+        "--batch --random-agent --level 5 --risk 3 --threads 10 "
+        "--technique=BEUSTQ -a --dump-all --exclude-sysdbs "
+        "--tamper=space2comment,between,randomcase,charencode"
+    ),
+}
+
+
+def interactive_sqlmap(console, profile: str, base_args: str, extra: str) -> str:
+    """Let the user pick a profile and edit the final flag string."""
+    console.print("\n[bold]sqlmap intensity profile:[/bold]")
+    names = list(SQLMAP_PROFILES.keys())
+    for i, name in enumerate(names, 1):
+        marker = " [dim](current)[/dim]" if name == profile else ""
+        console.print(f"  {i}) {name}{marker}")
+    try:
+        choice = input(f"Choose profile [{names.index(profile) + 1}]: ").strip()
+    except EOFError:
+        choice = ""
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        profile = names[int(choice) - 1]
+        base_args = SQLMAP_PROFILES[profile]
+
+    composed = f"{base_args} {extra}".strip()
+    console.print(f"\n[bold]Flags:[/bold] {composed}")
+    console.print("[dim]Press Enter to accept, or type a full replacement flag string:[/dim]")
+    try:
+        edited = input("> ").strip()
+    except EOFError:
+        edited = ""
+    return edited or composed
+
+
+def launch_sqlmap(cmd: str, timeout: int, console) -> int:
+    """
+    Run a sqlmap command.
+
+    - timeout == 0: interactive mode — parent ignores SIGINT so Ctrl+C reaches
+      sqlmap's own [C]ontinue/[Q]uit menu.
+    - timeout > 0: automated mode — sqlmap runs in its own process group and is
+      killed (with its children) if it exceeds the timeout.
+    """
+    import os
+    import signal
+    import subprocess
+
+    if timeout and timeout > 0:
+        proc = subprocess.Popen(cmd, shell=True, start_new_session=True)
+        try:
+            return proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            console.print(
+                f"[yellow]sqlmap exceeded {timeout}s — killing and moving on[/yellow]"
+            )
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return 124  # conventional timeout exit code
+        except KeyboardInterrupt:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            raise
+
+    # Interactive: hand Ctrl+C to sqlmap's own menu
+    prev = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return subprocess.run(cmd, shell=True).returncode
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+
+def grab_cookie(
+    url: str,
+    headers: dict[str, str] | None = None,
+    login_url: str | None = None,
+    login_data: str | None = None,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    """
+    Obtain session cookies from a target.
+
+    If login_url/login_data are given, POST them first (form or JSON). Then
+    read the cookie jar. Returns (cookie_string, cookie_dict).
+    """
+    import httpx
+
+    kwargs = {"timeout": 15.0, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        kwargs["proxy"] = proxy
+    jar: dict[str, str] = {}
+    with httpx.Client(**kwargs) as c:
+        try:
+            if login_url and login_data:
+                is_json = login_data.strip().startswith("{")
+                if is_json:
+                    import json as _json
+                    c.post(login_url, json=_json.loads(login_data), headers=headers or {})
+                else:
+                    from urllib.parse import parse_qsl
+                    data = dict(parse_qsl(login_data))
+                    # CSRF-aware login: GET the login page first (also seeds the
+                    # session cookie) and merge any pre-filled hidden fields
+                    # (anti-CSRF tokens like DVWA's user_token) that the user's
+                    # static --login-data can't know. User-supplied values win.
+                    try:
+                        page = c.get(login_url, headers=headers or {})
+                        from sqli_ai.param_discovery import hidden_form_fields
+                        for k, v in hidden_form_fields(page.text).items():
+                            data.setdefault(k, v)
+                    except httpx.HTTPError:
+                        pass
+                    c.post(login_url, data=data, headers=headers or {})
+            else:
+                c.get(url, headers=headers or {})
+        except httpx.HTTPError:
+            pass
+        for cookie in c.cookies.jar:
+            jar[cookie.name] = cookie.value
+
+    cookie_str = "; ".join(f"{k}={v}" for k, v in jar.items())
+    return cookie_str, jar
+
+
+def sqlmap_handoff(
+    targets: list[str],
+    guess_params: list[str] | None,
+    out_file: str,
+    profile: str,
+    sqlmap_args: str,
+    run: bool,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+    verbose: bool = False,
+    menu: bool = False,
+    timeout: int = 0,
+) -> int:
+    """Emit a sqlmap target list + command; optionally run sqlmap."""
+    from urllib.parse import urlparse
+
+    # Expand: keep URLs that already have params; for bare URLs, if param
+    # mining is on, append a few high-value candidate params so sqlmap has
+    # something to test.
+    mine = (guess_params or [])[:6]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for t in targets:
+        parsed_t = urlparse(t)
+        has_q = bool(parsed_t.query)
+        if has_q:
+            # URL already has real params from OpenAPI/crawl — use as-is
+            candidates = [t]
+        elif mine:
+            # Bare URL — expand with top mined param names for discovery
+            candidates = [f"{t}?{p}=1" for p in mine]
+        else:
+            candidates = [t]
+        for c in candidates:
+            if c not in seen:
+                seen.add(c)
+                urls.append(c)
+
+    if not urls:
+        console.print("[yellow]No parameterized URLs to hand to sqlmap.[/yellow]")
+        return 2
+
+    with open(out_file, "w") as f:
+        f.write("\n".join(urls) + "\n")
+
+    # Compose flags: profile base + user extras, optionally via interactive menu
+    base_args = SQLMAP_PROFILES.get(profile, SQLMAP_PROFILES["normal"])
+    if menu:
+        final_flags = interactive_sqlmap(console, profile, base_args, sqlmap_args)
+    else:
+        final_flags = f"{base_args} {sqlmap_args}".strip()
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" --cookie '{cookie}'"
+
+    cmd = f"sqlmap -m {out_file} {final_flags}{header_args}"
+
+    console.print(f"[green]✓[/green] Wrote {len(urls)} sqlmap targets to [bold]{out_file}[/bold]")
+    # Always show what will be tested (this is the "did it cover my URLs?" answer)
+    show = urls if (verbose or len(urls) <= 40) else urls[:40]
+    for u in show:
+        console.print(f"    [cyan]->[/cyan] {u}")
+    if len(show) < len(urls):
+        console.print(f"    [dim]... and {len(urls) - len(show)} more (see {out_file})[/dim]")
+    console.print(
+        f"\n[dim]sqlmap will test each URL's parameters sequentially "
+        f"(~100+ techniques per param).[/dim]"
+    )
+    console.print(f"\n[bold]Run sqlmap[/bold] [dim](profile: {profile})[/dim]:")
+    console.print(f"  {cmd}\n")
+    console.print(
+        "[dim]Tip: for per-parameter focus add -p <name>; "
+        "for the BrokenCrystals raw-SQL bug, sqlmap error-based will flag "
+        "/api/testimonials/count?query=...[/dim]"
+    )
+
+    if run:
+        import shutil
+        if not shutil.which("sqlmap"):
+            console.print("[yellow]sqlmap not found on PATH; command printed above.[/yellow]")
+            return 1
+        hint = f" [dim](timeout {timeout}s)[/dim]" if timeout else \
+            " [dim](Ctrl+C hands the menu to sqlmap)[/dim]"
+        console.print(f"[cyan]Launching sqlmap...[/cyan]{hint}\n")
+        return launch_sqlmap(cmd, timeout, console)
+    return 0
+
+
+def has_injectable_params(url: str, test_path: bool = False) -> bool:
+    """Does the URL carry query params (or path segments when path testing)?"""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.query or "*" in url:
+        return True
+    if test_path:
+        return any(s for s in parsed.path.split("/") if s)
+    return False
+
+
+def url_has_id_like_path(url: str) -> bool:
+    """True when a URL's path ends in an ID-like segment (numeric, UUID, or a
+    long alphanumeric token) and carries no query string.
+
+    REST endpoints such as ``/api/user/1`` or ``/products/42`` place the
+    injectable value in the path, not the query. Auto-enabling path testing for
+    these — without forcing users to remember ``--path`` — is what lets the
+    scanner catch path-based error SQLi (e.g. BrokenCrystals ``/api/user/{id}``)
+    out of the box. Kept deliberately narrow (ID-like only) so bare content
+    URLs like ``/about`` don't trigger noisy per-segment probing.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.query or "*" in url:
+        return False
+    segs = [s for s in parsed.path.split("/") if s]
+    if not segs:
+        return False
+
+    def _id_like(seg: str) -> bool:
+        if seg.isdigit():
+            return True
+        # UUID-ish or long alphanumeric identifier (has both letters and digits).
+        return (
+            len(seg) >= 8
+            and any(c.isdigit() for c in seg)
+            and any(c.isalpha() for c in seg)
+        )
+
+    # Any ID-like segment (not just the last) makes the URL worth path-testing,
+    # e.g. /user/1/orders as well as /api/user/1.
+    return any(_id_like(s) for s in segs)
+
+
+def setup_llm_backend(args, console: Console) -> tuple[bool, str | None, str | None]:
+    """
+    Prepare LLM backend. Returns (use_llm, base_url, error_message).
+    """
+    if args.no_llm:
+        return False, None, None
+
+    # Explicit remote backend (OpenAI, LiteLLM, etc.)
+    if args.base_url:
+        import os
+        if not args.api_key and not os.getenv("OPENAI_API_KEY"):
+            return False, None, (
+                "Remote LLM backend requires --api-key or OPENAI_API_KEY. "
+                "Omit --base-url to use local Ollama."
+            )
+        return True, args.base_url.rstrip("/"), None
+
+    # Default: local Ollama background
+    host = args.ollama_host
+    status = console.print if args.verbose else lambda m: console.print(f"[dim]{m}[/dim]")
+
+    ok, msg = ensure_ready(
+        model=args.model,
+        host=host,
+        auto_start=not args.no_start_ollama,
+        auto_pull=not args.no_pull,
+        on_status=status,
+    )
+    if not ok:
+        return False, None, msg
+
+    if not args.verbose:
+        console.print(f"[green]✓[/green] {msg}")
+    return True, ollama_base_url(host), None
+
+
+_STATIC_EXT = frozenset({
+    ".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf", ".zip", ".gz",
+    ".tar", ".mp4", ".mp3", ".webm", ".wav",
+})
+_STATIC_SEGS = (
+    "/assets/", "/static/", "/images/", "/img/", "/fonts/",
+    "/dist/", "/build/", "/vendor/", "/node_modules/",
+    "/@ng/",    # Angular internal routes
+    "/Trident/", "/Edge/", "/MSIE/",  # browser sniffing paths
+    "/%5C/",    # backslash encoded — SPA artifact
+)
+
+
+def _is_static(url: str) -> bool:
+    """Return True for static assets that cannot contain SQL injection."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path.lower()
+    ext = path[path.rfind("."):] if "." in path else ""
+    if ext in _STATIC_EXT:
+        return True
+    return any(s in url.lower() for s in _STATIC_SEGS)
+
+
+def _sink_key(url: str, param: str) -> tuple:
+    """A per-SINK dedup key: same param reached through a DIFFERENT server-side
+    handler is a distinct injection point, not a duplicate.
+
+    Keys on (host, path, other-param-names, action-value, param). The ``action``
+    value is the semantic discriminator for CGI/handler-style apps (BadStore's
+    ?action=register vs ?action=login vs ?action=cartadd are separate SQL sinks
+    for the same field name). Other params contribute only their NAMES, so
+    varying values (crawl noise) don't inflate the count.
+    """
+    from urllib.parse import parse_qsl, urlparse
+    pr = urlparse(url or "")
+    q = dict(parse_qsl(pr.query, keep_blank_values=True))
+    other_names = tuple(sorted(k for k in q if k != param))
+    action = q.get("action", "")
+    return (pr.netloc, pr.path, other_names, action, param)
+
+
+def _parse_creds(raw: list[str] | None) -> list[tuple[str, str]]:
+    """Parse --creds 'user:pass' strings into (user, pass) pairs.
+
+    Split on the FIRST ':' only, so passwords may contain colons. Entries
+    without a ':' are skipped with their value treated as a username + empty pass.
+    """
+    out: list[tuple[str, str]] = []
+    for item in (raw or []):
+        if ":" in item:
+            u, p = item.split(":", 1)
+            out.append((u, p))
+        elif item:
+            out.append((item, ""))
+    return out
+
+
+def _is_session_destroying(url: str) -> bool:
+    """True for logout/sign-out URLs that would DESTROY an authenticated session.
+
+    Visiting these mid-scan (or mid-crawl) with a valid cookie logs us out, so
+    every request after that is silently unauthenticated — the #1 way an
+    authenticated scan quietly turns into an unauthenticated one. They're never
+    injection targets, so skipping them is pure upside.
+    """
+    import re as _re
+    return bool(_re.search(
+        r"log[\-_]?out|sign[\-_]?out|log[\-_]?off|/logoff|/signoff|(?:^|[/?&=])exit(?:$|[/?&=.])",
+        url, _re.IGNORECASE,
+    ))
+
+
+def organic_expand_targets(
+    targets: list[str],
+    headers: dict[str, str],
+    console,
+    verify_ssl: bool = True,
+    proxy: str | None = None,
+    timeout: float = 10.0,
+    max_seeds: int = 20,
+    max_new: int = 120,
+    post_extras: dict | None = None,
+) -> list[str]:
+    """One-pass organic expansion: fetch each seed page and add scan targets it
+    points at — GET-form actions pre-filled with fields, query-carrying links,
+    and (organically) POST forms with their fields. This lets ``-u https://site``
+    reach the login/cart/search/order endpoints a form points to — including CGI
+    ``?action=`` forms — without any per-app endpoint list.
+
+    POST forms are registered in ``post_extras`` (url -> (method, body, ct, None))
+    so the scanner tests their body params. Bounded: only the first ``max_seeds``
+    targets are fetched and at most ``max_new`` URLs are added.
+    """
+    import httpx
+
+    from sqli_ai.js_endpoints import discover_js_endpoints
+    from sqli_ai.param_discovery import discover
+
+    existing = set(targets)
+    discovered: list[str] = []
+    n_js = 0
+    post_extras = post_extras if post_extras is not None else {}
+    kwargs: dict = {"timeout": timeout, "verify": verify_ssl, "follow_redirects": True}
+    if proxy:
+        kwargs["proxy"] = proxy
+
+    seeds = [t for t in targets if not _is_static(t)][:max_seeds]
+    with httpx.Client(**kwargs) as c:
+        for seed in seeds:
+            try:
+                resp = c.get(seed, headers=headers or {})
+            except (httpx.HTTPError, OSError):
+                continue
+            ct = resp.headers.get("content-type", "")
+            try:
+                _names, urls, post_forms = discover(seed, resp.text, ct)
+            except Exception:
+                urls, post_forms = [], []
+            for u in urls:
+                if u in existing or _is_static(u) or len(discovered) >= max_new:
+                    continue
+                existing.add(u)
+                discovered.append(u)
+            # POST forms → POST scan targets with their fields (organic).
+            for furl, fbody, fct in post_forms:
+                if furl in existing or len(discovered) >= max_new:
+                    continue
+                existing.add(furl)
+                discovered.append(furl)
+                post_extras[furl] = ("POST", fbody, fct, None)
+            # JS-bundle endpoint mining: read the app's own JS to learn the API
+            # routes (and query params) it calls at runtime — the SPA endpoints a
+            # DOM crawler can't see (e.g. /rest/products/search?q=). Fully generic.
+            if "html" in ct.lower() or "<script" in resp.text[:4000].lower():
+                try:
+                    js_eps = discover_js_endpoints(
+                        seed, resp.text, c, headers=headers or {}
+                    )
+                except Exception:
+                    js_eps = set()
+                for u in sorted(js_eps):
+                    if u in existing or _is_static(u) or len(discovered) >= max_new:
+                        continue
+                    existing.add(u)
+                    discovered.append(u)
+                    n_js += 1
+
+    if discovered:
+        n_post = sum(1 for u in discovered if u in post_extras)
+        console.print(
+            f"[green]✓ Organic crawl found {len(discovered)} extra target(s)[/green] "
+            f"[dim](forms/links on the seed page(s); {n_post} POST form(s); "
+            f"{n_js} from JS bundles)[/dim]"
+        )
+        for u in discovered[:15]:
+            tag = " [dim]POST[/dim]" if u in post_extras else ""
+            console.print(f"    [cyan]->[/cyan] {u}{tag}")
+        if len(discovered) > 15:
+            console.print(f"    [dim]... and {len(discovered) - 15} more[/dim]")
+    return targets + discovered
+
+
+def katana_crawl(
+    site: str,
+    console,
+    depth: int = 3,
+    headers: dict[str, str] | None = None,
+    cookie: str | None = None,
+    verbose: bool = False,
+    timeout: int = 120,
+) -> list[str]:
+    """Crawl a site with katana and return discovered (non-static) URLs.
+
+    Passes auth headers/cookie through to katana so authenticated areas are
+    crawled too. Returns [] if katana isn't installed or finds nothing.
+    """
+    import shutil
+    if not shutil.which("katana"):
+        console.print(
+            "[yellow]katana is not installed — cannot crawl.[/yellow] "
+            "[dim](https://github.com/projectdiscovery/katana)[/dim]"
+        )
+        return []
+
+    # -cos excludes logout/sign-out URLs from the crawl SCOPE so katana never
+    # fetches them with our session cookie (which would log us out and make the
+    # rest of the authenticated crawl/scan silently unauthenticated).
+    cmd = ["katana", "-u", site, "-jc", "-silent", "-d", str(depth),
+           "-cos", "log[-_]?out|sign[-_]?out|log[-_]?off"]
+    for k, v in (headers or {}).items():
+        if k.lower() == "user-agent":
+            cmd += ["-H", f"User-Agent: {v}"]
+        else:
+            cmd += ["-H", f"{k}: {v}"]
+    if cookie:
+        cmd += ["-H", f"Cookie: {cookie}"]
+
+    console.print(f"[*] Crawling with katana (depth {depth})...")
+    import subprocess as _sp
+    try:
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        console.print(f"[yellow]katana failed to run: {e}[/yellow]")
+        return []
+
+    raw = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+    crawled = sorted({u for u in raw if not _is_static(u)})
+    filtered = len(raw) - len(crawled)
+    if crawled:
+        console.print(
+            f"[green]✓ katana found {len(crawled)} URL(s)[/green] "
+            f"[dim]({filtered} static assets filtered out)[/dim]"
+        )
+        show_n = crawled if verbose else crawled[:15]
+        for u in show_n:
+            console.print(f"    [cyan]->[/cyan] {u}")
+        if len(show_n) < len(crawled):
+            console.print(f"    [dim]... and {len(crawled) - len(show_n)} more (-v to see all)[/dim]")
+    else:
+        console.print(
+            f"[yellow]katana ran but found no usable URLs[/yellow] "
+            f"[dim]({len(raw)} raw hits, all static/filtered)[/dim]"
+        )
+    return crawled
+
+
+def _auto_discover(args, targets: list[str], console) -> None:
+    """
+    Smart target discovery for --auto mode. Fully transparent: every step
+    prints exactly what it tried and what it found — no silent fallbacks.
+
+    Runs for EVERY seed target (not just the first), so a list of sites is
+    fully expanded: each seed is probed for an OpenAPI/Swagger spec, and any
+    seed without one is fingerprinted + crawled + brute-forced. Sites with a
+    spec are collected in args._spec_sites so main() imports them all; the
+    original seeds are always kept.
+
+    Per seed:
+    1. Probe common Swagger/OpenAPI spec paths on the site root.
+    2. If a spec is found: remember the site for spec import.
+    3. If not: fingerprint known apps, crawl (katana), and brute-force paths;
+       accumulate the discovered URLs.
+    """
+    from sqli_ai.openapi import COMMON_SPEC_PATHS, load_openapi, last_probe_log
+
+    all_discovered: set[str] = set(targets)  # never drop the original seeds
+    spec_sites: list[str] = []
+
+    for site in list(targets):
+        console.print(f"\n[bold]Auto-discovery: {site}[/bold]")
+
+        # ---- Step 1: probe for an OpenAPI/Swagger spec ------------------
+        console.print(
+            f"[*] Probing {len(COMMON_SPEC_PATHS)} common Swagger/OpenAPI paths..."
+        )
+        try:
+            spec_hits = load_openapi(
+                site,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            )
+        except Exception as e:
+            spec_hits = []
+            console.print(f"[yellow]  OpenAPI probe raised an error: {e}[/yellow]")
+
+        if args.verbose:
+            for r in last_probe_log:
+                tag = "[green]200[/green]" if r.status == 200 else f"[dim]{r.status or 'ERR'}[/dim]"
+                console.print(f"    {tag}  {r.path}  [dim]— {r.reason}[/dim]")
+
+        if spec_hits:
+            found_path = next(
+                (r.path for r in last_probe_log if r.reason == "valid OpenAPI spec found"),
+                "?",
+            )
+            console.print(
+                f"[green]✓ Found OpenAPI/Swagger spec at {found_path}[/green] — "
+                f"{len(spec_hits)} endpoint(s) will be imported"
+            )
+            spec_sites.append(site)
+            continue  # endpoints imported in main(); no need to crawl this site
+
+        non200 = sum(1 for r in last_probe_log if r.status != 200)
+        blocked = sum(1 for r in last_probe_log if r.status == 403)
+        console.print(
+            f"[yellow]✗ No OpenAPI/Swagger spec found[/yellow] "
+            f"({len(last_probe_log)} paths tried, {non200} non-200 responses"
+            + (f", {blocked} returned 403 — target may be blocking automated probes" if blocked else "")
+            + ")"
+        )
+        if not args.verbose:
+            console.print("[dim]  (run with -v to see every path + status code tried)[/dim]")
+
+        # No hardcoded per-app knowledge: discovery is fully organic — spec
+        # import (above), JS-aware crawl, form/link/JS-fetch extraction and
+        # parameter mining (below). Nothing about the specific target app is
+        # baked in, so the same pipeline generalizes to any site.
+
+        # ---- Step 1.6: generic auth BEFORE crawling --------------------
+        # Auth-gated apps (DVWA/bWAPP-style) redirect every internal page to a
+        # login form when unauthenticated, so an unauthenticated crawl finds
+        # nothing. Establish a session with default creds FIRST, then crawl and
+        # brute-force WITH that session so the protected pages are discovered.
+        # Fully generic (submits only the app's own login form); per-host cookies
+        # are stored for the scan phase too.
+        site_cookie_str: Optional[str] = None
+        _host_cookies = getattr(args, "_host_cookies", {})
+        _user_auth = bool(
+            args.auth_token or (args.auth_url and args.auth_data)
+            or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
+        )
+        if not args.no_auto_auth and not _user_auth:
+            try:
+                from sqli_ai.session import establish_session
+                _jar, _msg = establish_session(
+                    site, console=console,
+                    timeout=min(getattr(args, "timeout", 15), 12.0),
+                    creds=_parse_creds(getattr(args, "creds", None)))
+            except Exception as e:
+                _jar, _msg = {}, f"auth error: {e}"
+            if _jar:
+                from urllib.parse import urlparse as _up_site0
+                host = _up_site0(site).netloc
+                _host_cookies[host] = _jar
+                args._host_cookies = _host_cookies
+                site_cookie_str = "; ".join(f"{k}={v}" for k, v in _jar.items())
+            elif "no login form" not in _msg:
+                console.print(f"[dim]Auth ({site}): {_msg}[/dim]")
+
+        # ---- Step 2: crawl to discover additional URLs (authenticated) --
+        crawled = katana_crawl(
+            site, console,
+            depth=getattr(args, "crawl_depth", 3),
+            cookie=site_cookie_str,
+            verbose=args.verbose,
+        )
+        from urllib.parse import urlparse as _up_site
+        args._crawled_hosts = getattr(args, "_crawled_hosts", set()) | {_up_site(site).netloc}
+
+        # ---- Step 2.5: JS-bundle endpoint mining (SPA discovery) --------
+        # Read the app's own JavaScript to learn the API routes (and their query
+        # params) it calls at runtime. This is how single-page apps expose
+        # endpoints like /rest/products/search?q= that never appear in the DOM,
+        # so a link crawler misses them. Fully generic — no per-app knowledge.
+        js_eps: list[str] = []
+        try:
+            import httpx as _httpx_js
+
+            from sqli_ai.js_endpoints import discover_js_endpoints
+            _js_hdrs = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"}
+            if site_cookie_str:
+                _js_hdrs["Cookie"] = site_cookie_str
+            with _httpx_js.Client(timeout=min(getattr(args, "timeout", 15), 12.0),
+                                  verify=False, follow_redirects=True) as _jc:
+                _root = _jc.get(site, headers=_js_hdrs)
+                js_eps = sorted(discover_js_endpoints(
+                    site, _root.text, _jc, headers=_js_hdrs
+                ))
+            if js_eps:
+                console.print(
+                    f"[green]✓ JS mining found {len(js_eps)} endpoint(s) "
+                    f"in the app's bundles[/green]"
+                )
+                show_j = js_eps if args.verbose else js_eps[:15]
+                for u in show_j:
+                    console.print(f"    [cyan]->[/cyan] {u}")
+                if len(show_j) < len(js_eps):
+                    console.print(f"    [dim]... and {len(js_eps) - len(show_j)} more (-v to see all)[/dim]")
+        except Exception as e:
+            console.print(f"[dim]JS endpoint mining skipped: {e}[/dim]")
+
+        # ---- Step 3: organic path brute-forcing (content discovery) -----
+        bruted: list[str] = []
+        if not getattr(args, "no_brute", False):
+            from sqli_ai.content_discovery import discover_paths
+            extra_words = None
+            wl = getattr(args, "brute_wordlist", None)
+            if wl:
+                try:
+                    with open(wl) as f:
+                        extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+                except OSError as e:
+                    console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+            _bf_hdrs = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+            if site_cookie_str:
+                _bf_hdrs["Cookie"] = site_cookie_str
+            try:
+                bruted = discover_paths(
+                    site,
+                    headers=_bf_hdrs,
+                    extra_words=extra_words,
+                    on_status=lambda m: console.print(m),
+                )
+            except Exception as e:
+                console.print(f"[yellow]Content discovery failed: {e}[/yellow]")
+            if bruted:
+                console.print(
+                    f"[green]✓ Brute-force found {len(bruted)} live path(s)[/green]"
+                )
+                show_b = bruted if args.verbose else bruted[:15]
+                for u in show_b:
+                    console.print(f"    [cyan]->[/cyan] {u}")
+                if len(show_b) < len(bruted):
+                    console.print(f"    [dim]... and {len(bruted) - len(show_b)} more (-v to see all)[/dim]")
+
+        all_discovered |= set(crawled) | set(bruted) | set(js_eps)
+
+    args._auto_targets = sorted(all_discovered)
+    args._spec_sites = spec_sites
+    # Back-compat: keep args.openapi pointing at the first spec site so any code
+    # path that only checks args.openapi still triggers an import.
+    if spec_sites and not args.openapi:
+        args.openapi = spec_sites[0]
+    args.guess_params = True  # crawled URLs rarely expose real params — mine them
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    console = Console()
+
+    if args.list_tamper:
+        from sqli_ai.tamper import available
+        console.print("[bold]Available tamper techniques:[/bold]")
+        for name in available():
+            console.print(f"  {name}")
+        return 0
+
+    console.print(
+        f"[bold cyan]SQLi-AI v{__version__}[/bold cyan] — "
+        f"AI-powered SQL injection scanner [dim](Ollama backend)[/dim]\n"
+    )
+
+    targets = collect_targets(args)
+
+    # Capture the ORIGINAL seed host(s) up front. Every target discovered later
+    # (crawl, JS mining, organic expansion, brute) is hard-restricted to these
+    # hosts before scanning — testing a host the user never seeded would be both
+    # out-of-scope/unauthorized and a false-positive source (off-site links like
+    # social/CDN/other domains routinely appear in a page's HTML and JS).
+    from urllib.parse import urlparse as _up_seed
+    seed_hosts = {_up_seed(t).netloc for t in targets if _up_seed(t).netloc}
+
+    # sqlmap-style '*' marker: if the user put a '*' in a URL they are telling us
+    # EXACTLY where to inject. Respect that — don't let auto-discovery, organic
+    # expansion, brute-forcing or param mining replace/dilute the marked target.
+    # (This is why "sticking * everywhere" appeared not to work: auto-discovery
+    # was expanding the seed and the marked spot got lost in the crawl.)
+    marker_mode = any("*" in t for t in targets)
+    if marker_mode:
+        args.no_auto = True
+        args.auto = False
+        args.organic = False
+        args.no_brute = True
+        args.guess_params = False
+        args.no_guess_params = True
+        console.print(
+            "[dim]Injection marker '*' detected — testing exactly the marked "
+            "field(s); auto-discovery/organic/brute disabled.[/dim]"
+        )
+
+    # Zero-config defaults: auto-discovery runs automatically for a single -u
+    # site (bare scanning) so the user doesn't have to pass --auto every time.
+    # It's skipped for list/stdin input (those already come from a crawler) and
+    # when an explicit --openapi spec is given, and can be forced with --auto or
+    # disabled with --no-auto.
+    # Auto-discovery runs for a single -u site AND for an explicit -l list of
+    # app roots — both are "seed" inputs the user expects to be expanded
+    # (fingerprint + spec import + crawl + known-vuln seeding, per host). It
+    # stays OFF for --stdin (that is already-expanded crawler output) unless the
+    # user forces it with --auto, and can always be disabled with --no-auto.
+    seed_input = (bool(args.url) or bool(args.url_list)) and not args.stdin
+    auto_on = (
+        (args.auto or seed_input)
+        and not args.no_auto
+        and not args.openapi
+        and bool(targets)
+    )
+    if auto_on:
+        _auto_discover(args, targets, console)
+        # If auto ran katana it may have replaced targets; re-read
+        if hasattr(args, '_auto_targets'):
+            targets = args._auto_targets
+
+    # OpenAPI/Swagger import — discover endpoints with their real param names
+    # spec_extras maps url -> (method, body, content_type, inject_headers)
+    spec_extras: dict[str, tuple[str, Optional[str], Optional[str], Optional[dict]]] = {}
+
+    # Spec sources: explicit --openapi plus every site auto-discovery found a
+    # spec on (args._spec_sites). Import them ALL so a list of API targets is
+    # fully expanded, not just the first.
+    spec_sources: list[str] = []
+    if args.openapi:
+        spec_sources.append(args.openapi)
+    spec_sources.extend(getattr(args, "_spec_sites", []))
+    # De-dup while preserving order.
+    _seen_src: set[str] = set()
+    spec_sources = [s for s in spec_sources if not (s in _seen_src or _seen_src.add(s))]
+
+    if spec_sources:
+        from sqli_ai.openapi import load_openapi
+        for src in spec_sources:
+            console.print(f"[*] Importing OpenAPI spec from {src} ...")
+            try:
+                spec_targets = load_openapi(
+                    src,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+                    },
+                )
+                if spec_targets:
+                    console.print(
+                        f"[green]✓[/green] {len(spec_targets)} endpoints from spec "
+                        f"[dim]({sum(1 for t in spec_targets if t.method != 'GET')} POST/PUT)[/dim]"
+                    )
+                    for st in spec_targets:
+                        targets.append(st.url)
+                        if st.method != "GET" or st.body or st.inject_headers:
+                            spec_extras[st.url] = (
+                                st.method, st.body, st.content_type, st.inject_headers
+                            )
+                else:
+                    console.print("[yellow]No endpoints parsed from spec[/yellow]")
+            except Exception as e:
+                console.print(f"[yellow]OpenAPI import failed for {src}: {e}[/yellow]")
+        # De-dup after merge
+        seen_t: set[str] = set()
+        targets = [t for t in targets if not (t in seen_t or seen_t.add(t))]
+
+    if not targets:
+        console.print(
+            "[red]No targets.[/red] Provide one of:\n"
+            "  -u \"http://host/page?id=1\"\n"
+            "  -l urls.txt            (file of URLs)\n"
+            "  --stdin                (pipe URLs in)\n\n"
+            "[dim]Tip: a bare host with no parameters has nothing to inject. "
+            "Crawl first, e.g.:[/dim]\n"
+            "  [dim]katana -u https://target -f qurl -silent | "
+            "python -m sqli_ai --stdin --only-with-params[/dim]"
+        )
+        return 2
+
+    # Crawl mode = many targets from stdin/list. Path testing on by default there
+    # (REST apps are mostly path-based), unless explicitly disabled.
+    crawl_mode = bool(args.stdin or args.url_list) or len(targets) > 1
+    test_path = args.test_path or (crawl_mode and not args.no_path)
+    # Single URL with an ID-like path segment and no query params (REST style,
+    # e.g. /api/user/1): auto-enable path testing so path-based error SQLi is
+    # caught without requiring the user to remember --path.
+    if not test_path and not args.no_path and any(
+        url_has_id_like_path(t) for t in targets
+    ):
+        test_path = True
+        console.print(
+            "[dim]Path testing auto-enabled (ID-like path segment, no query "
+            "params).[/dim]"
+        )
+    if args.no_path:
+        test_path = False
+
+    # For crawl input, it's common to only care about parameterized URLs
+    if args.only_with_params:
+        before = len(targets)
+        targets = [t for t in targets if has_injectable_params(t, test_path)]
+        skipped = before - len(targets)
+        if skipped:
+            console.print(f"[dim]Skipped {skipped} URL(s) without query parameters[/dim]")
+        if not targets:
+            console.print("[yellow]No URLs with parameters to test.[/yellow]")
+            return 2
+
+    headers = parse_headers(args.headers)
+    # Default to a real browser User-Agent for the actual injection probes.
+    # Without it httpx sends "python-httpx/x", which many WAFs / rate-limiters
+    # block outright (403) — silently turning every endpoint into a false
+    # negative. Only set when the user didn't supply their own UA.
+    if not any(k.lower() == "user-agent" for k in headers):
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+        )
+    cookies = parse_cookies(args.cookie) if args.cookie else {}
+    content_type = headers.get("Content-Type") or headers.get("content-type")
+    # max_attempts must be >= len(seed_payloads) so all payloads get tested.
+    # We resolve this after loading payloads below.
+    _raw_max_attempts = args.max_attempts
+
+    # Auto-grab a session cookie (optionally via login) and reuse everywhere
+    if args.grab_cookie or (args.login_url and args.login_data):
+        seed_url = args.grab_cookie
+        if not seed_url or seed_url == "__FIRST__":
+            seed_url = targets[0]
+        console.print("[*] Grabbing session cookie...")
+        cookie_str, jar = grab_cookie(
+            seed_url,
+            headers=headers,
+            login_url=args.login_url,
+            login_data=args.login_data,
+            proxy=args.proxy,
+        )
+        if jar:
+            cookies.update(jar)
+            if not args.cookie:
+                args.cookie = cookie_str
+            else:
+                args.cookie = args.cookie.rstrip("; ") + "; " + cookie_str
+            console.print(f"[green]✓[/green] Captured cookie(s): {', '.join(jar.keys())}")
+        else:
+            console.print("[yellow]No Set-Cookie returned by the target[/yellow]")
+
+    # ---- Authenticated scanning: obtain a bearer/JWT token --------------
+    # Priority: explicit --auth-token > --auth-url/--auth-data login >
+    # known-app auto-auth (e.g. Juice Shop login-SQLi self-auth).
+    from sqli_ai.auth import obtain_token
+    auth_token: Optional[str] = None
+    if args.auth_token:
+        auth_token = args.auth_token
+        console.print("[green]✓[/green] Using supplied auth token")
+    elif args.auth_url and args.auth_data:
+        console.print(f"[*] Authenticating via {args.auth_url} ...")
+        auth_token, msg = obtain_token(
+            args.auth_url, args.auth_data, headers=headers,
+            token_path=args.auth_token_path, proxy=args.proxy,
+        )
+        console.print(f"[green]✓[/green] {msg}" if auth_token else f"[yellow]{msg}[/yellow]")
+
+    if auth_token:
+        # Attach to every request. Not treated as an injection point
+        # (Authorization is in the http_probe skip list).
+        headers[args.auth_header] = f"Bearer {auth_token}"
+
+    # Explicit katana crawl (--crawl): crawl each unique HOST ONCE from its root
+    # (not once per already-discovered endpoint), authenticated with whatever
+    # session we just established. Hosts already crawled by --auto are skipped.
+    if args.crawl:
+        from urllib.parse import urlparse as _up_crawl
+        crawl_headers = dict(headers)
+        crawl_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+        already_crawled = getattr(args, "_crawled_hosts", set())
+        origins: list[str] = []
+        seen_hosts: set[str] = set()
+        for t in targets:
+            pr = _up_crawl(t)
+            if pr.netloc and pr.netloc not in seen_hosts:
+                seen_hosts.add(pr.netloc)
+                if pr.netloc not in already_crawled:
+                    origins.append(f"{pr.scheme}://{pr.netloc}/")
+        skipped = len(seen_hosts) - len(origins)
+        if skipped:
+            console.print(
+                f"[dim]--crawl: {skipped} host(s) already crawled by --auto, skipping[/dim]"
+            )
+        seen_c = set(targets)
+        added: list[str] = []
+        for origin in origins:
+            for u in katana_crawl(
+                origin, console, depth=args.crawl_depth,
+                headers=crawl_headers, cookie=args.cookie, verbose=args.verbose,
+            ):
+                if u not in seen_c:
+                    seen_c.add(u)
+                    added.append(u)
+        if added:
+            console.print(f"[green]✓ Crawl added {len(added)} new target(s)[/green]")
+            targets = targets + added
+
+    # Explicit path brute-forcing (--brute without --auto): discover endpoints
+    # organically on each unique host.
+    if args.brute and not auto_on:
+        from urllib.parse import urlparse as _up_b
+
+        from sqli_ai.content_discovery import discover_paths
+        extra_words = None
+        if args.brute_wordlist:
+            try:
+                with open(args.brute_wordlist) as f:
+                    extra_words = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            except OSError as e:
+                console.print(f"[yellow]Cannot read --brute-wordlist: {e}[/yellow]")
+        b_headers = dict(headers)
+        b_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+        seen_hosts_b: set[str] = set()
+        seen_b = set(targets)
+        added_b: list[str] = []
+        for t in list(targets):
+            host = _up_b(t).netloc
+            if host in seen_hosts_b:
+                continue
+            seen_hosts_b.add(host)
+            root = f"{_up_b(t).scheme}://{host}/"
+            for u in discover_paths(
+                root, headers=b_headers, proxy=args.proxy,
+                extra_words=extra_words, on_status=lambda m: console.print(m),
+            ):
+                if u not in seen_b:
+                    seen_b.add(u)
+                    added_b.append(u)
+        if added_b:
+            console.print(f"[green]✓ Brute-force added {len(added_b)} target(s)[/green]")
+            targets = targets + added_b
+
+    # Organic target expansion: crawl the seed page(s) one level to add the
+    # forms/links they point at as scan targets. Skipped for large crawl lists
+    # (katana/gau already did the crawling) and when --no-organic is set.
+    if args.organic and len(targets) <= 20:
+        expand_headers = dict(headers)
+        expand_headers.setdefault("User-Agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+        targets = organic_expand_targets(
+            targets, expand_headers, console,
+            proxy=args.proxy, timeout=min(args.timeout, 10.0),
+            post_extras=spec_extras,
+        )
+
+    # ---- Scope enforcement: NEVER scan a host the user didn't seed --------
+    # Discovery (katana crawl, JS mining, organic form/link expansion) can pull
+    # in off-site URLs (social links, CDNs, other domains referenced by the app).
+    # Scanning those is out-of-scope/unauthorized AND a false-positive source.
+    # Hard-filter every target down to the original seed host(s).
+    if seed_hosts:
+        _before_scope = len(targets)
+        targets = [t for t in targets if _up_seed(t).netloc in seed_hosts]
+        # Drop any off-host spec/known extras too, so they can't re-enter.
+        spec_extras = {u: v for u, v in spec_extras.items()
+                       if _up_seed(u).netloc in seed_hosts}
+        _dropped_scope = _before_scope - len(targets)
+        if _dropped_scope:
+            console.print(
+                f"[dim]Scope: dropped {_dropped_scope} off-host target(s) — "
+                f"only seeded host(s) {', '.join(sorted(seed_hosts))} are tested[/dim]"
+            )
+
+    # Never scan logout/sign-out URLs — visiting one with a session cookie logs
+    # us out and silently turns the rest of an authenticated scan unauthenticated.
+    _before_logout = len(targets)
+    targets = [t for t in targets if not _is_session_destroying(t)]
+    spec_extras = {u: v for u, v in spec_extras.items()
+                   if not _is_session_destroying(u)}
+    if len(targets) < _before_logout:
+        console.print(
+            f"[dim]Auth-safe: skipped {_before_logout - len(targets)} logout/"
+            f"sign-out URL(s) that would destroy the session[/dim]"
+        )
+
+    # ---- Generic organic authentication (per host) ---------------------
+    # For any seeded host that gates content behind a login form, try to log in
+    # with default credentials (CSRF-aware) and reuse the resulting session for
+    # that host's scan — doubling reachable surface (DVWA/bWAPP-style apps whose
+    # vulnerable pages 302 to login when unauthenticated). Fully generic: it only
+    # submits whatever login form the app itself serves. Skipped when the user
+    # supplied their own auth/cookie or passed --no-auto-auth.
+    # Establish a FRESH scanning session per host. Discovery already ran its own
+    # pre-crawl auth so protected pages were crawled — but that session may have
+    # been burned (the crawl can trip a logout link before we filter them), so we
+    # re-authenticate here for a clean session used throughout the scan. Only
+    # re-auth hosts discovery found a login on (the gated apps); open apps have no
+    # form and would just waste probes. Skipped if the user supplied their own auth.
+    host_cookies: dict[str, dict[str, str]] = {}
+    _discovery_authed = set(getattr(args, "_host_cookies", {}))
+    _user_supplied_auth = bool(
+        args.auth_token or (args.auth_url and args.auth_data)
+        or args.cookie or args.grab_cookie or (args.login_url and args.login_data)
+    )
+    if not args.no_auto_auth and not _user_supplied_auth and seed_hosts:
+        from sqli_ai.session import establish_session
+        # Re-auth the gated hosts (found during discovery); also try any seed host
+        # not yet covered by discovery (e.g. --no-auto runs).
+        _auth_hosts = _discovery_authed | (seed_hosts if not _discovery_authed else set())
+        for host in sorted(_auth_hosts or seed_hosts):
+            scheme = "https"
+            for t in targets:
+                if _up_seed(t).netloc == host:
+                    scheme = _up_seed(t).scheme or "https"
+                    break
+            site_root = f"{scheme}://{host}/"
+            try:
+                jar, msg = establish_session(
+                    site_root, console=console,
+                    timeout=min(args.timeout, 12.0), headers=headers,
+                    creds=_parse_creds(getattr(args, "creds", None)),
+                )
+            except Exception as e:
+                jar, msg = {}, f"auth error: {e}"
+            if jar:
+                host_cookies[host] = jar
+                console.print(f"[green]✓ Scan session ready for {host}[/green]")
+            elif "no login form" not in msg:
+                console.print(f"[dim]Auth ({host}): {msg}[/dim]")
+
+    # Organic cookie capture: if the target sets a session cookie (CartID,
+    # SSOid, PHPSESSID, ...) and the user didn't supply one, grab it and add it
+    # as an injection point. Because the precheck APPENDS to the cookie's real
+    # value, a structured cookie like "ts:1:11.5:1000" is tested as
+    # "ts:1:11.5:1000'", hitting the exact vulnerable field — fully organic,
+    # no per-app knowledge. Catches cookie-based SQLi (e.g. unquoted IN()).
+    if args.organic and not cookies and targets:
+        try:
+            _cstr, _jar = grab_cookie(
+                targets[0], headers=headers, proxy=args.proxy
+            )
+        except Exception:
+            _jar = {}
+        if _jar:
+            cookies.update(_jar)
+            console.print(
+                f"[dim]Organic cookie capture: {', '.join(_jar)} "
+                f"(will be tested for injection)[/dim]"
+            )
+
+    # Parameter mining wordlist — ON by default (disable with --no-guess-params).
+    guess_params = None
+    if (not args.no_guess_params) or args.param_wordlist or args.guess_params:
+        from sqli_ai.payloads import COMMON_PARAMS
+        if args.param_wordlist:
+            try:
+                with open(args.param_wordlist) as f:
+                    guess_params = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            except OSError as e:
+                console.print(f"[yellow]Cannot read --param-wordlist: {e}[/yellow]")
+                guess_params = list(COMMON_PARAMS)
+        else:
+            guess_params = list(COMMON_PARAMS)
+
+    default_ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
+    # UA used for liveness probing; NOT an injection point unless user set -H
+    probe_headers = dict(headers)
+    probe_headers.setdefault("User-Agent", default_ua)
+
+    # Liveness pre-filter (httpx-style): drop dead URLs before the slow work.
+    # Runs before both the scan AND the sqlmap handoff so sqlmap isn't fed
+    # dead endpoints. On by default for crawl/spec input; disable with --no-probe.
+    do_probe = (args.probe_alive or crawl_mode) and not args.no_probe and len(targets) > 1
+    if do_probe:
+        console.print(f"[*] Probing {len(targets)} URLs for liveness (httpx-style)...")
+        # Never liveness-filter known POST/PUT/PATCH endpoints — a GET probe
+        # against them is meaningless (returns 404/405) and would wrongly drop
+        # e.g. the login SQLi endpoint before it's ever scanned.
+        keep_urls = {
+            url for url, extra in spec_extras.items()
+            if extra and extra[0] and str(extra[0]).upper() != "GET"
+        }
+        alive, status_map = probe_alive(
+            targets,
+            threads=args.probe_threads,
+            timeout=min(args.timeout, 8.0),
+            headers=probe_headers,
+            proxy=args.proxy,
+            keep_urls=keep_urls,
+        )
+        dead = len(targets) - len(alive)
+        console.print(
+            f"[*] Live: [green]{len(alive)}[/green]  "
+            f"Dead/filtered: [dim]{dead}[/dim]"
+        )
+        if args.verbose:
+            for u in alive:
+                console.print(f"    [green]live[/green] {u} ({status_map.get(u)})")
+        targets = alive
+        if not targets:
+            console.print("[yellow]No live targets.[/yellow]")
+            return 2
+
+    # sqlmap handoff: use SQLi-AI only for discovery, then hand to sqlmap
+    if args.sqlmap or args.run_sqlmap:
+        return sqlmap_handoff(
+            targets=targets,
+            guess_params=guess_params,
+            out_file=args.sqlmap_out,
+            profile=args.sqlmap_profile,
+            sqlmap_args=args.sqlmap_args,
+            run=args.run_sqlmap,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            verbose=args.verbose,
+            menu=args.sqlmap_menu,
+            timeout=args.sqlmap_timeout,
+        )
+
+    # Load payload library
+    from sqli_ai.sqlmap_payloads import get_payloads, load_sqlmap_payloads
+    if args.payloads in ("sqlmap", "embedded"):
+        seed_payloads, payload_src = load_sqlmap_payloads(
+            data_dir=getattr(args, "sqlmap_data", None),
+            sleep=args.sleep,
+        )
+    else:
+        seed_payloads = get_payloads(techniques=[args.payloads], sleep=args.sleep)
+        payload_src = f"{args.payloads} technique ({len(seed_payloads)} payloads)"
+
+    # --fast: only error-based payloads (fastest detection, no time-blind)
+    if args.fast:
+        from sqli_ai.sqlmap_payloads import PAYLOADS_ERROR_BASED
+        display_payloads = PAYLOADS_ERROR_BASED
+        payload_src = f"error-based only [{len(display_payloads)} payloads, fast mode]"
+    else:
+        display_payloads = seed_payloads
+
+    # Per-parameter payload budget. Testing the ENTIRE suite (~100+ payloads) on
+    # every reacting param explodes a single endpoint into 1000s of requests
+    # (e.g. a non-SQL /api/file whose params react to junk). Cap by --level;
+    # the dedicated boolean-ratio/UNION/time-based/NoSQL tests cover techniques
+    # that the capped seed list might not reach. --max-attempts overrides.
+    if _raw_max_attempts:
+        max_attempts = _raw_max_attempts
+    else:
+        level_caps = {1: 20, 2: 40, 3: len(display_payloads)}
+        max_attempts = min(len(display_payloads), level_caps.get(args.level, 20))
+
+    console.print(f"[dim]Payloads: {payload_src} | max {max_attempts}/param[/dim]")
+
+    tamper_chain = []
+    if args.tamper:
+        from sqli_ai.tamper import AUTO_TAMPER_CHAIN, TAMPERS
+        if args.tamper.strip().lower() == "auto":
+            tamper_chain = list(AUTO_TAMPER_CHAIN)
+        else:
+            for name in args.tamper.split(","):
+                name = name.strip()
+                if name and name in TAMPERS:
+                    tamper_chain.append(name)
+                elif name:
+                    console.print(f"[yellow]Unknown tamper '{name}' (see --list-tamper)[/yellow]")
+
+    # Auto-scale concurrency: 1 for a single target, up to 8 when discovery
+    # expanded the run into many targets — unless the user set -t explicitly.
+    if args.threads is None:
+        args.threads = min(8, max(1, len(targets))) if len(targets) > 1 else 1
+
+    if len(targets) > 1:
+        console.print(
+            f"[*] {len(targets)} targets queued "
+            f"[dim](scanning with {args.threads} thread(s))[/dim]\n"
+        )
+
+    use_llm, base_url, llm_error = setup_llm_backend(args, console)
+    if llm_error:
+        console.print(f"[yellow]{llm_error}[/yellow]")
+        console.print("[yellow]Falling back to heuristic-only mode.[/yellow]\n")
+        use_llm = False
+
+    probe = HttpProbe(
+        timeout=args.timeout,
+        proxy=args.proxy,
+        default_headers={"User-Agent": default_ua},
+        cookies=cookies,
+    )
+
+    agent = LlmAgent(
+        api_key=args.api_key,
+        base_url=base_url,
+        model=args.model if use_llm else DEFAULT_OLLAMA_MODEL,
+    )
+
+    # Announce exactly which brain is driving the scan (asked-for transparency).
+    import os as _os
+    if use_llm:
+        if args.base_url:
+            backend = f"remote OpenAI-compatible @ {base_url}"
+        else:
+            backend = f"Ollama (local) @ {base_url}"
+        _to = _os.getenv("SQLi-AI_LLM_TIMEOUT", "25")
+        console.print(
+            f"[bold]AI engine:[/bold] [green]{backend}[/green] "
+            f"model=[cyan]{agent.model}[/cyan] "
+            f"[dim](per-call timeout {_to}s; auto-falls back to heuristics if slow; "
+            f"disable with --no-llm)[/dim]"
+        )
+        if args.fast:
+            console.print("[dim]  --fast: LLM per-parameter suggestion/analysis is "
+                          "skipped; LLM used only where cheap.[/dim]")
+        if args.verbose:
+            console.print(
+                "[dim]  LLM roles: payload suggestion, response analysis, finding "
+                "confirmation. Detection itself is deterministic (heuristics).[/dim]"
+            )
+    else:
+        why = "--no-llm" if args.no_llm else "LLM unavailable"
+        console.print(
+            f"[bold]AI engine:[/bold] [yellow]OFF[/yellow] ({why}) — "
+            f"heuristic-only deterministic detection engine"
+        )
+
+    verbose_progress = args.verbose or args.show_response
+
+    def progress(msg: str):
+        if verbose_progress or msg.startswith(("[!]", "[+]", "[*]\n", "[*] Scan")):
+            console.print(msg)
+
+    scanner = Scanner(
+        agent=agent,
+        probe=probe,
+        max_attempts_per_param=max_attempts,
+        use_llm=use_llm,
+        test_path=test_path,
+        path_all_segments=args.path_all,
+        include_dead=args.include_dead,
+        fast=args.fast,
+        guess_params=guess_params,
+        tamper=tamper_chain,
+        auto_tamper=not args.no_auto_tamper,
+        show_response=args.show_response,
+        continue_on_found=args.continue_on_found,
+        seed_payloads=display_payloads,
+        organic=args.organic,
+        second_order=args.second_order,
+        # Time-based is opt-in via --time, or implied by explicitly selecting the
+        # time/stacked payload modes.
+        time_based=args.time_based or args.payloads in ("time", "stacked"),
+        llm_deep=args.llm_deep,
+        on_progress=progress if verbose_progress else lambda m: (
+            console.print(m) if m.lstrip().startswith(("[!]", "[*] Scan", "[*] Found")) else None
+        ),
+    )
+    scanner._sleep_ms = args.sleep * 1000
+    scanner._precheck = not args.no_precheck
+    if tamper_chain:
+        console.print(f"[dim]Tamper chain: {', '.join(tamper_chain)}[/dim]")
+    if test_path:
+        console.print("[dim]Path-segment injection: enabled[/dim]")
+    if guess_params:
+        console.print(f"[dim]Parameter mining: {len(guess_params)} names per URL[/dim]")
+    if args.organic:
+        console.print("[dim]Organic discovery: params mined from each response (forms/links/JS/JSON)[/dim]")
+
+    # Methods to try per target. --method may be comma-separated (e.g. GET,POST).
+    cli_methods = [m.strip().upper() for m in args.method.split(",") if m.strip()] or ["GET"]
+
+    # A synthetic JSON body for POST/PUT when the user gave no --data and the
+    # endpoint has no known spec body — gives body-param injection something
+    # to work with (common credential/search/id field names).
+    _SYNTH_BODY = (
+        '{"id":"1","email":"test@test.com","username":"test","user":"test",'
+        '"password":"test","q":"test","search":"test","name":"test"}'
+    )
+
+    all_reports = []
+    total_findings = 0
+    interrupted = False
+    try:
+        def run_one(target: str):
+            # Method/body/headers from OpenAPI or known-app spec if available,
+            # otherwise the CLI method list (which may be several methods).
+            spec_data = spec_extras.get(target, (None, None, None, None))
+            spec_method, spec_body, spec_ct, spec_headers = spec_data
+            merged_headers = dict(headers)
+            if spec_headers:
+                for k, v in spec_headers.items():
+                    if k not in merged_headers:
+                        merged_headers[k] = v
+
+            # Attach this host's authenticated session (from generic auto-auth),
+            # so each app in a multi-host list is scanned with its OWN session.
+            _thost = _up_seed(target).netloc
+            if _thost in host_cookies:
+                _cookie_hdr = "; ".join(f"{k}={v}" for k, v in host_cookies[_thost].items())
+                existing_cookie = next(
+                    (merged_headers[k] for k in merged_headers if k.lower() == "cookie"),
+                    "",
+                )
+                merged_headers["Cookie"] = (
+                    (existing_cookie.rstrip("; ") + "; " + _cookie_hdr)
+                    if existing_cookie else _cookie_hdr
+                )
+
+            # If the spec pins a method for this URL, use only that.
+            # Otherwise try every method the user requested.
+            methods = [spec_method] if spec_method else list(cli_methods)
+
+            # Auth-endpoint bypass: login/authenticate endpoints are the classic
+            # SQLi auth-bypass sink (Juice Shop's POST /rest/user/login with
+            # email=' OR 1=1--). They're almost always POST + a JSON credential
+            # body, which a plain GET scan never exercises — so if a discovered
+            # endpoint's path looks like authentication and the user didn't pin a
+            # method, also POST it with a credential body. Fully generic (keys off
+            # the path shape, not any specific app).
+            import re as _re_auth
+            _auth_path = bool(_re_auth.search(
+                r"(log[-_]?in|sign[-_]?in|authenticate|/auth\b|/session|/token)",
+                _up_seed(target).path, _re_auth.IGNORECASE,
+            ))
+            if _auth_path and not spec_method and "POST" not in methods:
+                methods.append("POST")
+
+            reports = []
+            for m in methods:
+                if spec_method:
+                    body, ct = spec_body, spec_ct
+                elif m == "GET":
+                    body, ct = None, None
+                else:
+                    # POST/PUT with no supplied data → synthesize a JSON body
+                    body = args.data or _SYNTH_BODY
+                    ct = content_type or "application/json"
+                reports.append(scanner.scan(
+                    url=target,
+                    method=m,
+                    data=body,
+                    content_type=ct,
+                    extra_headers=merged_headers if merged_headers else headers,
+                    params=args.params,
+                ))
+
+            # Merge multi-method reports into one for this target
+            merged = reports[0]
+            for r in reports[1:]:
+                merged.findings.extend(r.findings)
+                merged.total_requests += r.total_requests
+                merged.errors.extend(r.errors)
+            return merged
+
+        if args.threads > 1 and len(targets) > 1:
+            import concurrent.futures
+            console.print(
+                f"[dim]Scanning {len(targets)} targets with {args.threads} threads...[/dim]\n"
+            )
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=args.threads)
+            futures = {ex.submit(run_one, t): t for t in targets}
+            done = 0
+            try:
+                for fut in concurrent.futures.as_completed(futures):
+                    done += 1
+                    try:
+                        report = fut.result()
+                    except Exception as e:
+                        # One bad target must never suppress the final summary.
+                        console.print(f"[yellow]Target failed: {futures[fut]} — {e}[/yellow]")
+                        continue
+                    all_reports.append(report)
+                    total_findings += len(report.findings)
+                    console.print(
+                        f"\n[bold]── ({done}/{len(targets)}):[/bold] {report.target_url}"
+                    )
+                    print_report(report, console,
+                                 run_sqli_total=total_findings,
+                                 run_urls_done=done, run_urls_total=len(targets))
+            except KeyboardInterrupt:
+                interrupted = True
+                for f in futures:
+                    f.cancel()
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
+        else:
+            try:
+                for idx, target in enumerate(targets, 1):
+                    if len(targets) > 1:
+                        console.print(f"\n[bold]── Target {idx}/{len(targets)}:[/bold] {target}")
+                    try:
+                        report = run_one(target)
+                    except Exception as e:
+                        console.print(f"[yellow]Target failed: {target} — {e}[/yellow]")
+                        continue
+                    all_reports.append(report)
+                    total_findings += len(report.findings)
+                    if len(targets) > 1:
+                        print_report(report, console,
+                                     run_sqli_total=total_findings,
+                                     run_urls_done=idx, run_urls_total=len(targets))
+                    else:
+                        print_report(report, console)
+            except KeyboardInterrupt:
+                interrupted = True
+    finally:
+        probe.close()
+        # NOTE: agent is intentionally NOT closed here — the AI analysis pass
+        # below still needs it. It's closed once that pass is done.
+
+    if interrupted:
+        console.print(
+            "\n[yellow]Interrupted — showing the findings collected so far.[/yellow]"
+        )
+    console.print(
+        f"\n[bold green]━━━ Stage 1 complete[/bold green] — "
+        f"{len(all_reports)} URL(s) scanned, "
+        f"[bold]{total_findings}[/bold] finding(s)"
+    )
+    # Multi-URL run: dump EVERY SQL error observed (even on unconfirmed params),
+    # so DB leakage surfaced during probing is never lost in the noise.
+    if len(all_reports) > 1:
+        print_all_sql_errors(all_reports, console)
+    # Reconcile DB type per host (one host = one backend). This corrects
+    # outlier/unknown guesses and is what sqlmap's --dbms is derived from.
+    if total_findings:
+        unify_db_types(all_reports, console)
+    if total_findings:
+        from rich.panel import Panel
+        from rich.table import Table
+        from urllib.parse import urlparse as _up
+
+        from sqli_ai.report import _indent
+
+        # Collect unique findings and GROUP THEM BY HOST so the output is linear
+        # per site (not interleaved in scan-completion order). Within a host,
+        # highest-confidence findings come first.
+        seen_sinks: set[tuple] = set()
+        rows: list[tuple] = []  # (host, report, finding)
+        deduped = 0
+        for r in all_reports:
+            host = _up(r.target_url).netloc
+            for f in r.findings:
+                sink = _sink_key(f.payload_url or r.target_url, f.param)
+                if sink in seen_sinks:
+                    deduped += 1
+                    continue
+                seen_sinks.add(sink)
+                rows.append((host, r, f))
+        rows.sort(key=lambda t: (t[0], -t[2].confidence, t[2].param))
+        unique_findings = [(r, f) for _, r, f in rows]
+
+        # ---- AI analysis pass -------------------------------------------
+        # Runs the LLM on EVERY confirmed finding to produce an impact /
+        # exploitation / remediation writeup. This is where the AI does
+        # genuinely useful, visible work — and because it runs AFTER the
+        # deterministic engine has confirmed each vuln, it can never change
+        # detection results or scan consistency. Skipped in --fast / --no-llm
+        # and self-disables (circuit breaker) if the model is slow/unreachable.
+        if use_llm and not args.fast and unique_findings:
+            import os as _os_ai
+            import time as _ai_time
+            # Hard wall-clock budget so a slow local model can't turn the
+            # end-of-run analysis into a multi-minute hang. Once spent, the
+            # remaining findings just keep their (already-complete) heuristic
+            # evidence. Override with SQLIAI_AI_BUDGET (seconds).
+            try:
+                _ai_budget = float(_os_ai.getenv("SQLIAI_AI_BUDGET", "60"))
+            except (ValueError, TypeError):
+                _ai_budget = 60.0
+            _ai_start = _ai_time.monotonic()
+            console.print(
+                f"\n[bold]AI analysis[/bold] — reviewing "
+                f"{len(unique_findings)} confirmed finding(s) with "
+                f"[cyan]{agent.model}[/cyan] "
+                f"[dim](budget {_ai_budget:.0f}s)[/dim] ..."
+            )
+            for i, (_r, f) in enumerate(unique_findings, 1):
+                if getattr(agent, "_disabled", False):
+                    console.print(
+                        "[yellow]  AI analysis disabled (model slow/unreachable) "
+                        "— remaining findings use heuristic evidence only.[/yellow]"
+                    )
+                    break
+                if _ai_time.monotonic() - _ai_start > _ai_budget:
+                    console.print(
+                        f"[yellow]  AI analysis budget ({_ai_budget:.0f}s) reached "
+                        f"— {len(unique_findings) - i + 1} finding(s) left with "
+                        f"heuristic evidence only.[/yellow]"
+                    )
+                    break
+                console.print(
+                    f"[dim]  [{i}/{len(unique_findings)}] analyzing "
+                    f"{f.param} ({f.injection_type.value}) ...[/dim]"
+                )
+                res = agent.analyze_finding(
+                    url=f.payload_url or _r.target_url,
+                    param=f.param,
+                    location=f.location.value,
+                    injection_type=f.injection_type.value,
+                    db_type=f.db_type,
+                    payload=f.payload,
+                    evidence=f.evidence,
+                    response_after=f.response_after,
+                )
+                if res and not res.get("error"):
+                    parts = []
+                    if res.get("impact"):
+                        parts.append(f"Impact: {res['impact']}")
+                    if res.get("exploitation"):
+                        parts.append(f"Exploit: {res['exploitation']}")
+                    if res.get("remediation"):
+                        parts.append(f"Fix: {res['remediation']}")
+                    f.ai_analysis = "\n".join(parts)
+
+        tbl = Table(title="Confirmed SQLi Findings", show_lines=False)
+        tbl.add_column("Host", style="magenta", no_wrap=False, max_width=32)
+        tbl.add_column("Endpoint", no_wrap=False, max_width=42)
+        tbl.add_column("Param", style="bold yellow")
+        tbl.add_column("Type", style="cyan")
+        tbl.add_column("DB", style="green")
+        tbl.add_column("Conf")
+        prev_host = None
+        for host, r, f in rows:
+            tbl.add_row(
+                host if host != prev_host else "",
+                _up(r.target_url).path,
+                f.param,
+                f.injection_type.value,
+                f.db_type or "?",
+                f"{f.confidence:.0%}",
+            )
+            prev_host = host
+        console.print(tbl)
+        if deduped:
+            console.print(
+                f"[dim]({deduped} duplicate finding(s) collapsed — same endpoint+param)[/dim]"
+            )
+
+        # Per-host breakdown: "found X SQLi for this host".
+        from collections import OrderedDict
+        per_host: "OrderedDict[str, list]" = OrderedDict()
+        for host, r, f in rows:
+            per_host.setdefault(host, []).append(f)
+        console.print("\n[bold]── Per-host SQLi summary[/bold]")
+        for host, flist in per_host.items():
+            dbs = sorted({f.db_type for f in flist if f.db_type and f.db_type != "?"})
+            db_tag = f" [green]{'/'.join(dbs)}[/green]" if dbs else ""
+            params = ", ".join(sorted({f.param for f in flist}))
+            console.print(
+                f"  [magenta]{host}[/magenta] — [bold]{len(flist)}[/bold] "
+                f"SQLi finding(s){db_tag}  [dim]({params})[/dim]"
+            )
+        from collections import Counter as _Counter
+        _types = _Counter(f.injection_type.value for _, _r, f in rows)
+        _type_break = ", ".join(f"{t}: {n}" for t, n in _types.most_common())
+        console.print(
+            f"  [dim]────────[/dim]\n"
+            f"  [bold]Total: {len(rows)} finding(s) across {len(per_host)} host(s)[/bold]"
+            f"  [dim]({_type_break})[/dim]"
+        )
+
+        # Detailed evidence per finding: PoC command + before/after responses so
+        # each hit is immediately reproducible and reviewable.
+        console.print("\n[bold]── Proof of Concept & evidence[/bold]")
+        for i, (r, f) in enumerate(unique_findings, 1):
+            body = (
+                f"[bold]URL:[/bold]        {f.payload_url or r.target_url}\n"
+                f"[bold]Parameter:[/bold]  {f.param} ({f.location.value})\n"
+                f"[bold]Type:[/bold]       {f.injection_type.value}   "
+                f"[bold]DB:[/bold] {f.db_type or '?'}   "
+                f"[bold]Confidence:[/bold] {f.confidence:.0%}\n"
+                f"[bold]Payload:[/bold]    {f.payload}\n"
+                f"[bold]Evidence:[/bold]   {f.evidence}"
+            )
+            if f.poc_curl:
+                body += f"\n\n[bold]PoC:[/bold]\n  [cyan]{f.poc_curl}[/cyan]"
+            if f.response_before or f.response_after:
+                body += (
+                    "\n\n[bold]Response BEFORE[/bold] [dim](baseline)[/dim]:\n"
+                    f"[dim]{_indent(f.response_before)}[/dim]"
+                    "\n\n[bold]Response AFTER[/bold] [dim](payload injected)[/dim]:\n"
+                    f"[yellow]{_indent(f.response_after)}[/yellow]"
+                )
+            if f.ai_analysis:
+                body += f"\n\n[bold]AI analysis[/bold] [dim]({agent.model})[/dim]:\n[green]{_indent(f.ai_analysis)}[/green]"
+            sev_color = "red" if f.confidence >= 0.8 else "yellow"
+            console.print(Panel(
+                body,
+                title=f"[{sev_color}]PoC #{i} — {f.param} @ {_up(r.target_url).path}[/{sev_color}]",
+                border_style=sev_color,
+            ))
+
+    # AI analysis pass is done — the agent is no longer needed. Close it now
+    # (it was deliberately kept open past the scan's finally block for the pass).
+    agent.close()
+
+    # Raw per-URL report(s): honour -o if given (unchanged behaviour).
+    if args.output:
+        if len(all_reports) == 1:
+            save_json(all_reports[0], args.output)
+        else:
+            _save_multi(all_reports, args.output)
+        console.print(f"[dim]Raw report saved to {args.output}[/dim]")
+
+    # ALWAYS remember every finding in a consolidated report at the end — a
+    # JSON (machine-readable) + a Markdown summary — so results are never lost,
+    # even when -o wasn't passed. Derived from -o's stem when given, else a
+    # timestamped default in the CWD.
+    if all_reports:
+        import os as _os
+        import time as _time
+        if args.output:
+            stem = args.output.rsplit(".", 1)[0]
+        else:
+            stem = f"sql-ai-report-{_time.strftime('%Y%m%d-%H%M%S')}"
+        json_path = f"{stem}.findings.json"
+        md_path = f"{stem}.findings.md"
+        try:
+            write_findings_report(all_reports, json_path, md_path)
+            console.print(
+                f"[dim]All findings remembered in[/dim] "
+                f"[cyan]{_os.path.abspath(json_path)}[/cyan] "
+                f"[dim]and[/dim] [cyan]{_os.path.abspath(md_path)}[/cyan]"
+            )
+        except Exception as e:
+            console.print(f"[yellow]Could not write consolidated report: {e}[/yellow]")
+
+    # Default-credentials check keyed by the DB type we fingerprinted.
+    if args.db_creds and not interrupted:
+        run_db_creds_check(all_reports, timeout=args.db_creds_timeout, console=console)
+
+    # Stage 2: sqlmap on confirmed findings ONLY — starts after ALL URLs scanned
+    if args.then_sqlmap and not interrupted:
+        if total_findings == 0:
+            console.print(
+                "[yellow]No confirmed SQLi found — nothing to hand to sqlmap.[/yellow]"
+            )
+        else:
+            if args.ask or args.sqlmap_menu:
+                console.print(
+                    f"\n[bold]Run sqlmap on {total_findings} confirmed finding(s)?[/bold] "
+                    f"[dim](profile: {args.sqlmap_profile})[/dim]"
+                )
+                try:
+                    answer = input("  [Y/n]: ").strip().lower()
+                except EOFError:
+                    answer = "y"
+                if answer not in ("", "y", "yes"):
+                    console.print("[dim]Skipped sqlmap — printing commands to run manually:[/dim]")
+                    # Build and print the commands without executing
+                    from sqli_ai.models import ParamLocation
+                    from urllib.parse import urlparse as _up2, parse_qs, urlencode, urlunparse
+                    base_args = SQLMAP_PROFILES.get(args.sqlmap_profile, SQLMAP_PROFILES["normal"])
+                    header_args = "".join(
+                        f" -H '{k}: {v}'" for k, v in headers.items()
+                        if k.lower() != "user-agent"
+                    )
+                    if args.cookie:
+                        header_args += f" --cookie '{args.cookie}'"
+                    for r in all_reports:
+                        for f in r.findings:
+                            url = r.target_url
+                            extra = f"-p {f.param}" if f.location in (
+                                ParamLocation.QUERY, ParamLocation.BODY
+                            ) else ""
+                            dbms = f"--dbms={f.db_type}" if f.db_type else ""
+                            cmd = f"sqlmap -u '{url}' {base_args} {dbms} {args.sqlmap_args} {extra}{header_args}".strip()
+                            import re as _re2
+                            cmd = _re2.sub(r" {2,}", " ", cmd)
+                            console.print(f"  [dim]{cmd}[/dim]")
+                    # Still show the final rollup before returning.
+                    print_rollup(all_reports, console)
+                    return 1 if total_findings else 0
+            console.print(
+                f"[bold cyan]━━━ Stage 2 starting[/bold cyan] — "
+                f"running sqlmap on [bold]{total_findings}[/bold] confirmed finding(s)"
+            )
+        run_sqlmap_on_findings(
+            all_reports,
+            profile=args.sqlmap_profile,
+            sqlmap_args=args.sqlmap_args,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            menu=args.sqlmap_menu,
+            timeout=args.sqlmap_timeout,
+            spec_extras=spec_extras,
+        )
+
+    # nuclei DAST breadth on everything we discovered/scanned.
+    if args.nuclei and not interrupted:
+        nuclei_targets = [r.target_url for r in all_reports] or targets
+        run_nuclei(
+            nuclei_targets,
+            tags=args.nuclei_tags,
+            extra_args=args.nuclei_args,
+            headers=headers,
+            cookie=args.cookie,
+            console=console,
+            timeout=args.sqlmap_timeout,
+        )
+
+    # Final rollup — the last, unambiguous "how many did we find" statement.
+    print_rollup(all_reports, console)
+
+    return 1 if total_findings else 0
+
+
+def print_all_sql_errors(reports, console) -> None:
+    """List every distinct SQL error observed across a multi-URL run, grouped by
+    host. Shows DB leakage even for params that were never confirmed as SQLi."""
+    from urllib.parse import urlparse
+    from collections import OrderedDict
+
+    grouped: "OrderedDict[str, list]" = OrderedDict()
+    total = 0
+    for r in reports:
+        if not r.sql_errors:
+            continue
+        parsed = urlparse(r.target_url)
+        host = parsed.netloc
+        for param, err in r.sql_errors:
+            grouped.setdefault(host, []).append((parsed.path or "/", param, err))
+            total += 1
+
+    if not total:
+        console.print(
+            "\n[bold]── SQL errors observed[/bold] "
+            "[dim](none — no DB errors leaked during probing)[/dim]"
+        )
+        return
+
+    console.print(
+        f"\n[bold]── SQL errors observed[/bold] "
+        f"[dim]({total} distinct across {len(grouped)} host(s))[/dim]"
+    )
+    for host, rows in grouped.items():
+        console.print(f"  [magenta]{host}[/magenta]")
+        for path, param, err in rows:
+            err_1line = " ".join(err.split())[:160]
+            console.print(
+                f"    [cyan]{path}[/cyan] [yellow]{param}[/yellow] — [red]{err_1line}[/red]"
+            )
+
+
+def run_db_creds_check(reports, timeout: float, console) -> None:
+    """Probe each detected DBMS's standard port for vendor-default credentials.
+
+    One check per unique (host, db_type) pair fingerprinted during the scan.
+    SQLite (and any DB with no known network port) is skipped automatically.
+    """
+    from urllib.parse import urlparse
+    from rich.panel import Panel
+
+    from sqli_ai.db_creds import check_default_creds
+
+    # Collect unique (host, db_type) from confirmed findings.
+    pairs: dict[tuple[str, str], None] = {}
+    for r in reports:
+        for f in r.findings:
+            db = (f.db_type or "").strip().lower()
+            if not db or db in ("?", "unknown"):
+                continue
+            host = urlparse(f.payload_url or r.target_url).hostname
+            if host:
+                pairs[(host, db)] = None
+
+    if not pairs:
+        console.print(
+            "\n[bold]── Default-credentials check[/bold]\n"
+            "  [dim]No DBMS was fingerprinted from the findings — nothing to probe.[/dim]"
+        )
+        return
+
+    console.print(
+        f"\n[bold]── Default-credentials check[/bold] "
+        f"[dim](probing {len(pairs)} host/DBMS pair(s), timeout {timeout:.0f}s)[/dim]"
+    )
+    for (host, db) in pairs:
+        try:
+            results = check_default_creds(host, db, timeout=timeout)
+        except Exception as e:
+            console.print(f"  [yellow]{host} ({db}): probe failed — {e}[/yellow]")
+            continue
+        for res in results:
+            if res.working:
+                creds = ", ".join(
+                    f"{u or '<no-user>'}:{pw or '<empty>'}" for u, pw in res.working
+                )
+                body = (
+                    f"[bold red]DEFAULT CREDENTIALS ACCEPTED[/bold red]\n"
+                    f"[bold]Host:[/bold] {res.host}:{res.port}  "
+                    f"[bold]DBMS:[/bold] {res.db_type}\n"
+                    f"[bold]Working:[/bold] [red]{creds}[/red]\n"
+                    f"[dim]{res.note}[/dim]"
+                )
+                console.print(Panel(body, border_style="red",
+                                    title=f"[red]{res.host} — weak DB creds[/red]"))
+            elif res.reachable and not res.tested:
+                cand = ", ".join(f"{u or '<no-user>'}:{pw or '<empty>'}"
+                                 for u, pw in res.candidates[:6])
+                console.print(
+                    f"  [yellow]{res.host}:{res.port} ({res.db_type})[/yellow] — {res.note}\n"
+                    f"    [dim]try: {cand}[/dim]"
+                )
+            else:
+                console.print(
+                    f"  [green]{res.host}:{res.port or '—'} ({res.db_type})[/green] "
+                    f"— [dim]{res.note}[/dim]"
+                )
+
+
+def run_sqlmap_on_findings(
+    reports,
+    profile: str,
+    sqlmap_args: str,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+    menu: bool = False,
+    timeout: int = 0,
+    spec_extras: Optional[dict] = None,
+) -> int:
+    """Run sqlmap against only the URLs SQLi-AI confirmed as injectable."""
+    import shutil
+    from urllib.parse import urlparse, urlunparse
+
+    from sqli_ai.models import ParamLocation
+
+    # Deduplicate: one sqlmap job per unique *base URL*.
+    # --guess-params can produce many findings for the same endpoint (one per
+    # guessed param). We only need to run sqlmap once per URL — it will probe
+    # all parameters itself. If there's a confirmed param, we add -p to focus.
+    from urllib.parse import parse_qs, urlencode
+    _spec_extras = spec_extras or {}
+    # base_url -> (param_extra, confidence, db_type, method, post_body, content_type)
+    best_finding: dict[str, tuple] = {}
+    for report in reports:
+        raw_parsed = urlparse(report.target_url)
+        raw_qs = parse_qs(raw_parsed.query, keep_blank_values=True)
+        # Recover method/body from spec_extras if this was a POST finding
+        spec_data = _spec_extras.get(report.target_url, (None, None, None, None))
+        spec_method, spec_body, spec_ct, _ = spec_data
+        for f in report.findings:
+            base = report.target_url
+            param_extra = ""
+            method = spec_method or "GET"
+            post_body = spec_body
+            post_ct = spec_ct
+
+            if f.location == ParamLocation.QUERY:
+                spec_params = {k: v for k, v in raw_qs.items() if k == f.param}
+                if not spec_params:
+                    spec_params = {f.param: ["1"]}
+                clean_url = urlunparse(raw_parsed._replace(
+                    query=urlencode({k: v[0] for k, v in spec_params.items()})
+                ))
+                base = clean_url
+                param_extra = f"-p {f.param}"
+
+            elif f.location in (ParamLocation.BODY, ParamLocation.JSON):
+                # POST body injection — pass method and data to sqlmap
+                param_extra = f"-p {f.param}"
+                if not post_body:
+                    post_body = f'{{"{f.param}": "1"}}'
+                    post_ct = "application/json"
+                method = method or "POST"
+
+            elif f.location == ParamLocation.HEADER:
+                param_extra = f'-p {f.param} --headers="{f.param}: *"'
+
+            elif f.location == ParamLocation.COOKIE:
+                param_extra = f'--cookie="{f.param}=*"'
+
+            elif f.location == ParamLocation.PATH:
+                idx = None
+                if f.param.startswith("path[") and "]" in f.param:
+                    try:
+                        idx = int(f.param[5:f.param.index("]")])
+                    except ValueError:
+                        idx = None
+                parsed_p = urlparse(base)
+                segs = parsed_p.path.split("/")
+                if idx is not None and 0 <= idx < len(segs):
+                    segs[idx] = segs[idx] + "*"
+                    base = urlunparse(parsed_p._replace(path="/".join(segs)))
+
+            prev = best_finding.get(base)
+            if prev is None or f.confidence > prev[1]:
+                best_finding[base] = (
+                    param_extra, f.confidence, f.db_type,
+                    method, post_body, post_ct,
+                )
+
+    jobs = [
+        (url, d[0], d[2], d[3], d[4], d[5])
+        for url, d in best_finding.items()
+    ]
+
+    if not jobs:
+        console.print(
+            "\n[yellow]No confirmed injectable URLs to hand to sqlmap.[/yellow] "
+            "[dim](nothing to exploit)[/dim]"
+        )
+        return 0
+
+    base_args = SQLMAP_PROFILES.get(profile, SQLMAP_PROFILES["normal"])
+    if menu:
+        base_args = interactive_sqlmap(console, profile, base_args, sqlmap_args)
+        sqlmap_args = ""
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" --cookie '{cookie}'"
+
+    console.print(
+        f"\n[bold cyan]Stage 2 — sqlmap targets ({len(jobs)}):[/bold cyan] "
+        f"[dim]profile: {profile}[/dim]"
+    )
+    for i, (url, extra, db, method, body, ct) in enumerate(jobs, 1):
+        db_tag = f"  [dim][{db}][/dim]" if db else ""
+        method_tag = f"  [dim]{method}[/dim]" if method and method != "GET" else ""
+        console.print(f"  {i}) {url}  [dim]{extra}[/dim]{method_tag}{db_tag}")
+    console.print()
+
+    have_sqlmap = shutil.which("sqlmap") is not None
+    for i, (url, extra, db, method, body, ct) in enumerate(jobs, 1):
+        dbms_flag = f"--dbms={db}" if db else ""
+        method_flag = ""
+        if method and method.upper() != "GET":
+            method_flag = f"--method={method.upper()}"
+            if body:
+                import shlex
+                method_flag += f" --data={shlex.quote(body)}"
+        cmd = f"sqlmap -u '{url}' {base_args} {dbms_flag} {method_flag} {sqlmap_args} {extra}{header_args}".strip()
+        # collapse multiple spaces
+        import re as _re
+        cmd = _re.sub(r" {2,}", " ", cmd)
+        console.print(f"\n[bold]━━━ sqlmap ({i}/{len(jobs)}):[/bold] {url}")
+        console.print(f"[dim]{cmd}[/dim]")
+        if not have_sqlmap:
+            continue
+        launch_sqlmap(cmd, timeout, console)
+
+    if not have_sqlmap:
+        console.print(
+            "\n[yellow]sqlmap not on PATH — commands printed above to run manually.[/yellow]"
+        )
+    else:
+        console.print(
+            "\n[dim]sqlmap results saved under ~/.local/share/sqlmap/output/<host>/[/dim]"
+        )
+    return 0
+
+
+def unify_db_types(all_reports, console=None) -> dict[str, str]:
+    """Reconcile DB type across findings for each host.
+
+    A single target host is almost always backed by ONE database engine, so
+    per-finding DB guesses that disagree (e.g. one endpoint's error text
+    happens to look SQLite-ish while the rest are clearly PostgreSQL) are noise.
+    We take a confidence-weighted vote per host, pick the dominant engine, and
+    rewrite every finding on that host to it. This also backfills findings whose
+    DB was '?'/unknown — which is what then feeds sqlmap's --dbms.
+
+    Returns {host: db_type} for the hosts that got a consensus.
+    """
+    from collections import defaultdict
+    from urllib.parse import urlparse
+
+    votes: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for r in all_reports:
+        host = urlparse(r.target_url).netloc
+        for f in r.findings:
+            db = (f.db_type or "").strip().lower()
+            if db and db not in ("?", "unknown"):
+                votes[host][db] += max(f.confidence, 0.1)
+
+    consensus: dict[str, str] = {}
+    for host, dbmap in votes.items():
+        if dbmap:
+            consensus[host] = max(dbmap, key=lambda k: dbmap[k])
+
+    changed = 0
+    for r in all_reports:
+        host = urlparse(r.target_url).netloc
+        cdb = consensus.get(host)
+        if not cdb:
+            continue
+        for f in r.findings:
+            if (f.db_type or "").strip().lower() != cdb:
+                f.db_type = cdb
+                changed += 1
+
+    if console and consensus:
+        for host, db in consensus.items():
+            others = sorted(k for k in votes[host] if k != db)
+            note = f" (was mixed: {', '.join([db] + others)})" if others else ""
+            console.print(
+                f"[dim]DB consensus for {host}: [bold]{db}[/bold]{note} — "
+                f"unified across findings and passed to sqlmap as --dbms[/dim]"
+            )
+    return consensus
+
+
+def print_rollup(all_reports, console) -> None:
+    """Print the final rollup: total SQLi, breakdown by injection type, and by
+    host. This is intentionally the LAST thing shown so 'how many did we find'
+    is unambiguous (e.g. 'Found 10 SQL injection point(s)')."""
+    from collections import Counter, OrderedDict
+    from urllib.parse import urlparse as _up
+
+    from rich.panel import Panel
+
+    # Dedup to unique SINKS so the count matches the table (same param via a
+    # different handler/action is a distinct injection point — see _sink_key).
+    seen: set[tuple] = set()
+    findings: list[tuple] = []  # (host, finding)
+    for r in all_reports:
+        host = _up(r.target_url).netloc
+        for f in r.findings:
+            sink = _sink_key(f.payload_url or r.target_url, f.param)
+            if sink in seen:
+                continue
+            seen.add(sink)
+            findings.append((host, f))
+
+    total = len(findings)
+    if total == 0:
+        console.print(Panel.fit(
+            "[bold]No SQL injection points confirmed.[/bold]",
+            title="SQLi-AI Result", border_style="green",
+        ))
+        return
+
+    by_type = Counter(f.injection_type.value for _, f in findings)
+    hosts = OrderedDict()
+    for host, f in findings:
+        hosts.setdefault(host, 0)
+        hosts[host] += 1
+
+    type_line = "  ".join(f"[cyan]{t}[/cyan]:{n}" for t, n in by_type.most_common())
+    host_lines = "\n".join(
+        f"  • [magenta]{h}[/magenta]: [bold]{n}[/bold] SQLi" for h, n in hosts.items()
+    )
+    console.print(Panel.fit(
+        f"[bold red]Found {total} SQL injection point(s)[/bold red] "
+        f"across [bold]{len(hosts)}[/bold] host(s)\n"
+        f"[bold]By type:[/bold] {type_line}\n"
+        f"[bold]By host:[/bold]\n{host_lines}",
+        title="SQLi-AI Result — Rollup", border_style="red",
+    ))
+
+
+def run_nuclei(
+    targets: list[str],
+    tags: str,
+    extra_args: str,
+    headers: dict[str, str],
+    cookie: str | None,
+    console,
+    out_file: str = "sqli_ai-nuclei-urls.txt",
+    timeout: int = 0,
+) -> int:
+    """Run nuclei DAST templates over the discovered URLs for multi-class
+    coverage (SQLi/XSS/SSTI/LFI/...). Complements SQLi-AI's deep SQLi/NoSQLi:
+    SQLi-AI does discovery + auth + deep SQLi, nuclei does breadth. Degrades to
+    printing the command if nuclei isn't installed."""
+    import shutil
+
+    urls = [t for t in targets if t]
+    if not urls:
+        console.print("[yellow]No URLs to hand to nuclei.[/yellow]")
+        return 2
+    with open(out_file, "w") as f:
+        f.write("\n".join(urls) + "\n")
+
+    header_args = ""
+    for k, v in (headers or {}).items():
+        if k.lower() != "user-agent":
+            header_args += f" -H '{k}: {v}'"
+    if cookie:
+        header_args += f" -H 'Cookie: {cookie}'"
+
+    cmd = f"nuclei -l {out_file} -dast -tags {tags}{header_args} {extra_args}".strip()
+    console.print(
+        f"\n[bold cyan]━━━ nuclei DAST[/bold cyan] "
+        f"[dim](tags: {tags}, {len(urls)} URL(s))[/dim]"
+    )
+    console.print(f"[dim]{cmd}[/dim]\n")
+
+    if not shutil.which("nuclei"):
+        console.print(
+            "[yellow]nuclei not on PATH — command printed above to run manually.[/yellow]\n"
+            "[dim]Install: https://github.com/projectdiscovery/nuclei[/dim]"
+        )
+        return 1
+    return launch_sqlmap(cmd, timeout, console)  # reuse the safe subprocess runner
+
+
+def _save_multi(reports, path: str) -> None:
+    """Save multiple scan reports to a single JSON file."""
+    import json
+    from sqli_ai.report import export_json
+    with open(path, "w") as f:
+        json.dump([export_json(r) for r in reports], f, indent=2)
+
+
+def _aggregate_findings(all_reports) -> list[dict]:
+    """Flatten every finding across all scanned URLs into a single list, deduped
+    by (host, endpoint, param), each row carrying its full evidence + PoC."""
+    from urllib.parse import urlparse as _up
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in all_reports:
+        host = _up(r.target_url).netloc
+        for f in r.findings:
+            # Per-SINK key (host, path, other-params, action, param) so the saved
+            # report matches the console rollup — same param via a different
+            # handler is a distinct injection point.
+            key = _sink_key(f.payload_url or r.target_url, f.param)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "host": host,
+                "url": f.payload_url or r.target_url,
+                "param": f.param,
+                "location": f.location.value,
+                "type": f.injection_type.value,
+                "db": f.db_type or "unknown",
+                "severity": f.severity.value,
+                "confidence": f.confidence,
+                "payload": f.payload,
+                "evidence": f.evidence,
+                "poc_curl": f.poc_curl,
+                "response_before": f.response_before,
+                "response_after": f.response_after,
+                "ai_analysis": f.ai_analysis,
+            })
+    out.sort(key=lambda d: (d["host"], -d["confidence"], d["param"]))
+    return out
+
+
+def write_findings_report(all_reports, json_path: str, md_path: str) -> None:
+    """Persist ALL findings at the end of a run: a machine-readable JSON and a
+    human-readable Markdown report. Written even without -o so nothing is lost."""
+    import json
+    from collections import Counter
+    findings = _aggregate_findings(all_reports)
+    by_type = Counter(f["type"] for f in findings)
+    by_host: dict[str, list] = {}
+    for f in findings:
+        by_host.setdefault(f["host"], []).append(f)
+
+    summary = {
+        "scanned_urls": len(all_reports),
+        "total_findings": len(findings),
+        "by_type": dict(by_type),
+        "by_host": {h: len(v) for h, v in by_host.items()},
+        "findings": findings,
+    }
+    with open(json_path, "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    lines = ["# SQL-AI scan report", ""]
+    lines.append(f"- URLs scanned: **{len(all_reports)}**")
+    lines.append(f"- Confirmed findings: **{len(findings)}**")
+    if by_type:
+        lines.append(f"- By type: " + ", ".join(f"{t}: {n}" for t, n in by_type.most_common()))
+    lines.append("")
+    for host, flist in by_host.items():
+        dbs = sorted({f["db"] for f in flist if f["db"] != "unknown"})
+        lines.append(f"## {host}  ({len(flist)} finding(s)"
+                     + (f", db: {'/'.join(dbs)}" if dbs else "") + ")")
+        lines.append("")
+        for i, f in enumerate(flist, 1):
+            lines.append(f"### {i}. {f['type']} — `{f['param']}` ({f['location']}) "
+                         f"[{f['severity']}, {f['confidence']:.0%}]")
+            lines.append(f"- URL: `{f['url']}`")
+            lines.append(f"- DB: {f['db']}")
+            lines.append(f"- Payload: `{f['payload']}`")
+            lines.append(f"- Evidence: {f['evidence']}")
+            if f["poc_curl"]:
+                lines.append(f"- PoC:\n\n```bash\n{f['poc_curl']}\n```")
+            if f["ai_analysis"]:
+                lines.append(f"- AI analysis:\n\n{f['ai_analysis']}")
+            lines.append("")
+    with open(md_path, "w") as fh:
+        fh.write("\n".join(lines))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
